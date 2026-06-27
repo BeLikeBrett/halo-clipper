@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Rounded-square background, app-matched dark navy -->
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="#1d2530"/>
+
+  <!-- Outer film frame: subtle accent border -->
+  <rect x="80" y="128" width="352" height="256" rx="16"
+        fill="#0d1117"
+        stroke="#4070a8" stroke-width="6"/>
+
+  <!-- Sprocket holes — left column -->
+  <g fill="#4070a8">
+    <rect x="48" y="152" width="20" height="28" rx="4"/>
+    <rect x="48" y="196" width="20" height="28" rx="4"/>
+    <rect x="48" y="240" width="20" height="28" rx="4"/>
+    <rect x="48" y="284" width="20" height="28" rx="4"/>
+    <rect x="48" y="328" width="20" height="28" rx="4"/>
+  </g>
+
+  <!-- Sprocket holes — right column -->
+  <g fill="#4070a8">
+    <rect x="444" y="152" width="20" height="28" rx="4"/>
+    <rect x="444" y="196" width="20" height="28" rx="4"/>
+    <rect x="444" y="240" width="20" height="28" rx="4"/>
+    <rect x="444" y="284" width="20" height="28" rx="4"/>
+    <rect x="444" y="328" width="20" height="28" rx="4"/>
+  </g>
+
+  <!-- Play triangle, off-white -->
+  <path d="M 214 192 L 214 320 L 326 256 Z"
+        fill="#e4ecf8"
+        stroke="#e4ecf8" stroke-width="4"
+        stroke-linejoin="round"/>
+</svg>

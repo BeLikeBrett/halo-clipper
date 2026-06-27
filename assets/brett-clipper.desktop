@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Brett's Simple Clipper
+GenericName=Video Clipper
+Comment=Fast, simple video trimming and clipping for Linux
+Exec=brett-clipper %F
+TryExec=brett-clipper
+Icon=brett-clipper
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=video;clip;trim;cut;edit;encode;
+StartupNotify=true
+StartupWMClass=brett-clipper
+MimeType=video/mp4;video/x-matroska;video/quicktime;video/webm;video/x-msvideo;video/x-m4v;
