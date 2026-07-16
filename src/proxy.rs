@@ -28,8 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-/// Cache root. `$XDG_CACHE_HOME/brett-clipper/proxies` if set, otherwise
-/// `$HOME/.cache/brett-clipper/proxies`.
+/// Cache root. `$XDG_CACHE_HOME/halo-clipper/proxies` if set, otherwise
+/// `$HOME/.cache/halo-clipper/proxies`. A cache left behind by the app's
+/// previous identity (`brett-clipper`) is renamed over on first touch so
+/// existing proxies stay valid.
 fn cache_root() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -39,13 +41,27 @@ fn cache_root() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("/tmp"));
             home.join(".cache")
         });
-    base.join("brett-clipper").join("proxies")
+    let root = base.join("halo-clipper").join("proxies");
+    if !root.exists() {
+        let legacy = base.join("brett-clipper").join("proxies");
+        if legacy.exists() {
+            let _ = std::fs::create_dir_all(root.parent().unwrap_or(&base));
+            match std::fs::rename(&legacy, &root) {
+                Ok(()) => log::info!("migrated proxy cache from {}", legacy.display()),
+                Err(e) => log::warn!("proxy cache migration failed: {e}"),
+            }
+        }
+    }
+    root
 }
 
 /// Stable cache key for a source file: hash of (absolute_path, size,
-/// mtime_ns). Returns None if the file isn't accessible (in which case
-/// proxy generation can't proceed anyway).
-fn cache_key(source: &Path) -> Option<String> {
+/// mtime_ns), suffixed by the quality profile so switching profiles
+/// regenerates rather than serving the wrong GOP structure. Standard
+/// keeps the historical un-suffixed name so pre-existing caches stay
+/// warm. Returns None if the file isn't accessible (in which case proxy
+/// generation can't proceed anyway).
+fn cache_key(source: &Path, quality: crate::settings::ProxyQuality) -> Option<String> {
     let abs = std::fs::canonicalize(source).ok()?;
     let meta = std::fs::metadata(&abs).ok()?;
     let size = meta.len();
@@ -59,18 +75,24 @@ fn cache_key(source: &Path) -> Option<String> {
     abs.hash(&mut h);
     size.hash(&mut h);
     mtime.hash(&mut h);
-    Some(format!("{:016x}.mp4", h.finish()))
+    let suffix = match quality {
+        crate::settings::ProxyQuality::Standard => "",
+        crate::settings::ProxyQuality::AllIntra => "-ai",
+    };
+    Some(format!("{:016x}{suffix}.mp4", h.finish()))
 }
 
 /// Final cache path for a given source. None if the source path can't
 /// be canonicalized (e.g., file removed under us).
-pub fn proxy_path_for(source: &Path) -> Option<PathBuf> {
-    Some(cache_root().join(cache_key(source)?))
+pub fn proxy_path_for(source: &Path, quality: crate::settings::ProxyQuality) -> Option<PathBuf> {
+    Some(cache_root().join(cache_key(source, quality)?))
 }
 
 /// True iff a finalized proxy file already exists on disk.
-pub fn proxy_exists(source: &Path) -> bool {
-    proxy_path_for(source).map(|p| p.exists()).unwrap_or(false)
+pub fn proxy_exists(source: &Path, quality: crate::settings::ProxyQuality) -> bool {
+    proxy_path_for(source, quality)
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 /// Total bytes consumed by the proxy cache directory. Returns 0 if the
@@ -163,14 +185,15 @@ impl ProxyHandle {
 
 /// Kick off background transcoding. `total_ms` is the source duration,
 /// used for progress percentage. `use_vaapi` enables the AMD/Intel HW
-/// encode path — much faster for long clips, but falls back to libx264
-/// internally if the device fails to init.
+/// encode path — much faster for long clips. `quality` picks the GOP
+/// structure (see [`crate::settings::ProxyQuality`]).
 pub fn spawn_transcode(
     source: &Path,
     total_ms: i64,
     use_vaapi: bool,
+    quality: crate::settings::ProxyQuality,
 ) -> Result<ProxyHandle> {
-    let dest = proxy_path_for(source)
+    let dest = proxy_path_for(source, quality)
         .ok_or_else(|| anyhow::anyhow!("source path is not canonicalizable"))?;
     std::fs::create_dir_all(dest.parent().unwrap_or_else(|| Path::new(".")))?;
     let dest_tmp = dest.with_extension("mp4.tmp");
@@ -199,6 +222,7 @@ pub fn spawn_transcode(
             &source,
             &dest_tmp,
             use_vaapi,
+            quality,
             &progress_t,
             &cancel_t,
             &child_t,
@@ -239,10 +263,19 @@ fn run_ffmpeg(
     source: &Path,
     dest_tmp: &Path,
     use_vaapi: bool,
+    quality: crate::settings::ProxyQuality,
     progress: &Arc<Mutex<ProxyProgress>>,
     cancel: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
+    // GOP length is what the quality profiles differ on. 12 frames is
+    // 0.2 s at 60fps — smooth drag-scrubbing for a small file. 1 makes
+    // every frame a keyframe: exact scrubs, bigger proxy.
+    let gop = match quality {
+        crate::settings::ProxyQuality::Standard => "12",
+        crate::settings::ProxyQuality::AllIntra => "1",
+    };
+
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner")
         .args(["-loglevel", "error", "-y"])
@@ -272,10 +305,7 @@ fn run_ffmpeg(
         .args(["-c:v", "h264_vaapi"])
         // CQP rate-control. ~24 is visually fine for editing reference.
         .args(["-rc_mode", "CQP", "-qp", "24"])
-        // Short GOP — the whole point of the proxy. 12 frames is 0.2 s
-        // at 60fps, 0.5 s at 24fps: keyframe-snap seeks during drag
-        // become smooth instead of chunked.
-        .args(["-g", "12"]);
+        .args(["-g", gop]);
     } else {
         // SW path — libx264 veryfast keeps wall-clock reasonable on
         // multi-core CPUs. CRF 22 is visually fine for editing.
@@ -287,7 +317,7 @@ fn run_ffmpeg(
                  force_original_aspect_ratio=decrease",
             ])
             .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"])
-            .args(["-g", "12", "-keyint_min", "12", "-sc_threshold", "0"]);
+            .args(["-g", gop, "-keyint_min", gop, "-sc_threshold", "0"]);
     }
 
     cmd.args(["-c:a", "copy"])

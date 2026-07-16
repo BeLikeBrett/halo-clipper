@@ -62,7 +62,7 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
             FontId::proportional(13.0),
             theme::TEXT_MUTED,
         );
-        painter.rect_stroke(rect, 6.0, Stroke::new(1.0, theme::BORDER));
+        painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, theme::BORDER));
         return (response, out);
     }
 
@@ -80,7 +80,7 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
             egui::pos2(lane_area_left - 1.0, rect.top() + 4.0),
             egui::pos2(lane_area_left - 1.0, rect.bottom() - LABEL_BAND_H),
         ],
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0_f32, theme::BORDER),
     );
     let header_center_y = (lane_top + lane_bot) * 0.5;
     let mute_size = 18.0;
@@ -155,7 +155,7 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
                 egui::pos2(x0, lane_rect.top() + 1.0),
                 egui::pos2(x1, lane_rect.bottom() - 1.0),
             );
-            painter.rect_stroke(sel, 3.0, Stroke::new(2.0, theme::ACCENT));
+            painter.rect_stroke(sel, 3.0, Stroke::new(2.0_f32, theme::ACCENT));
         }
     }
 
@@ -180,7 +180,7 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
             egui::pos2(ph_x, rect.top() + 4.0),
             egui::pos2(ph_x, rect.bottom() - LABEL_BAND_H),
         ],
-        Stroke::new(2.5, Color32::WHITE),
+        Stroke::new(2.5_f32, Color32::WHITE),
     );
     let triangle = vec![
         egui::pos2(ph_x - 8.0, rect.top()),
@@ -203,7 +203,7 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
     }
     out.dragging = response.dragged();
 
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0, theme::BORDER));
+    painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, theme::BORDER));
     (response, out)
 }
 
@@ -238,8 +238,6 @@ pub struct MultiTrackOutput {
     pub clip_drag_delta: Option<(ClipId, i64)>,
     /// Set on the frame the drag ends — caller should clear its session state.
     pub clip_drag_ended: bool,
-    /// Set when the user picked "Edit" from a clip's right-click menu.
-    pub edit_requested: Option<ClipId>,
     /// Set when the V1 (video) header mute glyph is clicked in the
     /// linked-audio collapsed state. Caller should toggle every audio
     /// track's muted state together so the "implied single track" stays
@@ -319,7 +317,7 @@ pub fn show_multitrack(
             FontId::proportional(13.0),
             theme::TEXT_MUTED,
         );
-        painter.rect_stroke(rect, 6.0, Stroke::new(1.0, theme::BORDER));
+        painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, theme::BORDER));
         return (response, out);
     }
 
@@ -333,7 +331,7 @@ pub fn show_multitrack(
             egui::pos2(lane_area_left - 1.0, rect.top() + 4.0),
             egui::pos2(lane_area_left - 1.0, rect.bottom() - LABEL_BAND_H),
         ],
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0_f32, theme::BORDER),
     );
 
     let clip_fill_v = Color32::from_rgb(54, 68, 92);
@@ -477,7 +475,7 @@ pub fn show_multitrack(
             );
             // Selection outline.
             if state.selected_clips.contains(&clip.id) {
-                painter.rect_stroke(block, 3.0, Stroke::new(2.0, theme::ACCENT));
+                painter.rect_stroke(block, 3.0, Stroke::new(2.0_f32, theme::ACCENT));
             }
 
             // Click + drag hit-test. Click selects (with Ctrl/Cmd =
@@ -514,17 +512,6 @@ pub fn show_multitrack(
             if clip_resp.drag_stopped() {
                 out.clip_drag_ended = true;
             }
-            // Right-click → "Edit" opens the side edit panel for this clip.
-            let mut edit_picked = false;
-            clip_resp.context_menu(|ui| {
-                if ui.button("Edit").clicked() {
-                    edit_picked = true;
-                    ui.close_menu();
-                }
-            });
-            if edit_picked {
-                out.edit_requested = Some(clip.id);
-            }
         }
     }
 
@@ -545,7 +532,7 @@ pub fn show_multitrack(
     let lane_area_bot = rect.bottom() - LABEL_BAND_H;
     painter.line_segment(
         [egui::pos2(ph_x, lane_area_top), egui::pos2(ph_x, lane_area_bot)],
-        Stroke::new(2.5, Color32::WHITE),
+        Stroke::new(2.5_f32, Color32::WHITE),
     );
     let triangle = vec![
         egui::pos2(ph_x - 8.0, rect.top()),
@@ -600,7 +587,7 @@ pub fn show_multitrack(
         }
     }
 
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0, theme::BORDER));
+    painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, theme::BORDER));
     (response, out)
 }
 
@@ -642,7 +629,7 @@ pub fn scrubber(ui: &mut Ui, state: &mut TimelineState) -> ScrubberOutput {
     let handle_pos = egui::pos2(handle_x, rect.center().y);
     let handle_r = if response.hovered() || response.dragged() { 10.0 } else { 8.0 };
     painter.circle_filled(handle_pos, handle_r, theme::ACCENT);
-    painter.circle_stroke(handle_pos, handle_r, Stroke::new(1.5, Color32::WHITE));
+    painter.circle_stroke(handle_pos, handle_r, Stroke::new(1.5_f32, Color32::WHITE));
 
     if response.clicked() || response.dragged() {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -686,7 +673,7 @@ fn draw_ticks(
             painter.line_segment(
                 [egui::pos2(x, label_top),
                  egui::pos2(x, label_top + 4.0)],
-                Stroke::new(1.0, minor_color),
+                Stroke::new(1.0_f32, minor_color),
             );
             t += minor_interval_s;
         }
@@ -700,13 +687,13 @@ fn draw_ticks(
         painter.line_segment(
             [egui::pos2(x, upper_bottom),
              egui::pos2(x, upper_bottom - 10.0)],
-            Stroke::new(1.5, major_color),
+            Stroke::new(1.5_f32, major_color),
         );
         // Tick inside label band
         painter.line_segment(
             [egui::pos2(x, label_top),
              egui::pos2(x, label_top + 8.0)],
-            Stroke::new(1.5, major_color),
+            Stroke::new(1.5_f32, major_color),
         );
         // Label, larger and more readable
         painter.text(
@@ -759,7 +746,7 @@ fn draw_handle(
     // Thin stem within the upper area only.
     painter.line_segment(
         [egui::pos2(x, rect.top() + 4.0), egui::pos2(x, upper_bot)],
-        Stroke::new(1.5, color),
+        Stroke::new(1.5_f32, color),
     );
     // Clamp the flag rect so it stays fully visible even when the mark
     // is at the very start (x = rect.left()) or end of the timeline.

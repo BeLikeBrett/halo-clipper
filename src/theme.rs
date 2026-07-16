@@ -37,35 +37,35 @@ pub fn apply(ctx: &Context) {
 
     visuals.panel_fill = BG_PANEL;
     visuals.window_fill = BG_MODAL;
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.window_rounding = Rounding::same(10.0);
     visuals.extreme_bg_color = Color32::from_rgb(10, 11, 14);
     visuals.faint_bg_color = Color32::from_rgb(30, 33, 38);
     visuals.override_text_color = Some(TEXT_PRIMARY);
     visuals.hyperlink_color = ACCENT;
     visuals.selection.bg_fill = ACCENT.linear_multiply(0.35);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     visuals.widgets.noninteractive.bg_fill = BG_PANEL;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
 
     visuals.widgets.inactive.bg_fill = BG_BUTTON;
     visuals.widgets.inactive.weak_bg_fill = BG_BUTTON;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.inactive.rounding = Rounding::same(6.0);
 
     visuals.widgets.hovered.bg_fill = BG_BUTTON_HOVER;
     visuals.widgets.hovered.weak_bg_fill = BG_BUTTON_HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT.linear_multiply(0.7));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT.linear_multiply(0.7));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.hovered.rounding = Rounding::same(6.0);
 
     visuals.widgets.active.bg_fill = BG_BUTTON_ACTIVE;
     visuals.widgets.active.weak_bg_fill = BG_BUTTON_ACTIVE;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.active.rounding = Rounding::same(6.0);
 
     visuals.widgets.open.bg_fill = BG_BUTTON_HOVER;

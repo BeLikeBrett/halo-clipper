@@ -1,30 +1,30 @@
 // Top-level UI + app state.
 //
-// Each frame we (1) drain finished thumbnail results from the worker,
-// (2) consume keyboard shortcuts, (3) render top/bottom/central panels,
-// (4) draw the export modal on top if an export is in progress or just
-// finished, and (5) request a new thumb if the playhead moved.
+// Each frame we (1) poll the proxy transcode + player state, (2) consume
+// keyboard shortcuts, (3) render top/bottom/central panels, and (4) draw
+// the export modal on top if an export is in progress or just finished.
 //
-// Long-running work (thumbs, ffmpeg export) lives on background threads.
-// The UI never blocks on subprocess output.
+// Long-running work (proxy generation, ffmpeg export) lives on background
+// threads. The UI never blocks on subprocess output.
 
-use crate::encode::{self, EncodeSettings, GpuVendor, ResolutionPreset, VideoCodec};
+use crate::encode::{
+    self, AudioCodec, EncodeQuality, EncodeSettings, GpuVendor, ResolutionPreset, VideoCodec,
+};
 use crate::export::{
     self, AudioTrackPlan, ClipRange, EncodeMode, ExportHandle, ExportPhase, ExportPlan,
 };
 use crate::media::{self, MediaInfo};
 use crate::player::Player;
 use crate::proxy;
-use crate::settings::Settings;
+use crate::settings::{ProxyQuality, Settings};
 use crate::theme;
-use crate::thumb::{ThumbRequest, ThumbWorker};
 use crate::timeline::{self, TimelineState};
 use crate::track::{self, Clip, ClipId, IdGen, LinkId, TextOverlay, Track, TrackId, TrackKind};
 use crate::video_fbo::{self, VideoFbo};
 
 use egui::{Align2, Color32, Frame, Margin, RichText, Rounding, Stroke};
 use glow::HasContext;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -64,7 +64,7 @@ struct Project {
     /// split — adding text on any clip of V1 reads as "caption the V1
     /// track" rather than "caption this one segment". The map is sparse
     /// so untouched tracks pay no allocation cost.
-    text_overlays: std::collections::HashMap<TrackId, TextOverlay>,
+    text_overlays: HashMap<TrackId, TextOverlay>,
     id_gen: IdGen,
     mode: EditMode,
 }
@@ -162,7 +162,7 @@ struct UndoSnapshot {
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
-    text_overlays: std::collections::HashMap<TrackId, TextOverlay>,
+    text_overlays: HashMap<TrackId, TextOverlay>,
 }
 
 impl UndoSnapshot {
@@ -198,13 +198,24 @@ pub enum ExportMode {
     /// was modified beyond cutting; otherwise re-encode with default
     /// preserve-quality settings (libx264 CRF 18 + AAC 192k).
     Auto,
-    /// Size-target encode that fits under Discord Nitro's 500 MB
-    /// upload limit. Always re-encodes via CBR with a resolution that
-    /// matches the bitrate budget.
-    DiscordNitro,
-    /// User-controlled. Resolution / codec / bitrate / etc. surfaced in
-    /// the modal. Always re-encodes.
+    /// Size-target encode that fits under a Discord upload cap (per-tier
+    /// presets + slider). Always re-encodes via CBR with a resolution
+    /// that matches the bitrate budget.
+    Discord,
+    /// User-controlled. Resolution / codec / quality / fps / audio all
+    /// surfaced in the modal. Always re-encodes.
     Custom,
+}
+
+/// How Custom mode drives the encoder's rate control.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RateControl {
+    /// Constant quality — CRF / QP / CQ / ICQ depending on codec.
+    /// Predictable quality, variable file size.
+    ConstantQuality,
+    /// Target bitrate with a maxrate cap. Predictable size, variable
+    /// quality.
+    Bitrate,
 }
 
 /// Persistent Custom-encode settings — kept on `ClipperApp` so the
@@ -213,45 +224,57 @@ pub enum ExportMode {
 pub struct CustomEncode {
     pub resolution: ResolutionPreset,
     pub video_codec: VideoCodec,
-    pub crf: u32,
+    pub rate_control: RateControl,
+    /// Constant-quality value, interpreted per codec (see
+    /// `VideoCodec::quality_name`). Reset to the codec's default when
+    /// the codec changes because the scales don't line up.
+    pub quality: u32,
     pub video_bitrate_kbps: u32,
     pub video_preset: String,
+    /// None = source frame rate.
+    pub fps_limit: Option<u32>,
+    pub audio_codec: AudioCodec,
     pub audio_bitrate_kbps: u32,
-    /// When false, only the resolution + codec are exposed. When true,
-    /// the full set of fields (CRF, preset, audio bitrate, …) unlocks.
+    /// When false, only the headline controls are exposed. When true,
+    /// the full set (encoder preset, audio codec/bitrate) unlocks.
     pub advanced_unlocked: bool,
 }
 
 impl CustomEncode {
-    fn default_for(src_w: u32, src_h: u32) -> Self {
-        let defaults = EncodeSettings::default_for_source(src_w, src_h);
-        let (crf, bitrate) = match defaults.quality {
-            encode::EncodeQuality::Crf(v) => (v, 8_000),
-            encode::EncodeQuality::Bitrate(v) => (18, v),
-        };
+    fn default_for(codec: VideoCodec) -> Self {
         Self {
             resolution: ResolutionPreset::Source,
-            video_codec: defaults.video_codec,
-            crf,
-            video_bitrate_kbps: bitrate,
-            video_preset: defaults.video_preset,
-            audio_bitrate_kbps: defaults.audio_bitrate_kbps,
+            video_codec: codec,
+            rate_control: RateControl::ConstantQuality,
+            quality: codec.default_quality(),
+            video_bitrate_kbps: ResolutionPreset::Source.default_bitrate_kbps(),
+            video_preset: codec.default_preset().into(),
+            fps_limit: None,
+            audio_codec: AudioCodec::Aac,
+            audio_bitrate_kbps: 192,
             advanced_unlocked: false,
         }
     }
 
+    /// Switch codec, resetting the codec-scale-dependent fields.
+    fn set_codec(&mut self, codec: VideoCodec) {
+        self.video_codec = codec;
+        self.video_preset = codec.default_preset().into();
+        self.quality = codec.default_quality();
+    }
+
     fn to_encode_settings(&self, src_w: u32, src_h: u32) -> EncodeSettings {
-        let quality = if self.video_codec.supports_crf() {
-            encode::EncodeQuality::Crf(self.crf)
-        } else {
-            encode::EncodeQuality::Bitrate(self.video_bitrate_kbps)
+        let quality = match self.rate_control {
+            RateControl::ConstantQuality => EncodeQuality::ConstantQuality(self.quality),
+            RateControl::Bitrate => EncodeQuality::Bitrate(self.video_bitrate_kbps),
         };
         EncodeSettings {
             resolution: self.resolution.dimensions(src_w, src_h),
             video_codec: self.video_codec,
             quality,
             video_preset: self.video_preset.clone(),
-            audio_codec: encode::AudioCodec::Aac,
+            fps_limit: self.fps_limit,
+            audio_codec: self.audio_codec,
             audio_bitrate_kbps: self.audio_bitrate_kbps,
         }
     }
@@ -295,10 +318,6 @@ struct ShortcutActions {
 pub struct ClipperApp {
     project: Option<Project>,
     status: String,
-    thumb_worker: ThumbWorker,
-    preview_texture: Option<egui::TextureHandle>,
-    preview_for_ms: i64,
-    last_requested_ms: Option<i64>,
     export_mode: ExportMode,
     /// Custom-encode settings persist between modal sessions so the user
     /// doesn't lose their preferences each time they cancel + reopen.
@@ -346,9 +365,6 @@ pub struct ClipperApp {
     /// the mouse-driven "intended" cut position separately from the
     /// (possibly snapped) actual position so snap stickiness has hysteresis.
     clip_drag_session: Option<ClipDragSession>,
-    /// Right-side Edit panel visibility (Advanced mode only). Contents
-    /// reflect whichever clip is currently selected.
-    edit_panel_open: bool,
     /// In-flight scrub-proxy transcode (None when cache hit or not yet
     /// started). On completion, update() swaps mpv to the finished file
     /// at the current playhead.
@@ -358,10 +374,10 @@ pub struct ClipperApp {
     settings: Settings,
     /// True while the File → Settings modal is open.
     settings_open: bool,
-    /// User-selected Discord Nitro target file size, in MB. Lets the
-    /// user dial down from the 475 MB max for short clips where they'd
-    /// rather have a smaller file than maximum quality. Persists for
-    /// the session; not saved to disk.
+    /// User-selected Discord target file size, in MB. Tier chips set it
+    /// to the matching upload cap; the slider allows anything between
+    /// the free tier's 10 MB and Nitro's headroom-adjusted 475 MB.
+    /// Persists for the session; not saved to disk.
     discord_target_mb: u32,
 }
 
@@ -381,25 +397,18 @@ impl ClipperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
         theme::apply(&cc.egui_ctx);
         let player = Arc::new(Player::new()?);
+        // One probe each — the results feed both the stored fields and
+        // the Custom-encode defaults.
+        let available_hw_codecs = encode::detect_hw_encoders();
+        let detected_gpu = encode::detect_gpu();
+        let recommended = encode::recommend_codec(detected_gpu, &available_hw_codecs);
         Ok(Self {
             project: None,
             status: "Open a video to begin.".into(),
-            thumb_worker: ThumbWorker::spawn(),
-            preview_texture: None,
-            preview_for_ms: -1,
-            last_requested_ms: None,
             export_mode: ExportMode::Auto,
-            custom_encode: {
-                let hw = encode::detect_hw_encoders();
-                let gpu = encode::detect_gpu();
-                let recommended = encode::recommend_codec(gpu, &hw);
-                let mut c = CustomEncode::default_for(1920, 1080);
-                c.video_codec = recommended;
-                c.video_preset = recommended.default_preset().into();
-                c
-            },
-            available_hw_codecs: encode::detect_hw_encoders(),
-            detected_gpu: encode::detect_gpu(),
+            custom_encode: CustomEncode::default_for(recommended),
+            available_hw_codecs,
+            detected_gpu,
             export: None,
             player,
             volume_ui: 100.0,
@@ -415,7 +424,6 @@ impl ClipperApp {
             last_audio_track_muted: false,
             last_clip_speed: 1.0,
             clip_drag_session: None,
-            edit_panel_open: false,
             proxy_handle: None,
             settings: Settings::load(),
             settings_open: false,
@@ -588,7 +596,13 @@ impl ClipperApp {
         else {
             return;
         };
+        self.open_path(path);
+    }
 
+    /// Open a source file directly — used by the file dialog, and by
+    /// main() when a path arrives on the command line ("Open With" from
+    /// a file manager).
+    pub fn open_path(&mut self, path: PathBuf) {
         match media::probe(&path) {
             Ok(info) => {
                 let size_str = std::fs::metadata(&path)
@@ -612,8 +626,9 @@ impl ClipperApp {
                 // Decide preview source: cached proxy if available,
                 // otherwise the original (we'll kick off a transcode
                 // below so subsequent opens hit the cache).
-                let cached_proxy = if proxy::proxy_exists(&path) {
-                    proxy::proxy_path_for(&path)
+                let proxy_quality = self.settings.proxy_quality;
+                let cached_proxy = if proxy::proxy_exists(&path, proxy_quality) {
+                    proxy::proxy_path_for(&path, proxy_quality)
                 } else {
                     None
                 };
@@ -632,6 +647,7 @@ impl ClipperApp {
                         &path,
                         info.duration_ms,
                         self.proxy_can_use_vaapi(),
+                        proxy_quality,
                     ) {
                         Ok(h) => {
                             self.proxy_handle = Some(h);
@@ -659,13 +675,10 @@ impl ClipperApp {
                     tracks: Vec::new(),
                     clips: Vec::new(),
                     selected_clips: HashSet::new(),
-                    text_overlays: std::collections::HashMap::new(),
+                    text_overlays: HashMap::new(),
                     id_gen: IdGen::default(),
                     mode: EditMode::SimpleClip,
                 });
-                self.preview_texture = None;
-                self.preview_for_ms = -1;
-                self.last_requested_ms = None;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
             }
@@ -674,35 +687,6 @@ impl ClipperApp {
                 log::error!("probe failed: {e:#}");
             }
         }
-    }
-
-    fn drain_thumb_results(&mut self, ctx: &egui::Context) {
-        while let Ok(result) = self.thumb_worker.rx.try_recv() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [result.width as usize, result.height as usize],
-                &result.rgba,
-            );
-            let tex = ctx.load_texture(
-                format!("preview_{}", result.timestamp_ms),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.preview_for_ms = result.timestamp_ms;
-            self.preview_texture = Some(tex);
-        }
-    }
-
-    fn maybe_request_thumb(&mut self) {
-        let Some(project) = &self.project else { return };
-        if self.last_requested_ms == Some(project.playhead_ms) {
-            return;
-        }
-        self.last_requested_ms = Some(project.playhead_ms);
-        self.thumb_worker.request(ThumbRequest {
-            source: project.source.clone(),
-            timestamp_ms: project.playhead_ms,
-            target_width: 1280,
-        });
     }
 
     /// Drive playback in MultiTrack mode. mpv plays the source linearly;
@@ -1128,10 +1112,11 @@ impl ClipperApp {
         }
     }
 
-    /// The total cut duration in ms — used by size-targeted modes
-    /// (Discord Nitro) to compute the bitrate budget.
+    /// The total output duration in ms — used by size-targeted modes
+    /// (Discord) to compute the bitrate budget.
     /// - SimpleClip: out - in
-    /// - MultiTrack: sum of video clip durations (cut output length)
+    /// - MultiTrack: real output length — gaps kept (they export as
+    ///   black), per-clip speed applied (a 2× clip renders half as long)
     fn cut_duration_ms_for_export(&self, project: &Project) -> i64 {
         match project.mode {
             EditMode::SimpleClip => match (project.in_ms, project.out_ms) {
@@ -1140,13 +1125,13 @@ impl ClipperApp {
             },
             EditMode::MultiTrack => {
                 if let Some(v) = project.first_video_track() {
-                    project
-                        .clips
+                    let clips = collect_track_clips(&project.clips, v);
+                    let end = clips
                         .iter()
-                        .filter(|c| c.track_id == v)
-                        .map(|c| c.src_duration_ms())
-                        .sum::<i64>()
-                        .max(1)
+                        .map(|c| c.cut_start_ms + (c.src_end_ms - c.src_start_ms).max(0))
+                        .max()
+                        .unwrap_or(0);
+                    export::output_duration_ms(&clips, end).max(1)
                 } else {
                     project.media.duration_ms
                 }
@@ -1184,7 +1169,7 @@ impl ClipperApp {
                         self.custom_encode.resolution.label(),
                     )),
                 ),
-                ExportMode::DiscordNitro => {
+                ExportMode::Discord => {
                     let target_bytes =
                         encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
                     let settings = encode::DiscordNitro::settings_for(
@@ -1201,7 +1186,7 @@ impl ClipperApp {
                     (
                         EncodeMode::Encode(settings),
                         Some(format!(
-                            "Discord Nitro → {} CBR (≈ {:.0} MB target).",
+                            "Discord → {} CBR (≈ {:.0} MB target).",
                             nitro_codec.display(),
                             est_mb,
                         )),
@@ -1260,7 +1245,11 @@ impl ClipperApp {
                 }
                 // Linked state (no audio clip detached) → only A1 plays.
                 // After Detach Audio → mix every track honoring per-track
-                // mute. Matches the preview's audio routing.
+                // mute. Matches the preview's audio routing. Tracks whose
+                // stream index doesn't exist in the source are dropped —
+                // the data model guarantees one audio lane even for
+                // soundless videos, but referencing [0:a:0] on a file
+                // with no audio stream would abort the whole export.
                 let any_audio_detached = project.clips.iter().any(|c| {
                     c.link.is_none()
                         && project.tracks.iter().any(|t| {
@@ -1279,6 +1268,10 @@ impl ClipperApp {
                     )
                 };
                 let audio_tracks: Vec<AudioTrackPlan> = audio_track_iter
+                    .filter(|t| {
+                        t.source_audio_index.unwrap_or(0)
+                            < project.media.audio_stream_count
+                    })
                     .map(|t| AudioTrackPlan {
                         source_audio_index: t.source_audio_index.unwrap_or(0),
                         muted: t.muted,
@@ -1288,14 +1281,14 @@ impl ClipperApp {
                     .collect();
                 let video_text_overlay = project.text_overlays.get(&video_track).cloned();
                 // MultiTrack always re-encodes (filter_complex requires
-                // decode). Auto/Custom/DiscordNitro all route through
-                // the filter graph; they just produce different
+                // decode). Auto/Custom/Discord all route through the
+                // filter graph; they just produce different
                 // EncodeSettings.
                 let nitro_target_bytes =
                     encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
                 let settings = match self.export_mode {
                     ExportMode::Custom => self.custom_encode.to_encode_settings(src_w, src_h),
-                    ExportMode::DiscordNitro => encode::DiscordNitro::settings_for(
+                    ExportMode::Discord => encode::DiscordNitro::settings_for(
                         cut_duration_ms,
                         nitro_target_bytes,
                         src_w,
@@ -1310,13 +1303,13 @@ impl ClipperApp {
                         settings.video_codec.display(),
                         self.custom_encode.resolution.label(),
                     ),
-                    ExportMode::DiscordNitro => {
+                    ExportMode::Discord => {
                         let est_mb = encode::DiscordNitro::estimated_size_bytes(
                             cut_duration_ms,
                             nitro_target_bytes,
                         ) as f64 / (1024.0 * 1024.0);
                         format!(
-                            "Discord Nitro → {} CBR (≈ {:.0} MB target; multi-track filter graph).",
+                            "Discord → {} CBR (≈ {:.0} MB target; multi-track filter graph).",
                             settings.video_codec.display(),
                             est_mb,
                         )
@@ -1330,6 +1323,9 @@ impl ClipperApp {
                         source: project.source.clone(),
                         destination,
                         source_codec: project.media.video_codec.clone(),
+                        src_width: project.media.width,
+                        src_height: project.media.height,
+                        src_fps: project.media.fps,
                         video_clips,
                         video_text_overlay,
                         audio_tracks,
@@ -1486,7 +1482,6 @@ impl ClipperApp {
 
 impl eframe::App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_thumb_results(ctx);
         self.tick_proxy();
         self.sync_audio_mix();
         self.sync_clip_speed();
@@ -1576,7 +1571,7 @@ impl eframe::App for ClipperApp {
                     });
 
                     ui.separator();
-                    ui.label(RichText::new("✂  Brett's Simple Clipper")
+                    ui.label(RichText::new("✂  Halo Clipper")
                         .size(15.0)
                         .strong()
                         .color(theme::TEXT_PRIMARY));
@@ -1650,13 +1645,13 @@ impl eframe::App for ClipperApp {
                 self.show_media_list(ui);
             });
 
-        // Right: Edit panel. Only meaningful in Advanced mode; auto-closes
-        // when the mode switches back to Simple Clip.
-        if self.edit_panel_open
-            && self
-                .project
-                .as_ref()
-                .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        // Right: Edit panel. Shows whenever a clip is selected in
+        // Advanced mode — click a clip to edit it, click empty lane (or
+        // switch modes) and it goes away. No open/close ceremony.
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack && !p.selected_clips.is_empty())
         {
             egui::SidePanel::right("edit_panel")
                 .resizable(true)
@@ -1667,8 +1662,6 @@ impl eframe::App for ClipperApp {
                 .show(ctx, |ui| {
                     self.show_edit_panel(ui);
                 });
-        } else {
-            self.edit_panel_open = false;
         }
 
         // Central: preview top-right, rest empty (room for future tracks/effects)
@@ -1741,12 +1734,6 @@ impl eframe::App for ClipperApp {
         }
 
         self.was_dragging_seek = self.user_dragging_seek;
-
-        // Don't burn ffmpeg cycles refreshing the still preview while mpv
-        // is playing — the live picture is in mpv's window.
-        if !mpv_playing {
-            self.maybe_request_thumb();
-        }
     }
 
     /// Final shutdown hook. eframe calls this once the user has closed
@@ -1772,11 +1759,13 @@ impl eframe::App for ClipperApp {
 }
 
 impl ClipperApp {
-    /// Right-side Edit panel. Reflects whichever clip is currently
-    /// selected. Settings act on the audio TRACK that owns the clip (or
-    /// every linked audio partner track if a video clip is selected),
-    /// so changes are immediately audible in preview and consistent
-    /// between collapsed and detached states. Closes via the X button.
+    /// Right-side Edit panel. Appears automatically while a clip is
+    /// selected in Advanced mode and reflects that clip. Settings act on
+    /// the audio TRACK that owns the clip (or every linked audio partner
+    /// track if a video clip is selected), so changes are immediately
+    /// audible in preview and consistent between collapsed and detached
+    /// states. The ✕ deselects, which hides the panel — clicking empty
+    /// timeline does the same.
     fn show_edit_panel(&mut self, ui: &mut egui::Ui) {
         let mut want_close = false;
         ui.horizontal(|ui| {
@@ -1789,7 +1778,7 @@ impl ClipperApp {
                         .rounding(Rounding::same(4.0))
                         .min_size(egui::vec2(28.0, 28.0)),
                 )
-                .on_hover_text("Close")
+                .on_hover_text("Deselect")
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if close.clicked() {
                     want_close = true;
@@ -1881,9 +1870,10 @@ impl ClipperApp {
         };
 
         let Some(snap) = snap else {
-            ui.label(RichText::new("Right-click a clip and choose Edit.")
+            // Shouldn't happen (the panel only renders with a selection),
+            // but stay graceful if the selected clip vanished mid-frame.
+            ui.label(RichText::new("Select a clip on the timeline.")
                 .color(theme::TEXT_MUTED));
-            if want_close { self.edit_panel_open = false; }
             return;
         };
 
@@ -2086,17 +2076,31 @@ impl ClipperApp {
                     overlay.color = color;
                 }
 
+                // Typography extras — outline, shadow, opacity. All baked
+                // into the export via drawtext; the preview approximates
+                // them (see show_text_overlay_handle).
+                let outline_resp = ui.add(
+                    egui::Slider::new(&mut overlay.outline_px, 0..=12)
+                        .text("Outline"),
+                );
+                if outline_resp.drag_started() { self.push_undo(); }
+                let opacity_resp = ui.add(
+                    egui::Slider::new(&mut overlay.opacity, 0.1..=1.0)
+                        .step_by(0.05)
+                        .text("Opacity"),
+                );
+                if opacity_resp.drag_started() { self.push_undo(); }
+                let mut shadow = overlay.shadow;
+                if ui.checkbox(&mut shadow, "Drop shadow").changed() {
+                    self.push_undo();
+                    overlay.shadow = shadow;
+                }
+
                 ui.label(RichText::new("Applies to the whole track. Drag the handle on the preview to reposition.")
                     .small().color(theme::TEXT_MUTED.linear_multiply(0.7)));
 
                 // Write back if anything actually changed.
-                let changed = overlay.text != original.text
-                    || (overlay.x - original.x).abs() > 0.0001
-                    || (overlay.y - original.y).abs() > 0.0001
-                    || overlay.font_size_px != original.font_size_px
-                    || overlay.color != original.color
-                    || overlay.font != original.font;
-                if changed {
+                if overlay != original {
                     if let (Some(tid), Some(p)) = (track_id_for_text, self.project.as_mut()) {
                         p.text_overlays.insert(tid, overlay);
                     }
@@ -2104,16 +2108,10 @@ impl ClipperApp {
             }
         }
 
-        // ─────────── Drawing tools (placeholder) ───────────
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(10.0);
-        ui.label(RichText::new("Drawing").color(theme::TEXT_MUTED).small());
-        ui.label(RichText::new("Coming soon — freehand + shape annotations.")
-            .small().color(theme::TEXT_MUTED.linear_multiply(0.7)));
-
         if want_close {
-            self.edit_panel_open = false;
+            if let Some(p) = self.project.as_mut() {
+                p.selected_clips.clear();
+            }
         }
     }
 
@@ -2140,7 +2138,7 @@ impl ClipperApp {
                 .fill(theme::BG_BUTTON_HOVER)
                 .rounding(Rounding::same(6.0))
                 .inner_margin(Margin::symmetric(10.0, 8.0))
-                .stroke(Stroke::new(1.0, theme::ACCENT.linear_multiply(0.6)))
+                .stroke(Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.6)))
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(name)
@@ -2201,9 +2199,18 @@ impl ClipperApp {
 
         let cx = preview_rect.left() + overlay.x.clamp(0.0, 1.0) * preview_rect.width();
         let cy = preview_rect.top() + overlay.y.clamp(0.0, 1.0) * preview_rect.height();
-        let color = Color32::from_rgb(overlay.color[0], overlay.color[1], overlay.color[2]);
+        let opacity = overlay.opacity.clamp(0.1, 1.0);
+        let alpha = (opacity * 255.0) as u8;
+        let color = Color32::from_rgba_unmultiplied(
+            overlay.color[0],
+            overlay.color[1],
+            overlay.color[2],
+            alpha,
+        );
+        // Preview approximations of the export-side drawtext layers. The
+        // pixel scale matches the font scaling above so proportions hold.
+        let px = preview_rect.height() / source_h;
 
-        // Paint the caption text itself.
         let galley = ui.painter().layout_no_wrap(
             overlay.text.clone(),
             font_id.clone(),
@@ -2211,6 +2218,40 @@ impl ClipperApp {
         );
         let text_size = galley.size();
         let text_pos = egui::pos2(cx - text_size.x * 0.5, cy - text_size.y * 0.5);
+
+        // Drop shadow: one offset black pass under everything.
+        if overlay.shadow {
+            let off = (2.0 * px).max(1.0);
+            let shadow_color =
+                Color32::from_rgba_unmultiplied(0, 0, 0, (0.6 * opacity * 255.0) as u8);
+            let g = ui.painter().layout_no_wrap(
+                overlay.text.clone(),
+                font_id.clone(),
+                shadow_color,
+            );
+            ui.painter().galley(
+                text_pos + egui::vec2(off, off),
+                g,
+                shadow_color,
+            );
+        }
+        // Outline: eight offset black passes ringing the fill. Cruder
+        // than drawtext's real border but reads the same at preview size.
+        if overlay.outline_px > 0 {
+            let r = (overlay.outline_px as f32 * px).max(1.0);
+            let outline_color = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
+            for (dx, dy) in [
+                (-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r),
+                (-r, -r), (r, -r), (-r, r), (r, r),
+            ] {
+                let g = ui.painter().layout_no_wrap(
+                    overlay.text.clone(),
+                    font_id.clone(),
+                    outline_color,
+                );
+                ui.painter().galley(text_pos + egui::vec2(dx, dy), g, outline_color);
+            }
+        }
         ui.painter().galley(text_pos, galley, color);
 
         // Drag-hit area: a touch larger than the rendered text so it's
@@ -2229,9 +2270,9 @@ impl ClipperApp {
         );
         if resp.hovered() || resp.dragged() {
             let stroke = if resp.dragged() {
-                egui::Stroke::new(2.0, theme::ACCENT)
+                egui::Stroke::new(2.0_f32, theme::ACCENT)
             } else {
-                egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(150, 200, 255, 180))
+                egui::Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(150, 200, 255, 180))
             };
             ui.painter().rect_stroke(handle, 4.0, stroke);
             ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
@@ -2295,7 +2336,7 @@ impl ClipperApp {
         Frame::none()
             .fill(theme::BG_PREVIEW)
             .rounding(Rounding::same(8.0))
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
             .show(&mut child, |ui| {
                 ui.set_min_size(preview_rect.size());
                 ui.set_max_size(preview_rect.size());
@@ -2449,7 +2490,7 @@ impl ClipperApp {
                             grip_rect.bottom() - 3.0 - off),
                  egui::pos2(grip_rect.left() + 3.0 + off,
                             grip_rect.bottom() - 3.0)],
-                Stroke::new(1.5, grip_color),
+                Stroke::new(1.5_f32, grip_color),
             );
         }
         if grip_resp.hovered() || grip_resp.dragged() {
@@ -2476,8 +2517,6 @@ impl ClipperApp {
         let mut clip_drag_started: Option<(ClipId, f32)> = None;
         let mut clip_drag_delta: Option<(ClipId, i64)> = None;
         let mut clip_drag_ended: bool = false;
-        let mut want_open_edit_panel = false;
-
         if let Some(project) = &mut self.project {
             let mode = project.mode;
             // Display length stays put when clips are deleted — the canvas
@@ -2558,12 +2597,6 @@ impl ClipperApp {
                     clip_drag_started = mt_out.clip_drag_started;
                     clip_drag_delta = mt_out.clip_drag_delta;
                     clip_drag_ended = mt_out.clip_drag_ended;
-                    if let Some(id) = mt_out.edit_requested {
-                        // Right-click → Edit also makes that clip the
-                        // current selection so the panel shows it.
-                        want_selection = Some(SelectionChange::ReplaceWith(id));
-                        want_open_edit_panel = true;
-                    }
                     if mt_out.linked_audio_mute_toggled {
                         want_toggle_linked_audio = true;
                     }
@@ -2742,9 +2775,6 @@ impl ClipperApp {
                 }
             }
         }
-        if want_open_edit_panel {
-            self.edit_panel_open = true;
-        }
         self.user_dragging_seek = dragging_any;
     }
 
@@ -2765,8 +2795,8 @@ impl ClipperApp {
     }
 
     /// File → Settings modal. Houses preferences that persist across
-    /// runs in `~/.config/brett-clipper/config.json`. Today: just the
-    /// proxy-cache toggle + a manual clear button.
+    /// runs in `~/.config/halo-clipper/config.json`: proxy quality,
+    /// cache auto-clear, and a manual cache-clear button.
     fn show_settings_modal(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         ctx.layer_painter(egui::LayerId::new(
@@ -2787,12 +2817,12 @@ impl ClipperApp {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .resizable(false)
-            .fixed_size([560.0, 360.0])
+            .fixed_size([560.0, 470.0])
             .frame(
                 Frame::window(&ctx.style())
                     .fill(theme::BG_MODAL)
                     .rounding(Rounding::same(12.0))
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .inner_margin(Margin::same(28.0)),
             )
             .show(ctx, |ui| {
@@ -2804,11 +2834,53 @@ impl ClipperApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("Saved to ~/.config/brett-clipper/config.json")
+                    RichText::new("Saved to ~/.config/halo-clipper/config.json")
                         .size(12.0)
                         .color(theme::TEXT_MUTED),
                 );
                 ui.add_space(22.0);
+
+                ui.label(
+                    RichText::new("Scrub proxy quality")
+                        .size(14.5)
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.radio_value(
+                        &mut self.settings.proxy_quality,
+                        ProxyQuality::Standard,
+                        RichText::new("Standard").size(13.0),
+                    )
+                    .on_hover_text(
+                        "Keyframe every 12 frames — small proxies, scrubs land \
+                         within a fraction of a second of the pointer.",
+                    );
+                    ui.radio_value(
+                        &mut self.settings.proxy_quality,
+                        ProxyQuality::AllIntra,
+                        RichText::new("All-intra (frame-exact)").size(13.0),
+                    )
+                    .on_hover_text(
+                        "Every frame is a keyframe — scrubs land exactly where \
+                         you point, but proxies are several times larger and \
+                         slower to generate.",
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Applies to the next video you open. Existing proxies \
+                         for the other profile stay cached.",
+                    )
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+                );
+
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(18.0);
 
                 ui.label(
                     RichText::new("Scrub proxy cache")
@@ -2937,9 +3009,9 @@ impl ClipperApp {
         let mut cancel = false;
         let mut next_mode = self.export_mode;
         let modal_height = match self.export_mode {
-            ExportMode::Custom if self.custom_encode.advanced_unlocked => 760.0,
-            ExportMode::Custom => 600.0,
-            ExportMode::DiscordNitro => 560.0,
+            ExportMode::Custom if self.custom_encode.advanced_unlocked => 840.0,
+            ExportMode::Custom => 680.0,
+            ExportMode::Discord => 620.0,
             ExportMode::Auto => 430.0,
         };
 
@@ -2955,7 +3027,7 @@ impl ClipperApp {
                 Frame::window(&ctx.style())
                     .fill(theme::BG_MODAL)
                     .rounding(Rounding::same(12.0))
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .inner_margin(Margin::same(28.0)),
             )
             .show(ctx, |ui| {
@@ -2986,17 +3058,18 @@ impl ClipperApp {
                          CRF 18 to preserve source quality.",
                     ),
                     (
-                        ExportMode::DiscordNitro,
-                        "Discord Nitro (500 MB)",
-                        "Size-targeted CBR encode that fits Discord Nitro's 500 \
-                         MB upload limit. Picks resolution + bitrate from the \
-                         clip's duration.",
+                        ExportMode::Discord,
+                        "Discord",
+                        "Size-targeted encode that fits under a Discord upload \
+                         cap — pick your tier (Free 10 MB / Nitro Basic 50 MB / \
+                         Nitro 500 MB) or dial in any size.",
                     ),
                     (
                         ExportMode::Custom,
                         "Custom",
-                        "Pick a resolution and codec. Toggle Advanced for CRF, \
-                         preset, audio bitrate, and bigger control.",
+                        "Pick resolution, codec, quality-or-bitrate, and frame \
+                         rate. Toggle Advanced for encoder preset and audio \
+                         codec/bitrate.",
                     ),
                 ] {
                     let selected = next_mode == mode;
@@ -3016,11 +3089,11 @@ impl ClipperApp {
                         theme::BG_BUTTON
                     };
                     let stroke = if selected {
-                        Stroke::new(2.0, theme::ACCENT)
+                        Stroke::new(2.0_f32, theme::ACCENT)
                     } else if row.hovered() {
-                        Stroke::new(1.0, theme::ACCENT.linear_multiply(0.5))
+                        Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.5))
                     } else {
-                        Stroke::new(1.0, theme::BORDER)
+                        Stroke::new(1.0_f32, theme::BORDER)
                     };
                     ui.painter()
                         .rect(row.rect, Rounding::same(8.0), bg, stroke);
@@ -3032,7 +3105,7 @@ impl ClipperApp {
                     ui.painter().circle_stroke(
                         egui::pos2(indicator_x, indicator_y),
                         indicator_radius,
-                        Stroke::new(1.5, if selected { theme::ACCENT } else { theme::BORDER }),
+                        Stroke::new(1.5_f32, if selected { theme::ACCENT } else { theme::BORDER }),
                     );
                     if selected {
                         ui.painter().circle_filled(
@@ -3075,7 +3148,7 @@ impl ClipperApp {
 
                 // Per-mode sub-panel.
                 match next_mode {
-                    ExportMode::DiscordNitro => {
+                    ExportMode::Discord => {
                         ui.add_space(10.0);
                         ui.separator();
                         ui.add_space(12.0);
@@ -3129,9 +3202,9 @@ impl ClipperApp {
         }
     }
 
-    /// Stats panel for Discord Nitro mode. Recomputes the target
-    /// bitrate / resolution from the current cut duration each frame so
-    /// the user sees what's about to encode without having to commit.
+    /// Stats panel for Discord mode. Recomputes the target bitrate /
+    /// resolution from the current cut duration each frame so the user
+    /// sees what's about to encode without having to commit.
     fn show_discord_nitro_panel(&mut self, ui: &mut egui::Ui) {
         let Some(project) = self.project.as_ref() else {
             ui.label(RichText::new("Open a video first.").color(theme::TEXT_MUTED));
@@ -3139,17 +3212,26 @@ impl ClipperApp {
         };
         let duration_ms = self.cut_duration_ms_for_export(project);
 
-        // ── Target-size slider ──
-        // Lets the user dial down from the 475 MB max — useful for short
-        // clips where they'd rather have a smaller file than a forced
-        // max-quality 475 MB blob.
+        // ── Tier presets + target-size slider ──
+        // One chip per Discord subscription tier; the slider covers
+        // everything in between for people who want a specific size.
         ui.label(
             RichText::new("Target file size")
                 .size(13.0)
                 .strong()
                 .color(theme::TEXT_PRIMARY),
         );
-        ui.add_space(4.0);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (label, mb) in encode::DiscordNitro::TIERS {
+                let active = self.discord_target_mb == *mb;
+                if speed_preset_chip(ui, label, active).clicked() {
+                    self.discord_target_mb = *mb;
+                }
+            }
+        });
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().slider_width = 380.0;
             ui.add(
@@ -3158,15 +3240,15 @@ impl ClipperApp {
                     encode::DiscordNitro::MIN_TARGET_MB
                         ..=encode::DiscordNitro::MAX_TARGET_MB,
                 )
-                .step_by(25.0)
+                .step_by(5.0)
                 .suffix(" MB"),
             );
         });
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "475 MB = max quality (default). Drag down for smaller files \
-                 on short clips — the encoder picks resolution + bitrate to fit.",
+                "Pick the tier matching where you'll upload, or drag the \
+                 slider — the encoder picks resolution + bitrate to fit.",
             )
             .size(11.5)
             .color(theme::TEXT_MUTED),
@@ -3180,6 +3262,8 @@ impl ClipperApp {
             encode::DiscordNitro::total_kbps_for(duration_ms, target_bytes);
         let video_kbps =
             encode::DiscordNitro::video_kbps_for(duration_ms, target_bytes);
+        let audio_kbps =
+            encode::DiscordNitro::audio_kbps_for(duration_ms, target_bytes);
         // True when the MAX_BITRATE_KBPS global ceiling is doing more
         // work than the slider. Short clips can't usefully consume the
         // full target; we surface that so the user understands why a
@@ -3218,7 +3302,7 @@ impl ClipperApp {
                 format!(
                     "{:.1} Mbps video + {} kbps audio{}",
                     video_kbps as f64 / 1000.0,
-                    encode::DiscordNitro::AUDIO_KBPS,
+                    audio_kbps,
                     if cap_dominates { "  (capped)" } else { "" },
                 ),
             ),
@@ -3259,7 +3343,7 @@ impl ClipperApp {
                 self.discord_target_mb,
                 est_mb_rounded,
             )
-        } else if video_kbps + encode::DiscordNitro::AUDIO_KBPS < 500 {
+        } else if video_kbps + audio_kbps < 500 {
             "Long clip at this target — bitrate is very low, picture may look soft."
                 .into()
         } else {
@@ -3268,7 +3352,7 @@ impl ClipperApp {
                 est_mb_rounded,
             )
         };
-        let note_color = if cap_dominates || video_kbps + encode::DiscordNitro::AUDIO_KBPS < 500 {
+        let note_color = if cap_dominates || video_kbps + audio_kbps < 500 {
             theme::ACCENT_ERR.linear_multiply(0.85)
         } else {
             theme::TEXT_MUTED
@@ -3276,11 +3360,14 @@ impl ClipperApp {
         ui.label(RichText::new(note).size(12.5).color(note_color));
     }
 
-    /// The body of the Custom export panel. Renders resolution +
-    /// codec controls; reveals CRF/preset/audio settings when the
-    /// "Advanced" toggle is on.
+    /// The body of the Custom export panel. Headline controls:
+    /// resolution, frame rate, codec, rate control (constant quality vs
+    /// target bitrate). The "Advanced" toggle reveals encoder preset and
+    /// audio codec/bitrate.
     fn show_custom_encode_panel(&mut self, ui: &mut egui::Ui) {
-        // Resolution row.
+        let src_fps = self.project.as_ref().map(|p| p.media.fps).unwrap_or(0.0);
+
+        // Resolution + frame rate on one row.
         ui.horizontal(|ui| {
             ui.label(RichText::new("Resolution").color(theme::TEXT_MUTED).small());
             let current = self.custom_encode.resolution;
@@ -3298,7 +3385,45 @@ impl ClipperApp {
                         }
                     }
                 });
+
+            ui.add_space(12.0);
+            ui.label(RichText::new("Frame rate").color(theme::TEXT_MUTED).small());
+            let fps_label = |limit: Option<u32>| match limit {
+                None => {
+                    if src_fps > 0.0 {
+                        format!("Source ({src_fps:.0} fps)")
+                    } else {
+                        "Source".into()
+                    }
+                }
+                Some(n) => format!("{n} fps"),
+            };
+            egui::ComboBox::from_id_salt("custom_fps")
+                .selected_text(fps_label(self.custom_encode.fps_limit))
+                .show_ui(ui, |ui| {
+                    for option in [None, Some(24), Some(30), Some(60)] {
+                        ui.selectable_value(
+                            &mut self.custom_encode.fps_limit,
+                            option,
+                            fps_label(option),
+                        );
+                    }
+                });
         });
+        if self
+            .custom_encode
+            .fps_limit
+            .is_some_and(|n| src_fps > 0.0 && n as f64 >= src_fps + 0.5)
+        {
+            ui.label(
+                RichText::new(
+                    "Chosen frame rate is above the source's — frames will be \
+                     duplicated, not gained.",
+                )
+                .small()
+                .color(theme::ACCENT_ERR.linear_multiply(0.85)),
+            );
+        }
         ui.add_space(6.0);
 
         // Recommendation banner — surfaces what the GPU probe came up
@@ -3354,49 +3479,92 @@ impl ClipperApp {
                         };
                         let resp = ui.selectable_label(*codec == current, label);
                         if resp.clicked() && *codec != current {
-                            self.custom_encode.video_codec = *codec;
-                            self.custom_encode.video_preset =
-                                codec.default_preset().to_string();
+                            self.custom_encode.set_codec(*codec);
                         }
                     }
                 });
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
-        // Quality row — CRF (SW codecs) or bitrate (HW codecs / when
-        // user explicitly chose a constant bitrate).
-        let supports_crf = self.custom_encode.video_codec.supports_crf();
-        if supports_crf {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Quality (CRF)").color(theme::TEXT_MUTED).small());
-                ui.add(
-                    egui::Slider::new(&mut self.custom_encode.crf, 14..=32)
-                        .text("lower = better"),
-                );
-            });
-            ui.label(
-                RichText::new("18 = visually lossless, 23 = default, 28 = small file.")
+        // Rate control: constant quality (default) vs target bitrate.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Rate control").color(theme::TEXT_MUTED).small());
+            ui.radio_value(
+                &mut self.custom_encode.rate_control,
+                RateControl::ConstantQuality,
+                "Constant quality",
+            )
+            .on_hover_text("Same visual quality everywhere; file size varies with content.");
+            ui.radio_value(
+                &mut self.custom_encode.rate_control,
+                RateControl::Bitrate,
+                "Target bitrate",
+            )
+            .on_hover_text("Predictable file size; quality varies with content.");
+        });
+        ui.add_space(4.0);
+
+        match self.custom_encode.rate_control {
+            RateControl::ConstantQuality => {
+                let codec = self.custom_encode.video_codec;
+                let range = codec.quality_range();
+                self.custom_encode.quality =
+                    self.custom_encode.quality.clamp(*range.start(), *range.end());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Quality ({})", codec.quality_name()))
+                            .color(theme::TEXT_MUTED)
+                            .small(),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.custom_encode.quality, range)
+                            .text("lower = better"),
+                    );
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "{} ≈ visually lossless. Each step up shrinks the file \
+                         and softens fine detail.",
+                        codec.default_quality(),
+                    ))
                     .small()
                     .color(theme::TEXT_MUTED.linear_multiply(0.7)),
-            );
-        } else {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Bitrate (kbps)").color(theme::TEXT_MUTED).small());
-                ui.add(
-                    egui::Slider::new(
-                        &mut self.custom_encode.video_bitrate_kbps,
-                        500..=50_000,
-                    )
-                    .logarithmic(true),
                 );
-            });
+            }
+            RateControl::Bitrate => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Bitrate (kbps)").color(theme::TEXT_MUTED).small());
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.custom_encode.video_bitrate_kbps,
+                            500..=50_000,
+                        )
+                        .logarithmic(true),
+                    );
+                });
+                // Rough size estimate so the slider means something.
+                if let Some(project) = self.project.as_ref() {
+                    let dur_ms = self.cut_duration_ms_for_export(project);
+                    let total_kbps = self.custom_encode.video_bitrate_kbps as i64
+                        + self.custom_encode.audio_bitrate_kbps as i64;
+                    let est_mb =
+                        (total_kbps * dur_ms) as f64 / 8_000.0 / (1024.0 * 1024.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "≈ {est_mb:.0} MB at the current cut length."
+                        ))
+                        .small()
+                        .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+                    );
+                }
+            }
         }
         ui.add_space(8.0);
 
         // Advanced unlock toggle.
         ui.checkbox(
             &mut self.custom_encode.advanced_unlocked,
-            "Advanced — unlock preset, audio bitrate, and constant bitrate override",
+            "Advanced — encoder preset, audio codec + bitrate",
         );
 
         if self.custom_encode.advanced_unlocked {
@@ -3435,6 +3603,32 @@ impl ClipperApp {
                             );
                         }
                     });
+                if matches!(
+                    self.custom_encode.video_codec,
+                    VideoCodec::VaapiH264 | VideoCodec::VaapiHevc
+                ) {
+                    ui.label(
+                        RichText::new("(VAAPI has no preset knob)")
+                            .small()
+                            .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+                    );
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Audio codec").color(theme::TEXT_MUTED).small());
+                let current_audio = self.custom_encode.audio_codec;
+                egui::ComboBox::from_id_salt("custom_audio_codec")
+                    .selected_text(current_audio.display())
+                    .show_ui(ui, |ui| {
+                        for codec in AudioCodec::ALL {
+                            ui.selectable_value(
+                                &mut self.custom_encode.audio_codec,
+                                *codec,
+                                codec.display(),
+                            );
+                        }
+                    });
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -3447,24 +3641,6 @@ impl ClipperApp {
                     .step_by(32.0),
                 );
             });
-            if supports_crf {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Bitrate cap (kbps)").color(theme::TEXT_MUTED).small());
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.custom_encode.video_bitrate_kbps,
-                            500..=50_000,
-                        )
-                        .logarithmic(true),
-                    );
-                });
-                ui.label(
-                    RichText::new("(only used when codec changes to one that needs a bitrate)")
-                        .small()
-                        .color(theme::TEXT_MUTED.linear_multiply(0.7)),
-                );
-            }
         }
 
         if self.available_hw_codecs.is_empty() {
@@ -3508,7 +3684,7 @@ impl ClipperApp {
             .frame(Frame::window(&ctx.style())
                 .fill(theme::BG_MODAL)
                 .rounding(Rounding::same(12.0))
-                .stroke(Stroke::new(1.0, theme::BORDER))
+                .stroke(Stroke::new(1.0_f32, theme::BORDER))
                 .inner_margin(Margin::same(28.0)))
             .show(ctx, |ui| {
                 match &progress.phase {
@@ -3813,23 +3989,30 @@ fn paint_mpv(
 /// Detached state: mix every non-muted audio track via amix, matching
 /// the per-track mute glyphs the user can now see.
 fn build_audio_chain(p: &Project) -> Option<String> {
+    // A soundless source still gets one audio lane in the data model,
+    // but referencing [aid1] on a file with no audio stream makes mpv
+    // reject the whole filter graph.
+    if p.media.audio_stream_count == 0 {
+        return None;
+    }
     let any_audio_detached = p.clips.iter().any(|c| {
         c.link.is_none()
             && p.tracks
                 .iter()
                 .any(|t| t.id == c.track_id && t.kind == TrackKind::Audio)
     });
+    let stream_exists = |idx: &usize| *idx < p.media.audio_stream_count;
     let unmuted: Vec<(usize, f32)> = if any_audio_detached {
         p.tracks
             .iter()
             .filter(|t| t.kind == TrackKind::Audio && !t.muted)
-            .filter_map(|t| t.source_audio_index.map(|idx| (idx, t.gain.max(0.0))))
+            .filter_map(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, t.gain.max(0.0))))
             .collect()
     } else {
         p.tracks
             .iter()
             .find(|t| t.kind == TrackKind::Audio && !t.muted)
-            .and_then(|t| t.source_audio_index.map(|idx| (idx, t.gain.max(0.0))))
+            .and_then(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, t.gain.max(0.0))))
             .into_iter()
             .collect()
     };
@@ -4172,7 +4355,7 @@ fn pill_button(
         ui.painter().rect_stroke(
             rect,
             Rounding::same(15.0),
-            Stroke::new(1.0, theme::BORDER),
+            Stroke::new(1.0_f32, theme::BORDER),
         );
     }
     ui.painter().text(

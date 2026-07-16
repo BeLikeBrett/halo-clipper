@@ -1,4 +1,4 @@
-// Brett's Simple Clipper — entry point.
+// Halo Clipper — entry point.
 // Sets up logging, creates the eframe window, and hands off to ClipperApp.
 
 mod app;
@@ -10,7 +10,6 @@ mod player;
 mod proxy;
 mod settings;
 mod theme;
-mod thumb;
 mod timeline;
 mod track;
 mod video_fbo;
@@ -20,13 +19,21 @@ use app::ClipperApp;
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // A path argument means we were launched via "Open With" / the
+    // .desktop MimeType association (Exec=... %F) or a shell like
+    // `halo-clipper clip.mp4`. Open it straight away.
+    let initial_file = std::env::args_os()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file());
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([800.0, 500.0])
-        .with_title("Brett's Simple Clipper")
+        .with_title("Halo Clipper")
         // Match what the .desktop file sets so X11/Wayland compositors
         // group the running window under our menu entry / icon.
-        .with_app_id("brett-clipper");
+        .with_app_id("halo-clipper");
 
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
@@ -38,14 +45,19 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Brett's Simple Clipper",
+        "Halo Clipper",
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             load_caption_fonts(&cc.egui_ctx);
             match ClipperApp::new(cc) {
-                Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+                Ok(mut app) => {
+                    if let Some(path) = initial_file {
+                        app.open_path(path);
+                    }
+                    Ok(Box::new(app) as Box<dyn eframe::App>)
+                }
                 Err(e) => {
-                    eprintln!("Failed to start Brett's Simple Clipper: {e:#}");
+                    eprintln!("Failed to start Halo Clipper: {e:#}");
                     Err(format!("{e:#}").into())
                 }
             }

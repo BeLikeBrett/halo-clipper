@@ -35,11 +35,9 @@ pub struct Track {
     pub kind: TrackKind,
     pub name: String,
     pub muted: bool,
-    /// 1.0 = unity. Currently audio-only; ignored on video tracks.
-    /// Reserved for the Phase 1b gain-slider UI; the field is set by all
-    /// constructors so the snapshot/undo system can round-trip it once
-    /// it's wired into the export filter graph.
-    #[allow(dead_code)]
+    /// Track-level audio gain, 1.0 = unity. Audio-only; ignored on video
+    /// tracks. Set from the Edit panel, applied in both the preview mix
+    /// and the export filter graph.
     pub gain: f32,
     /// For audio tracks: which input audio stream (`[0:a:N]`) this track
     /// pulls from. Video tracks: `None`. Lets us probe-once / map-many
@@ -88,7 +86,7 @@ impl Clip {
 /// Per-track text overlay (drawn into the video by ffmpeg's drawtext).
 /// Position is normalized 0..=1 of the source frame so the same overlay
 /// reads identically at any resolution; rendered centered on (x, y).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TextOverlay {
     pub text: String,
     pub x: f32,
@@ -98,6 +96,15 @@ pub struct TextOverlay {
     /// Fontconfig font name. Values like "Sans", "Sans Bold", "Serif",
     /// "Mono" are resolved through libfontconfig at render time.
     pub font: String,
+    /// Black outline thickness in source pixels. 0 = off. Maps to
+    /// drawtext's `borderw`; the preview approximates it with offset
+    /// passes of the same glyphs.
+    pub outline_px: u32,
+    /// Soft drop shadow (fixed 2px offset at export scale). Maps to
+    /// drawtext's `shadowx/shadowy/shadowcolor`.
+    pub shadow: bool,
+    /// Text opacity, 0.1..=1.0. Applied to fill, outline, and shadow.
+    pub opacity: f32,
 }
 
 impl Default for TextOverlay {
@@ -109,6 +116,9 @@ impl Default for TextOverlay {
             font_size_px: 36,
             color: [255, 255, 255],
             font: "Sans".into(),
+            outline_px: 0,
+            shadow: false,
+            opacity: 1.0,
         }
     }
 }

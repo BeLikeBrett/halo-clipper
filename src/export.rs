@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::encode::{is_vaapi_decodable, EncodeSettings, HwDecode, VideoCodec};
+use crate::encode::{is_vaapi_decodable, EncodeSettings, HwDecode};
 
 /// Encode mode for a Simple export. MultiTrack always re-encodes through
 /// a filter graph and uses `EncodeSettings` directly.
@@ -94,6 +94,14 @@ pub enum ExportPlan {
         /// ffprobe `codec_name` of the source's video stream. Used to
         /// gate the HW-decode fast path — see `is_vaapi_decodable`.
         source_codec: String,
+        /// Source frame dimensions. Needed to synthesize black gap
+        /// segments at the right size and to scale caption font sizes
+        /// when the output resolution differs from the source.
+        src_width: u32,
+        src_height: u32,
+        /// Source frame rate — black gap segments are generated at this
+        /// rate so the concat doesn't mix cadences.
+        src_fps: f64,
         /// Ordered by cut_start_ms, non-overlapping.
         video_clips: Vec<ClipRange>,
         /// Optional caption baked into the V output stream — applies to
@@ -127,14 +135,8 @@ impl ExportPlan {
                 audio_tracks,
                 ..
             } => {
-                let v = video_clips.iter().map(ClipRange::cut_end_ms).max().unwrap_or(0);
-                let a = audio_tracks
-                    .iter()
-                    .flat_map(|t| t.clips.iter())
-                    .map(ClipRange::cut_end_ms)
-                    .max()
-                    .unwrap_or(0);
-                v.max(a)
+                let end = timeline_end_ms(video_clips, audio_tracks);
+                output_duration_ms(video_clips, end)
             }
         }
     }
@@ -289,6 +291,9 @@ fn run_plan(
             source,
             destination,
             source_codec,
+            src_width,
+            src_height,
+            src_fps,
             video_clips,
             video_text_overlay,
             audio_tracks,
@@ -297,6 +302,8 @@ fn run_plan(
             source,
             destination,
             source_codec,
+            (*src_width, *src_height),
+            *src_fps,
             video_clips,
             video_text_overlay.as_ref(),
             audio_tracks,
@@ -421,6 +428,9 @@ fn run_simple(
                 for arg in settings.audio_args() {
                     cmd.arg(arg);
                 }
+                for arg in audio_container_args(settings, destination) {
+                    cmd.arg(arg);
+                }
             }
             cmd.args(["-movflags", "+faststart"]);
         }
@@ -435,7 +445,7 @@ fn run_simple(
 
     log::info!("ffmpeg (simple): {cmd:?}");
 
-    run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot, 0)
+    run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot)
 }
 
 /// Resolves the VAAPI render-node device. Hardcoded for now —
@@ -494,11 +504,53 @@ fn earliest_src_start_ms(video_clips: &[ClipRange], audio_tracks: &[AudioTrackPl
         .max(0)
 }
 
+/// The rightmost cut position anything places content at — video clips
+/// plus the clips of audio tracks that actually emit. Both the video and
+/// audio chains pad out to this point (black / silence) so their output
+/// durations always match.
+fn timeline_end_ms(video_clips: &[ClipRange], audio_tracks: &[AudioTrackPlan]) -> i64 {
+    video_clips
+        .iter()
+        .map(ClipRange::cut_end_ms)
+        .chain(
+            audio_tracks
+                .iter()
+                .filter(|t| !t.muted && !t.clips.is_empty())
+                .flat_map(|t| t.clips.iter())
+                .map(ClipRange::cut_end_ms),
+        )
+        .max()
+        .unwrap_or(0)
+}
+
+/// Real (wall-clock) duration a concat chain of `clips` produces when
+/// padded out to `timeline_end_ms`: gaps keep their cut-time length,
+/// content is compressed/stretched by each clip's speed. Used for the
+/// progress bar's total, so speed clips don't leave the bar stuck at 60%
+/// when ffmpeg finishes.
+pub fn output_duration_ms(clips: &[ClipRange], timeline_end_ms: i64) -> i64 {
+    let mut cursor: i64 = 0;
+    let mut out: f64 = 0.0;
+    for c in clips {
+        if c.cut_start_ms > cursor {
+            out += (c.cut_start_ms - cursor) as f64;
+        }
+        out += c.src_duration_ms() as f64 / c.speed.max(0.01) as f64;
+        cursor = cursor.max(c.cut_end_ms());
+    }
+    if timeline_end_ms > cursor {
+        out += (timeline_end_ms - cursor) as f64;
+    }
+    out.round() as i64
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_multitrack(
     source: &Path,
     destination: &Path,
     source_codec: &str,
+    src_dims: (u32, u32),
+    src_fps: f64,
     video_clips: &[ClipRange],
     video_text_overlay: Option<&crate::track::TextOverlay>,
     audio_tracks: &[AudioTrackPlan],
@@ -516,15 +568,51 @@ fn run_multitrack(
     } else {
         HwDecode::None
     };
+    let on_gpu_after_decode = matches!(hw_decode, HwDecode::Vaapi);
 
     // Fast-seek the input to the earliest frame any clip needs, then build
     // the trims relative to that point. Eliminates the decode-from-zero
     // stall for clips taken from late in a long source.
     let seek_ms = earliest_src_start_ms(video_clips, audio_tracks);
 
+    // Both chains pad to this shared end so video and audio always come
+    // out the same length (and stay in sync across gaps).
+    let end_ms = timeline_end_ms(video_clips, audio_tracks);
+
+    // Video chain. Gaps on the timeline (split + delete, dragged-apart
+    // clips, a first clip that doesn't start at 0) become black segments,
+    // matching the preview and the audio chain's silence padding. Without
+    // them, concat squashes the gap out of the video while the audio keeps
+    // it — everything after the first gap plays desynced.
+    let (src_w, src_h) = src_dims;
+    let black_gap = |filter: &mut String, idx: usize, dur_ms: i64| -> String {
+        // The gap source is CPU frames; when the surrounding trim
+        // segments are VAAPI surfaces it must be uploaded so concat sees
+        // one surface type across all inputs. On the SW path the format
+        // is left open so negotiation matches the decoded segments
+        // without converting them.
+        let bridge = if on_gpu_after_decode { ",format=nv12,hwupload" } else { "" };
+        filter.push_str(&format!(
+            "color=c=black:s={}x{}:r={:.3}:d={:.3}{}[gap{}];\n",
+            src_w.max(2),
+            src_h.max(2),
+            src_fps.clamp(1.0, 480.0),
+            dur_ms as f64 / 1000.0,
+            bridge,
+            idx,
+        ));
+        format!("[gap{idx}]")
+    };
+
     let mut filter = String::new();
     let mut video_labels: Vec<String> = Vec::with_capacity(video_clips.len());
+    let mut gap_idx = 0usize;
+    let mut video_cursor: i64 = 0;
     for (i, c) in video_clips.iter().enumerate() {
+        if c.cut_start_ms > video_cursor {
+            video_labels.push(black_gap(&mut filter, gap_idx, c.cut_start_ms - video_cursor));
+            gap_idx += 1;
+        }
         let speed = c.speed.max(0.01);
         let setpts_expr = if (speed - 1.0).abs() < 0.001 {
             "setpts=PTS-STARTPTS".to_string()
@@ -541,30 +629,22 @@ fn run_multitrack(
             i,
         ));
         video_labels.push(format!("[v{}]", i));
+        video_cursor = video_cursor.max(c.cut_end_ms());
+    }
+    if end_ms > video_cursor {
+        video_labels.push(black_gap(&mut filter, gap_idx, end_ms - video_cursor));
     }
 
     // Pre-render the drawtext filter expression so the post-chain helper
     // can stay general (no knowledge of TextOverlay). Returns None when
-    // there's no caption to bake in.
+    // there's no caption to bake in. Pixel-denominated values (font size,
+    // outline, shadow offset) are scaled by output/source height because
+    // drawtext runs AFTER the scale step.
+    let out_h = encode.resolution.map(|(_, h)| h).unwrap_or(src_h);
+    let px_scale = if src_h > 0 { out_h as f64 / src_h as f64 } else { 1.0 };
     let drawtext = video_text_overlay
         .filter(|o| !o.text.trim().is_empty())
-        .map(|overlay| {
-            let safe = drawtext_escape(&overlay.text);
-            let color_hex = ((overlay.color[0] as u32) << 16)
-                | ((overlay.color[1] as u32) << 8)
-                | (overlay.color[2] as u32);
-            let font_spec = crate::track::font_choice(&overlay.font).fontconfig;
-            format!(
-                "drawtext=text='{}':font='{}':x='w*{:.3}-text_w/2':\
-                 y='h*{:.3}-text_h/2':fontsize={}:fontcolor=#{:06X}",
-                safe,
-                font_spec,
-                overlay.x.clamp(0.0, 1.0),
-                overlay.y.clamp(0.0, 1.0),
-                overlay.font_size_px.clamp(8, 1000),
-                color_hex,
-            )
-        });
+        .map(|overlay| build_drawtext(overlay, px_scale));
 
     // Post-concat filters: scale → (maybe hwdownload) → drawtext →
     // (maybe hwupload). The helper picks scale_vaapi vs scale based on
@@ -579,16 +659,14 @@ fn run_multitrack(
 
     filter.push_str(&video_labels.concat());
     if post.is_empty() {
-        filter.push_str(&format!("concat=n={}:v=1:a=0[vout];\n", video_clips.len()));
+        filter.push_str(&format!("concat=n={}:v=1:a=0[vout];\n", video_labels.len()));
     } else {
         filter.push_str(&format!(
             "concat=n={}:v=1:a=0[vconcat];\n",
-            video_clips.len(),
+            video_labels.len(),
         ));
         filter.push_str(&format!("[vconcat]{}[vout];\n", post.join(",")));
     }
-
-    let total_cut_ms: i64 = video_clips.iter().map(ClipRange::src_duration_ms).sum();
 
     // One audio chain per non-muted, non-empty track. Then amix them all.
     // If exactly one track survives, skip amix and route it straight to
@@ -635,8 +713,8 @@ fn run_multitrack(
             clip_idx += 1;
             cursor = c.cut_end_ms();
         }
-        if total_cut_ms > cursor {
-            let dur = (total_cut_ms - cursor) as f64 / 1000.0;
+        if end_ms > cursor {
+            let dur = (end_ms - cursor) as f64 / 1000.0;
             filter.push_str(&format!(
                 "anullsrc=r=48000:cl=stereo:duration={:.3}[s{}];\n",
                 dur, silence_idx,
@@ -726,6 +804,9 @@ fn run_multitrack(
         for arg in encode.audio_args() {
             cmd.arg(arg);
         }
+        for arg in audio_container_args(encode, destination) {
+            cmd.arg(arg);
+        }
     }
     cmd.args(["-movflags", "+faststart"]);
     if let Some(fmt) = output_format_for(destination) {
@@ -737,8 +818,64 @@ fn run_multitrack(
 
     log::info!("ffmpeg (multitrack): {cmd:?}");
 
-    let _ = VideoCodec::X264; // silence unused-import lint in slim builds
-    run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot, 0)
+    run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot)
+}
+
+/// Extra muxer flags a (codec, container) pair needs. Opus-in-MP4 is
+/// still gated behind `-strict -2` in ffmpeg's MP4 muxer even though
+/// playback support is widespread.
+fn audio_container_args(encode: &EncodeSettings, destination: &Path) -> Vec<String> {
+    let is_mp4_family = matches!(
+        output_format_for(destination),
+        Some("mp4") | Some("mov")
+    );
+    if encode.audio_codec == crate::encode::AudioCodec::Opus && is_mp4_family {
+        vec!["-strict".into(), "-2".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Render a TextOverlay into a drawtext filter expression. `px_scale`
+/// converts source-pixel values (font size, outline width, shadow
+/// offset) into output pixels — drawtext runs after the scale step, so
+/// a 4K-source caption exported at 1080p must halve its pixel sizes to
+/// keep the same on-screen proportion the preview showed.
+fn build_drawtext(overlay: &crate::track::TextOverlay, px_scale: f64) -> String {
+    let safe = drawtext_escape(&overlay.text);
+    let color_hex = ((overlay.color[0] as u32) << 16)
+        | ((overlay.color[1] as u32) << 8)
+        | (overlay.color[2] as u32);
+    let font_spec = crate::track::font_choice(&overlay.font).fontconfig;
+    let opacity = overlay.opacity.clamp(0.1, 1.0);
+    let scale_px = |px: u32| ((px as f64 * px_scale).round() as u32).max(1);
+
+    let mut expr = format!(
+        "drawtext=text='{}':font='{}':x='w*{:.3}-text_w/2':\
+         y='h*{:.3}-text_h/2':fontsize={}:fontcolor=#{:06X}@{:.2}",
+        safe,
+        font_spec,
+        overlay.x.clamp(0.0, 1.0),
+        overlay.y.clamp(0.0, 1.0),
+        scale_px(overlay.font_size_px.clamp(8, 1000)),
+        color_hex,
+        opacity,
+    );
+    if overlay.outline_px > 0 {
+        expr.push_str(&format!(
+            ":borderw={}:bordercolor=black@{:.2}",
+            scale_px(overlay.outline_px.min(20)),
+            opacity,
+        ));
+    }
+    if overlay.shadow {
+        let off = scale_px(2);
+        expr.push_str(&format!(
+            ":shadowx={off}:shadowy={off}:shadowcolor=black@{:.2}",
+            0.6 * opacity,
+        ));
+    }
+    expr
 }
 
 // ------------------------------------------------------------------
@@ -750,7 +887,6 @@ fn run_ffmpeg_with_progress(
     progress: &Arc<Mutex<ExportProgress>>,
     cancel_flag: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
-    completed_ms_offset: i64,
 ) -> Result<()> {
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("ffmpeg spawn: {e}"))?;
     let stdout = child.stdout.take().expect("piped");
@@ -775,10 +911,11 @@ fn run_ffmpeg_with_progress(
         let Some((key, value)) = line.split_once('=') else { continue };
         let mut p = progress.lock().unwrap();
         match key {
+            // Both keys are microseconds — out_time_ms is a long-standing
+            // ffmpeg misnomer.
             "out_time_us" | "out_time_ms" => {
                 if let Ok(us) = value.parse::<i64>() {
-                    let in_seg_ms = (us / 1000).max(0);
-                    p.current_ms = (completed_ms_offset + in_seg_ms).min(p.total_ms);
+                    p.current_ms = (us / 1000).clamp(0, p.total_ms);
                 }
             }
             "fps" => {
@@ -1109,6 +1246,108 @@ mod tests {
         }
     }
 
+    // ---- output timeline math -----------------------------------------
+
+    fn placed_clip(cut_start: i64, src_start: i64, src_end: i64, speed: f32) -> ClipRange {
+        ClipRange {
+            cut_start_ms: cut_start,
+            src_start_ms: src_start,
+            src_end_ms: src_end,
+            gain: 1.0,
+            speed,
+        }
+    }
+
+    #[test]
+    fn timeline_end_covers_video_and_unmuted_audio() {
+        let v = vec![placed_clip(0, 0, 5_000, 1.0)];
+        let a = vec![
+            track(false, vec![placed_clip(8_000, 0, 2_000, 1.0)]), // ends at 10s
+            track(true, vec![placed_clip(50_000, 0, 1_000, 1.0)]), // muted: ignored
+        ];
+        assert_eq!(timeline_end_ms(&v, &a), 10_000);
+    }
+
+    #[test]
+    fn output_duration_counts_gaps_and_speed() {
+        // [0..10s at 2×] → 5s of output, gap to 20s → +10s, [20..30s] → +10s.
+        let clips = vec![
+            placed_clip(0, 0, 10_000, 2.0),
+            placed_clip(20_000, 10_000, 20_000, 1.0),
+        ];
+        assert_eq!(output_duration_ms(&clips, 30_000), 25_000);
+        // Trailing pad beyond the last clip is added too.
+        assert_eq!(output_duration_ms(&clips, 35_000), 30_000);
+    }
+
+    #[test]
+    fn output_duration_matches_cut_length_when_no_speed() {
+        let clips = vec![
+            placed_clip(0, 0, 4_000, 1.0),
+            placed_clip(6_000, 4_000, 9_000, 1.0), // 2s gap before it
+        ];
+        assert_eq!(output_duration_ms(&clips, 11_000), 11_000);
+    }
+
+    // ---- drawtext rendering --------------------------------------------
+
+    #[test]
+    fn drawtext_scales_pixel_values_to_output_height() {
+        let overlay = crate::track::TextOverlay {
+            text: "hi".into(),
+            font_size_px: 48,
+            outline_px: 4,
+            shadow: true,
+            ..Default::default()
+        };
+        // 4K source exported at 1080p → everything halves.
+        let expr = build_drawtext(&overlay, 0.5);
+        assert!(expr.contains("fontsize=24"), "got {expr}");
+        assert!(expr.contains("borderw=2"), "got {expr}");
+        assert!(expr.contains("shadowx=1"), "got {expr}");
+    }
+
+    #[test]
+    fn drawtext_opacity_reaches_all_layers() {
+        let overlay = crate::track::TextOverlay {
+            text: "hi".into(),
+            outline_px: 2,
+            opacity: 0.5,
+            ..Default::default()
+        };
+        let expr = build_drawtext(&overlay, 1.0);
+        assert!(expr.contains("fontcolor=#FFFFFF@0.50"), "got {expr}");
+        assert!(expr.contains("bordercolor=black@0.50"), "got {expr}");
+    }
+
+    #[test]
+    fn drawtext_omits_optional_layers_when_off() {
+        let overlay = crate::track::TextOverlay {
+            text: "hi".into(),
+            ..Default::default()
+        };
+        let expr = build_drawtext(&overlay, 1.0);
+        assert!(!expr.contains("borderw"), "got {expr}");
+        assert!(!expr.contains("shadowx"), "got {expr}");
+    }
+
+    // ---- container gating ------------------------------------------------
+
+    #[test]
+    fn opus_in_mp4_needs_strict_flag() {
+        let mut s = EncodeSettings::default_for_source(1920, 1080);
+        s.audio_codec = crate::encode::AudioCodec::Opus;
+        assert_eq!(
+            audio_container_args(&s, Path::new("/tmp/out.mp4")),
+            vec!["-strict".to_string(), "-2".to_string()],
+        );
+        // MKV muxes opus natively — no flag.
+        assert!(audio_container_args(&s, Path::new("/tmp/out.mkv")).is_empty());
+        // AAC never needs it.
+        s.audio_codec = crate::encode::AudioCodec::Aac;
+        assert!(audio_container_args(&s, Path::new("/tmp/out.mp4")).is_empty());
+    }
+
     // ---- codec gating ------------------------------------------------
     //
     // The HW-decode fast path must only trigger when the source codec is
@@ -1170,5 +1409,303 @@ mod tests {
         ] {
             assert_eq!(c.hw_decode(), HwDecode::None, "{c:?} should stay on SW decode");
         }
+    }
+
+    // ---- end-to-end pipeline tests (real ffmpeg) -----------------------
+    //
+    // ffmpeg is a hard runtime dependency of the app, so these run it for
+    // real: generate a tiny synthetic source, export through the actual
+    // spawn() pipeline, and probe the result. This is the only layer that
+    // can catch filter-graph mistakes ffmpeg itself would reject (label
+    // typos, surface-type mismatches, bad option/codec pairings).
+
+    use crate::encode::{AudioCodec, EncodeQuality, VideoCodec};
+    use std::process::Command;
+    use std::time::Duration as StdDuration;
+
+    fn test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join("halo-clipper-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 10s 1280x720@30 test pattern + 440 Hz tone, h264+aac. Generated
+    /// once, shared by every test (guarded by the .done marker because
+    /// tests run in parallel).
+    fn synth_source(with_audio: bool) -> PathBuf {
+        let name = if with_audio { "src_av.mp4" } else { "src_v.mp4" };
+        let path = test_dir().join(name);
+        let done = test_dir().join(format!("{name}.done"));
+        if done.exists() {
+            return path;
+        }
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=10"]);
+        if with_audio {
+            cmd.args(["-f", "lavfi", "-i", "sine=frequency=440:duration=10"])
+                .args(["-c:a", "aac", "-b:a", "96k"]);
+        }
+        cmd.args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30"])
+            .arg(&path);
+        let status = cmd.status().expect("ffmpeg not installed?");
+        assert!(status.success(), "test-source generation failed");
+        std::fs::write(&done, b"ok").unwrap();
+        path
+    }
+
+    /// Run a plan through the real pipeline and wait for it to finish.
+    fn run_to_completion(plan: ExportPlan) -> ExportProgress {
+        let handle = spawn(plan).expect("spawn failed");
+        let deadline = Instant::now() + StdDuration::from_secs(120);
+        loop {
+            let p = handle.progress();
+            match p.phase {
+                ExportPhase::Running => {
+                    assert!(Instant::now() < deadline, "export timed out");
+                    thread::sleep(StdDuration::from_millis(100));
+                }
+                _ => return p,
+            }
+        }
+    }
+
+    /// (duration_secs, codec_name) of the named stream, via ffprobe.
+    fn probe_stream(path: &Path, selector: &str) -> Option<(f64, String)> {
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", selector])
+            .args(["-show_entries", "stream=codec_name,duration"])
+            .args(["-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .expect("ffprobe not installed?");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().next()?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let (codec, dur) = line.split_once(',')?;
+        Some((dur.trim().parse().ok()?, codec.to_string()))
+    }
+
+    fn base_encode(codec: VideoCodec) -> EncodeSettings {
+        EncodeSettings {
+            resolution: None,
+            video_codec: codec,
+            quality: EncodeQuality::ConstantQuality(30),
+            video_preset: if matches!(codec, VideoCodec::X264) {
+                "ultrafast".into()
+            } else {
+                codec.default_preset().into()
+            },
+            fps_limit: None,
+            audio_codec: AudioCodec::Aac,
+            audio_bitrate_kbps: 96,
+        }
+    }
+
+    #[test]
+    fn e2e_gap_exports_black_and_keeps_av_sync() {
+        // Two clips with a 2s gap between them ([0..3s], gap, [5s..8s]).
+        // The output must be 8s on BOTH streams — before the gap fix,
+        // video came out 6s (gap squashed) while audio came out 8s.
+        let source = synth_source(true);
+        let dest = test_dir().join("out_gap.mp4");
+        let clips = vec![
+            placed_clip(0, 1_000, 4_000, 1.0),
+            placed_clip(5_000, 6_000, 9_000, 1.0),
+        ];
+        let overlay = crate::track::TextOverlay {
+            text: "hi".into(),
+            outline_px: 2,
+            shadow: true,
+            opacity: 0.9,
+            ..Default::default()
+        };
+        let mut encode = base_encode(VideoCodec::X264);
+        encode.resolution = Some((640, 360));
+        encode.fps_limit = Some(30);
+        let plan = ExportPlan::MultiTrack {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_width: 1280,
+            src_height: 720,
+            src_fps: 30.0,
+            video_clips: clips.clone(),
+            video_text_overlay: Some(overlay),
+            audio_tracks: vec![AudioTrackPlan {
+                source_audio_index: 0,
+                muted: false,
+                gain: 1.0,
+                clips,
+            }],
+            encode,
+        };
+        let progress = run_to_completion(plan);
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "export failed: {:?}",
+            progress.phase
+        );
+        let (vdur, _) = probe_stream(&dest, "v:0").expect("no video stream");
+        let (adur, _) = probe_stream(&dest, "a:0").expect("no audio stream");
+        assert!((vdur - 8.0).abs() < 0.3, "video duration {vdur}, expected ~8s");
+        assert!((adur - 8.0).abs() < 0.3, "audio duration {adur}, expected ~8s");
+
+        // The gap (3s..5s on the output) must actually be black.
+        let out = Command::new("ffmpeg")
+            .args(["-hide_banner", "-i"])
+            .arg(&dest)
+            .args(["-vf", "blackdetect=d=1.5:pix_th=0.10", "-an", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let black = stderr
+            .lines()
+            .find(|l| l.contains("black_start"))
+            .unwrap_or_else(|| panic!("no black interval detected:\n{stderr}"));
+        let start: f64 = black
+            .split("black_start:")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        assert!((start - 3.0).abs() < 0.4, "black gap starts at {start}, expected ~3s");
+    }
+
+    #[test]
+    fn e2e_speed_clip_shortens_both_streams() {
+        // One 4s source range at 2× → ~2s of output on both streams.
+        let source = synth_source(true);
+        let dest = test_dir().join("out_speed.mp4");
+        let clips = vec![placed_clip(0, 0, 4_000, 2.0)];
+        let plan = ExportPlan::MultiTrack {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_width: 1280,
+            src_height: 720,
+            src_fps: 30.0,
+            video_clips: clips.clone(),
+            video_text_overlay: None,
+            audio_tracks: vec![AudioTrackPlan {
+                source_audio_index: 0,
+                muted: false,
+                gain: 1.0,
+                clips,
+            }],
+            encode: base_encode(VideoCodec::X264),
+        };
+        let progress = run_to_completion(plan);
+        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
+        assert_eq!(progress.total_ms, 2_000, "progress total should be speed-aware");
+        let (vdur, _) = probe_stream(&dest, "v:0").unwrap();
+        let (adur, _) = probe_stream(&dest, "a:0").unwrap();
+        assert!((vdur - 2.0).abs() < 0.3, "video duration {vdur}, expected ~2s");
+        assert!((adur - 2.0).abs() < 0.3, "audio duration {adur}, expected ~2s");
+    }
+
+    #[test]
+    fn e2e_silent_source_exports_without_audio() {
+        // A source with no audio stream: the plan carries no audio tracks
+        // (the app filters them out) and the export must still succeed.
+        let source = synth_source(false);
+        let dest = test_dir().join("out_silent.mp4");
+        let plan = ExportPlan::MultiTrack {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_width: 1280,
+            src_height: 720,
+            src_fps: 30.0,
+            video_clips: vec![placed_clip(0, 0, 3_000, 1.0)],
+            video_text_overlay: None,
+            audio_tracks: Vec::new(),
+            encode: base_encode(VideoCodec::X264),
+        };
+        let progress = run_to_completion(plan);
+        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
+        let (vdur, _) = probe_stream(&dest, "v:0").unwrap();
+        assert!((vdur - 3.0).abs() < 0.3);
+        assert!(probe_stream(&dest, "a:0").is_none(), "expected no audio stream");
+    }
+
+    #[test]
+    fn e2e_opus_in_mp4_muxes() {
+        let source = synth_source(true);
+        let dest = test_dir().join("out_opus.mp4");
+        let mut encode = base_encode(VideoCodec::X264);
+        encode.audio_codec = AudioCodec::Opus;
+        let plan = ExportPlan::Simple {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_start_ms: 1_000,
+            src_end_ms: 4_000,
+            encode: EncodeMode::Encode(encode),
+            audio_muted: false,
+        };
+        let progress = run_to_completion(plan);
+        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
+        let (_, acodec) = probe_stream(&dest, "a:0").expect("no audio stream");
+        assert_eq!(acodec, "opus");
+    }
+
+    #[test]
+    fn e2e_vaapi_gap_graph_when_hardware_present() {
+        // Full GPU path: VAAPI decode → gap segments hwuploaded into the
+        // concat → scale_vaapi → hwdownload/drawtext/hwupload sandwich →
+        // h264_vaapi CQP encode. Skips (passes) on machines without a
+        // VAAPI-capable ffmpeg + render node.
+        let have_vaapi = crate::encode::detect_hw_encoders()
+            .contains(&VideoCodec::VaapiH264)
+            && Path::new("/dev/dri/renderD128").exists();
+        if !have_vaapi {
+            eprintln!("skipping: no VAAPI encoder/render node on this machine");
+            return;
+        }
+        let source = synth_source(true);
+        let dest = test_dir().join("out_vaapi.mp4");
+        let clips = vec![
+            placed_clip(0, 1_000, 3_000, 1.0),
+            placed_clip(4_000, 6_000, 8_000, 1.0),
+        ];
+        let overlay = crate::track::TextOverlay {
+            text: "vaapi".into(),
+            outline_px: 2,
+            ..Default::default()
+        };
+        let mut encode = base_encode(VideoCodec::VaapiH264);
+        encode.resolution = Some((640, 360));
+        encode.fps_limit = Some(30);
+        let plan = ExportPlan::MultiTrack {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_width: 1280,
+            src_height: 720,
+            src_fps: 30.0,
+            video_clips: clips.clone(),
+            video_text_overlay: Some(overlay),
+            audio_tracks: vec![AudioTrackPlan {
+                source_audio_index: 0,
+                muted: false,
+                gain: 1.0,
+                clips,
+            }],
+            encode,
+        };
+        let progress = run_to_completion(plan);
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "VAAPI export failed: {:?}",
+            progress.phase
+        );
+        let (vdur, vcodec) = probe_stream(&dest, "v:0").unwrap();
+        assert_eq!(vcodec, "h264");
+        assert!((vdur - 6.0).abs() < 0.3, "video duration {vdur}, expected ~6s");
+        let (adur, _) = probe_stream(&dest, "a:0").unwrap();
+        assert!((adur - 6.0).abs() < 0.3, "audio duration {adur}, expected ~6s");
     }
 }

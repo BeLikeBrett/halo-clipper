@@ -1,6 +1,151 @@
 # Bug Fixes
 
-Running log of bugs found and fixed in brett-clipper. Newest at top.
+Running log of bugs found and fixed in Halo Clipper (formerly
+brett-clipper). Newest at top.
+
+---
+
+## 2026-07-16 — Advanced export: A/V desync after any timeline gap
+
+### Symptom
+
+In Advanced mode, any project with a gap on the timeline (split + delete
+a middle piece, drag clips apart, delete the first clip) exported with
+video and audio out of sync from the gap onward. The preview looked
+right; the exported file drifted by exactly the gap length.
+
+### Root cause
+
+`run_multitrack` built the two chains with different timeline models.
+The video chain concatenated the trimmed segments back-to-back, which
+*squashes* gaps out of the output. The audio chain inserted `anullsrc`
+silence for every gap, which *keeps* them. Video came out shorter than
+audio, and every clip after the first gap played against the wrong
+sound. (A leading gap or trailing gap also desynced the tail because the
+audio's final padding used the sum of clip durations rather than the
+timeline extent.)
+
+### Fix
+
+`src/export.rs`:
+
+1. Video gaps (leading, between clips, and trailing up to the shared
+   timeline end) are synthesized as black `color=` segments and fed into
+   the concat in cut order — matching both the preview (which paints
+   black in gaps) and the audio chain's silence. On the VAAPI path the
+   gap source is bridged with `format=nv12,hwupload` so concat sees one
+   surface type.
+2. New `timeline_end_ms()` — the rightmost cut position across video
+   clips and emitting audio tracks — is now the padding target for both
+   chains, so their durations always match.
+3. `total_output_ms()` (progress-bar total) now uses the real output
+   duration: gaps kept, per-clip speed applied (a 2× clip renders half
+   as long). Discord's bitrate budget uses the same math, so its size
+   targeting is no longer wrong for sped-up or gapped cuts.
+
+### Verification
+
+New end-to-end tests in `export::tests` run the real pipeline against a
+generated source: `e2e_gap_exports_black_and_keeps_av_sync` asserts both
+streams come out at the full timeline length and `blackdetect` finds the
+black interval at the gap position; `e2e_speed_clip_shortens_both_streams`
+asserts a 2× clip halves both streams and the progress total;
+`e2e_vaapi_gap_graph_when_hardware_present` runs the same graph through
+the full VAAPI GPU path (verified locally on the 7800 XT).
+
+---
+
+## 2026-07-16 — Advanced export fails outright on videos with no audio stream
+
+### Symptom
+
+Opening a soundless video (screen capture without mic, some phone
+clips), switching to Advanced, and exporting failed with an ffmpeg
+"matches no streams" error.
+
+### Root cause
+
+`ensure_tracks_initialized` guarantees at least one audio lane so the
+data model keeps a consistent shape, giving it `source_audio_index = 0`
+even when `audio_stream_count == 0`. The export plan then emitted
+`[0:a:0]atrim=...` against a stream that doesn't exist, which aborts the
+whole ffmpeg run. The preview had the same latent problem via mpv's
+`lavfi-complex` (`[aid1]` with no audio track).
+
+### Fix
+
+- `start_export` drops audio tracks whose `source_audio_index` isn't
+  backed by a real source stream; if none remain the export gets `-an`.
+- `build_audio_chain` (preview) returns None for soundless sources and
+  skips tracks pointing at nonexistent streams.
+
+Verified by `e2e_silent_source_exports_without_audio`.
+
+---
+
+## 2026-07-16 — Burned-in captions render at the wrong size on scaled exports
+
+### Symptom
+
+A caption positioned/sized against the preview exported noticeably
+larger than shown whenever the output resolution was below the source
+(e.g. 4K source → 1080p export), and smaller when upscaling.
+
+### Root cause
+
+`drawtext` runs *after* the `scale` step, so its `fontsize` is in output
+pixels — but the app passed the overlay's `font_size_px`, which is in
+source pixels (that's what the preview scales against).
+
+### Fix
+
+`build_drawtext` in `src/export.rs` scales every pixel-denominated value
+(font size, outline width, shadow offset) by `output_height /
+source_height`. Pinned by `drawtext_scales_pixel_values_to_output_height`.
+
+---
+
+## 2026-07-16 — Dead thumbnail pipeline burned an ffmpeg spawn on every seek
+
+### Symptom
+
+No visible symptom — that's the problem. Every playhead move while
+paused spawned an ffmpeg process to extract a 1280px still, decoded it,
+and uploaded it as an egui texture… which nothing ever painted. The
+embedded mpv preview replaced the still-frame preview long ago, but the
+worker was never unplugged.
+
+### Fix
+
+Removed `src/thumb.rs`, the `ThumbWorker` field, and the per-frame
+request/drain calls. Scrubbing no longer forks ffmpeg processes at all.
+
+---
+
+## 2026-07-16 — "Open With" from a file manager opened an empty app
+
+### Symptom
+
+The .desktop entry advertises video MIME types and passes `%F`, but
+choosing Halo Clipper in a file manager's "Open With" menu launched the
+app without loading the file.
+
+### Root cause
+
+`main()` never read `argv`.
+
+### Fix
+
+`main.rs` picks up the first CLI argument and routes it through the new
+`ClipperApp::open_path()` (the same path the file dialog uses).
+
+---
+
+## 2026-07-16 — Startup probed the GPU and ffmpeg encoders twice
+
+`ClipperApp::new` ran `detect_hw_encoders()` (an ffmpeg subprocess) and
+`detect_gpu()` twice each — once for the stored fields, once inside the
+Custom-encode defaults block. Now probed once and shared.
 
 ---
 

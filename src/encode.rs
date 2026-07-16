@@ -133,10 +133,39 @@ impl VideoCodec {
         matches!(self, Self::VaapiH264 | Self::VaapiHevc)
     }
 
-    /// CRF mode is only meaningful for the software x264/x265 encoders.
-    /// HW codecs always use CBR / VBR with `-b:v`.
-    pub fn supports_crf(self) -> bool {
-        matches!(self, Self::X264 | Self::X265)
+    /// Human label for this codec's constant-quality knob. Every codec
+    /// family calls it something different; the number's meaning (lower
+    /// = better) is the same everywhere.
+    pub fn quality_name(self) -> &'static str {
+        match self {
+            Self::X264 | Self::X265 => "CRF",
+            Self::NvencH264 | Self::NvencHevc => "CQ",
+            Self::QsvH264 | Self::QsvHevc => "ICQ",
+            Self::VaapiH264 | Self::VaapiHevc | Self::AmfH264 | Self::AmfHevc => "QP",
+        }
+    }
+
+    /// Sensible slider range for the constant-quality value. CRF and the
+    /// HW quality scales don't line up numerically, so each family gets
+    /// its own span.
+    pub fn quality_range(self) -> std::ops::RangeInclusive<u32> {
+        match self {
+            Self::X264 | Self::X265 => 14..=32,
+            Self::NvencH264 | Self::NvencHevc => 15..=35,
+            Self::QsvH264 | Self::QsvHevc => 15..=35,
+            Self::VaapiH264 | Self::VaapiHevc | Self::AmfH264 | Self::AmfHevc => 18..=35,
+        }
+    }
+
+    /// Default constant-quality value — visually transparent output
+    /// without bloating the file.
+    pub fn default_quality(self) -> u32 {
+        match self {
+            Self::X264 | Self::X265 => 18,
+            Self::NvencH264 | Self::NvencHevc => 21,
+            Self::QsvH264 | Self::QsvHevc => 21,
+            Self::VaapiH264 | Self::VaapiHevc | Self::AmfH264 | Self::AmfHevc => 22,
+        }
     }
 
     /// Sensible default preset string for this codec.
@@ -148,12 +177,6 @@ impl VideoCodec {
             Self::QsvH264 | Self::QsvHevc => "medium",
             Self::AmfH264 | Self::AmfHevc => "balanced",
         }
-    }
-
-    /// Whether this codec is software-only (always available) or HW.
-    #[allow(dead_code)]
-    pub fn is_hw(self) -> bool {
-        !matches!(self, Self::X264 | Self::X265)
     }
 
     /// Input-side decode strategy that pairs cleanly with this encoder.
@@ -200,30 +223,38 @@ pub fn is_vaapi_decodable(codec_name: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioCodec {
     Aac,
-    // Reserved for future audio-codec dropdown.
-    #[allow(dead_code)]
     Opus,
 }
 
 impl AudioCodec {
+    pub const ALL: &'static [AudioCodec] = &[Self::Aac, Self::Opus];
+
     pub fn ffmpeg_name(self) -> &'static str {
         match self {
             Self::Aac => "aac",
             Self::Opus => "libopus",
         }
     }
+
+    pub fn display(self) -> &'static str {
+        match self {
+            Self::Aac => "AAC (universal)",
+            Self::Opus => "Opus (better at low bitrates)",
+        }
+    }
 }
 
-/// Either CRF (constant quality, variable size) or CBR-style bitrate
+/// Either constant quality (variable size) or CBR-style bitrate
 /// (constant size target, variable quality). Size-targeting modes like
-/// Discord Nitro need CBR; quality-targeting modes like Auto prefer CRF
-/// on the SW codecs that support it.
-#[derive(Clone, Copy, Debug)]
+/// Discord need bitrate mode; quality-targeting modes like Auto and the
+/// Custom default prefer constant quality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeQuality {
-    /// libx264/libx265: lower number = better quality (and bigger file).
-    Crf(u32),
-    /// HW codecs OR size-targeted exports: kbps, with maxrate/bufsize
-    /// applied for predictable size.
+    /// Codec-appropriate constant-quality value — CRF for x264/x265,
+    /// QP for VAAPI/AMF, CQ for NVENC, ICQ for QSV. Lower = better
+    /// quality (and a bigger file) on every scale.
+    ConstantQuality(u32),
+    /// kbps, with maxrate/bufsize applied for predictable size.
     Bitrate(u32),
 }
 
@@ -236,6 +267,10 @@ pub struct EncodeSettings {
     pub video_codec: VideoCodec,
     pub quality: EncodeQuality,
     pub video_preset: String,
+    /// None = keep source frame rate. Some(n) caps the output at n fps
+    /// via ffmpeg's output `-r` (works on both CPU and GPU frame paths,
+    /// unlike the `fps` filter).
+    pub fps_limit: Option<u32>,
     pub audio_codec: AudioCodec,
     pub audio_bitrate_kbps: u32,
 }
@@ -248,8 +283,9 @@ impl EncodeSettings {
         Self {
             resolution: None,
             video_codec: VideoCodec::X264,
-            quality: EncodeQuality::Crf(18),
+            quality: EncodeQuality::ConstantQuality(18),
             video_preset: VideoCodec::X264.default_preset().into(),
+            fps_limit: None,
             audio_codec: AudioCodec::Aac,
             audio_bitrate_kbps: 192,
         }
@@ -257,25 +293,47 @@ impl EncodeSettings {
 
     /// Args following `-c:v` that go on the ffmpeg command line.
     pub fn video_args(&self) -> Vec<String> {
-        let mut args = Vec::with_capacity(8);
+        let mut args = Vec::with_capacity(12);
         args.push("-c:v".into());
         args.push(self.video_codec.ffmpeg_name().into());
         if !self.video_preset.is_empty() {
             args.push("-preset".into());
             args.push(self.video_preset.clone());
         }
-        // Codecs that don't accept -crf get coerced to bitrate mode here
-        // even if the caller set Crf. Safer than silently producing
-        // ffmpeg errors when a SW preset is paired with a HW encoder.
-        let effective = match (self.quality, self.video_codec.supports_crf()) {
-            (EncodeQuality::Crf(_), false) => EncodeQuality::Bitrate(8_000),
-            (q, _) => q,
-        };
-        match effective {
-            EncodeQuality::Crf(crf) => {
-                args.push("-crf".into());
-                args.push(crf.to_string());
-            }
+        match self.quality {
+            // Each codec family spells "constant quality" differently.
+            // The flag sets below mirror what the encoders document as
+            // their CQ/ICQ/CQP modes.
+            EncodeQuality::ConstantQuality(q) => match self.video_codec {
+                VideoCodec::X264 | VideoCodec::X265 => {
+                    args.extend(["-crf".into(), q.to_string()]);
+                }
+                VideoCodec::NvencH264 | VideoCodec::NvencHevc => {
+                    // -b:v 0 releases NVENC's default bitrate clamp so
+                    // -cq actually drives the size.
+                    args.extend([
+                        "-rc".into(), "vbr".into(),
+                        "-cq".into(), q.to_string(),
+                        "-b:v".into(), "0".into(),
+                    ]);
+                }
+                VideoCodec::VaapiH264 | VideoCodec::VaapiHevc => {
+                    args.extend([
+                        "-rc_mode".into(), "CQP".into(),
+                        "-qp".into(), q.to_string(),
+                    ]);
+                }
+                VideoCodec::QsvH264 | VideoCodec::QsvHevc => {
+                    args.extend(["-global_quality".into(), q.to_string()]);
+                }
+                VideoCodec::AmfH264 | VideoCodec::AmfHevc => {
+                    args.extend([
+                        "-rc".into(), "cqp".into(),
+                        "-qp_i".into(), q.to_string(),
+                        "-qp_p".into(), q.to_string(),
+                    ]);
+                }
+            },
             EncodeQuality::Bitrate(kbps) => {
                 args.push("-b:v".into());
                 args.push(format!("{kbps}k"));
@@ -287,6 +345,10 @@ impl EncodeSettings {
                 args.push("-bufsize".into());
                 args.push(format!("{}k", kbps * 2));
             }
+        }
+        if let Some(fps) = self.fps_limit {
+            args.push("-r".into());
+            args.push(fps.to_string());
         }
         args
     }
@@ -301,29 +363,35 @@ impl EncodeSettings {
     }
 }
 
-/// Discord Nitro size-targeting math. Given a duration and a target
-/// file-size budget (in MB), computes the bitrate + resolution that
-/// fits a clip into that budget while picking the highest resolution
-/// the budget can sustain.
+/// Discord size-targeting math. Given a duration and a target file-size
+/// budget (in MB), computes the bitrate + resolution that fits a clip
+/// into that budget while picking the highest resolution the budget can
+/// sustain.
 ///
-/// The target is a *parameter*, not a constant — Discord Nitro's hard
-/// limit is 500 MB and our safe-default is 475 MB, but users can dial
-/// it down for short clips where they'd rather have a smaller file
-/// than max quality (e.g., a 15-second highlight at 100 MB instead of
-/// the full 475 MB).
+/// The target is a *parameter*, not a constant — Discord's upload caps
+/// differ per subscription tier (see [`DiscordNitro::TIERS`]), and users
+/// can also dial the slider down for short clips where they'd rather
+/// have a smaller file than max quality.
 pub struct DiscordNitro;
 
 impl DiscordNitro {
-    /// 500 MB ceiling — Discord's hard upload cap.
+    /// 500 MB ceiling — Discord's hard upload cap for full Nitro.
     #[allow(dead_code)]
     pub const NITRO_LIMIT_BYTES: i64 = 500 * 1024 * 1024;
-    /// Lowest the user can dial via the slider — a 50 MB target still
-    /// fits Discord Nitro Basic's upload limit and produces watchable
-    /// quality for very short clips.
-    pub const MIN_TARGET_MB: u32 = 50;
+    /// Lowest the user can dial via the slider — 10 MB covers Discord's
+    /// free-tier upload limit.
+    pub const MIN_TARGET_MB: u32 = 10;
     /// Highest the slider goes. Sits 5% under Discord's 500 MB hard
     /// cap so container overhead can't push the final file over.
     pub const MAX_TARGET_MB: u32 = 475;
+    /// One-click presets for Discord's subscription tiers. The Nitro
+    /// entry is 475 (not 500) for the same container-overhead headroom
+    /// reason as MAX_TARGET_MB.
+    pub const TIERS: &'static [(&'static str, u32)] = &[
+        ("Free · 10 MB", 10),
+        ("Nitro Basic · 50 MB", 50),
+        ("Nitro · 500 MB", Self::MAX_TARGET_MB),
+    ];
     pub const AUDIO_KBPS: u32 = 128;
 
     /// Hard ceiling we cap the computed bitrate at, regardless of how
@@ -353,10 +421,26 @@ impl DiscordNitro {
         kbps.clamp(200.0, Self::MAX_BITRATE_KBPS as f64) as u32
     }
 
+    /// Audio bitrate for the given budget. 128 kbps normally, stepping
+    /// down when the total budget is tight (small targets like the
+    /// free-tier 10 MB on long clips) so audio doesn't eat the video's
+    /// entire allowance.
+    pub fn audio_kbps_for(duration_ms: i64, target_bytes: i64) -> u32 {
+        let total = Self::total_kbps_for(duration_ms, target_bytes);
+        if total >= 1_200 {
+            Self::AUDIO_KBPS
+        } else if total >= 500 {
+            96
+        } else {
+            64
+        }
+    }
+
     pub fn video_kbps_for(duration_ms: i64, target_bytes: i64) -> u32 {
-        Self::total_kbps_for(duration_ms, target_bytes)
-            .saturating_sub(Self::AUDIO_KBPS)
-            .max(200)
+        let total = Self::total_kbps_for(duration_ms, target_bytes);
+        total
+            .saturating_sub(Self::audio_kbps_for(duration_ms, target_bytes))
+            .max(150)
     }
 
     /// Resolution preset that the given video bitrate can support
@@ -385,12 +469,13 @@ impl DiscordNitro {
         EncodeSettings {
             resolution,
             video_codec: codec,
-            // CBR for predictable size, regardless of whether the codec
-            // would normally pick CRF.
+            // CBR for predictable size, regardless of what the codec
+            // would normally default to.
             quality: EncodeQuality::Bitrate(video_kbps),
             video_preset: codec.default_preset().into(),
+            fps_limit: None,
             audio_codec: AudioCodec::Aac,
-            audio_bitrate_kbps: Self::AUDIO_KBPS,
+            audio_bitrate_kbps: Self::audio_kbps_for(duration_ms, target_bytes),
         }
     }
 
@@ -400,7 +485,7 @@ impl DiscordNitro {
     /// we report 92% of the theoretical max + 3% for muxer overhead.
     pub fn estimated_size_bytes(duration_ms: i64, target_bytes: i64) -> i64 {
         let video_kbps = Self::video_kbps_for(duration_ms, target_bytes) as i64;
-        let total_kbps = video_kbps + Self::AUDIO_KBPS as i64;
+        let total_kbps = video_kbps + Self::audio_kbps_for(duration_ms, target_bytes) as i64;
         let theoretical_bits = total_kbps * 1000 * duration_ms / 1000;
         // 92% rate-control realism × 103% muxer overhead ≈ 0.948×.
         theoretical_bits / 8 * 948 / 1000
@@ -607,8 +692,9 @@ mod tests {
     }
 
     #[test]
-    fn vaapi_uses_bitrate_and_signals_hwupload() {
-        let s = settings_for(VideoCodec::VaapiH264);
+    fn vaapi_bitrate_mode_and_signals_hwupload() {
+        let mut s = settings_for(VideoCodec::VaapiH264);
+        s.quality = EncodeQuality::Bitrate(8_000);
         assert!(s.video_codec.needs_vaapi_upload());
         let args = s.video_args();
         assert_eq!(args[1], "h264_vaapi");
@@ -617,7 +703,7 @@ mod tests {
 
     #[test]
     fn forcing_bitrate_on_x264_skips_crf() {
-        // Discord Nitro mode forces CBR on libx264 — make sure the
+        // Discord mode forces CBR on libx264 — make sure the
         // EncodeQuality::Bitrate path actually flips the flags.
         let mut s = settings_for(VideoCodec::X264);
         s.quality = EncodeQuality::Bitrate(3_000);
@@ -626,6 +712,64 @@ mod tests {
         assert!(args.iter().any(|a| a == "-b:v"));
         assert!(args.iter().any(|a| a == "-maxrate"));
         assert!(args.iter().any(|a| a == "-bufsize"));
+    }
+
+    // ---- Constant-quality flags per HW codec family --------------------
+    //
+    // Each family exposes constant quality behind different flags. These
+    // pin the exact args so a refactor can't silently ship an encoder an
+    // option it doesn't understand.
+
+    fn cq_settings(codec: VideoCodec, q: u32) -> Vec<String> {
+        let mut s = settings_for(codec);
+        s.quality = EncodeQuality::ConstantQuality(q);
+        s.video_args()
+    }
+
+    #[test]
+    fn vaapi_constant_quality_uses_cqp() {
+        let args = cq_settings(VideoCodec::VaapiH264, 22);
+        let rc = args.iter().position(|a| a == "-rc_mode").unwrap();
+        assert_eq!(args[rc + 1], "CQP");
+        let qp = args.iter().position(|a| a == "-qp").unwrap();
+        assert_eq!(args[qp + 1], "22");
+        assert!(!args.iter().any(|a| a == "-b:v"));
+    }
+
+    #[test]
+    fn nvenc_constant_quality_uses_cq_with_zero_bitrate() {
+        let args = cq_settings(VideoCodec::NvencHevc, 21);
+        let cq = args.iter().position(|a| a == "-cq").unwrap();
+        assert_eq!(args[cq + 1], "21");
+        // -b:v 0 releases NVENC's default clamp.
+        let bv = args.iter().position(|a| a == "-b:v").unwrap();
+        assert_eq!(args[bv + 1], "0");
+    }
+
+    #[test]
+    fn qsv_constant_quality_uses_global_quality() {
+        let args = cq_settings(VideoCodec::QsvH264, 23);
+        let gq = args.iter().position(|a| a == "-global_quality").unwrap();
+        assert_eq!(args[gq + 1], "23");
+    }
+
+    #[test]
+    fn amf_constant_quality_uses_cqp_pair() {
+        let args = cq_settings(VideoCodec::AmfH264, 24);
+        assert!(args.iter().any(|a| a == "-qp_i"));
+        assert!(args.iter().any(|a| a == "-qp_p"));
+    }
+
+    #[test]
+    fn fps_limit_appends_output_rate() {
+        let mut s = settings_for(VideoCodec::X264);
+        s.fps_limit = Some(30);
+        let args = s.video_args();
+        let r = args.iter().position(|a| a == "-r").unwrap();
+        assert_eq!(args[r + 1], "30");
+        // No fps limit → no -r flag.
+        s.fps_limit = None;
+        assert!(!s.video_args().iter().any(|a| a == "-r"));
     }
 
     // ---- Discord Nitro -----------------------------------------------
@@ -704,6 +848,30 @@ mod tests {
     }
 
     #[test]
+    fn small_target_steps_audio_down_and_stays_in_budget() {
+        // 5-minute clip into the free tier's 10 MB. Audio must drop below
+        // 128 kbps or it would eat most of the ~273 kbps total budget.
+        let dur = 5 * 60 * 1000;
+        let target = DiscordNitro::target_bytes_from_mb(10);
+        let audio = DiscordNitro::audio_kbps_for(dur, target);
+        assert!(audio < 128, "expected reduced audio bitrate, got {audio}");
+        let est = DiscordNitro::estimated_size_bytes(dur, target);
+        let est_mb = est as f64 / (1024.0 * 1024.0);
+        assert!(
+            est_mb <= 10.5,
+            "10 MB target estimated at {est_mb:.1} MB"
+        );
+    }
+
+    #[test]
+    fn tier_presets_stay_within_slider_range() {
+        for (_, mb) in DiscordNitro::TIERS {
+            assert!(*mb >= DiscordNitro::MIN_TARGET_MB);
+            assert!(*mb <= DiscordNitro::MAX_TARGET_MB);
+        }
+    }
+
+    #[test]
     fn nitro_user_target_scales_bitrate_proportionally() {
         // 5-minute clip at 100 MB vs 475 MB target. Long enough that
         // the MAX_BITRATE_KBPS cap doesn't dominate, so the slider
@@ -732,23 +900,26 @@ mod tests {
 
     #[test]
     fn audio_args_use_chosen_codec_and_bitrate() {
-        let s = EncodeSettings::default_for_source(1920, 1080);
-        let args = s.audio_args();
-        assert_eq!(args, ["-c:a", "aac", "-b:a", "192k"]);
+        let mut s = EncodeSettings::default_for_source(1920, 1080);
+        assert_eq!(s.audio_args(), ["-c:a", "aac", "-b:a", "192k"]);
+        s.audio_codec = AudioCodec::Opus;
+        assert_eq!(s.audio_args(), ["-c:a", "libopus", "-b:a", "192k"]);
     }
 
     #[test]
-    fn supports_crf_flag_matches_codec_family() {
-        for c in [VideoCodec::X264, VideoCodec::X265] {
-            assert!(c.supports_crf(), "{:?} should support CRF", c);
-        }
+    fn quality_defaults_sit_inside_ranges() {
         for c in [
+            VideoCodec::X264,
+            VideoCodec::X265,
             VideoCodec::NvencH264,
             VideoCodec::VaapiH264,
             VideoCodec::QsvH264,
             VideoCodec::AmfH264,
         ] {
-            assert!(!c.supports_crf(), "{:?} should NOT use CRF", c);
+            assert!(
+                c.quality_range().contains(&c.default_quality()),
+                "{c:?} default quality outside its slider range"
+            );
         }
     }
 

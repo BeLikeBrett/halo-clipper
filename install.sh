@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Install Brett's Simple Clipper as a user-local Linux desktop app.
+# Install Halo Clipper as a user-local Linux desktop app.
 #
 # What this does:
 #   - Builds the release binary if it's not already present.
-#   - Copies the binary to ~/.local/bin/brett-clipper
+#   - Copies the binary to ~/.local/bin/halo-clipper
 #   - Copies icons to ~/.local/share/icons/hicolor/<size>/apps/
 #   - Copies the .desktop file to ~/.local/share/applications/
+#   - Removes any leftover install under the app's old name (brett-clipper)
 #   - Refreshes the desktop + icon caches so the menu picks it up.
 #
 # No sudo, no system-wide writes. Re-run safely to upgrade.
@@ -15,22 +16,29 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_NAME="brett-clipper"
-APP_ID="brett-clipper"
+BIN_NAME="halo-clipper"
+APP_ID="halo-clipper"
+LEGACY_ID="brett-clipper"
 
 BIN_DIR="${HOME}/.local/bin"
 ICON_BASE="${HOME}/.local/share/icons/hicolor"
 APP_DIR="${HOME}/.local/share/applications"
 
+remove_app() {
+    local id="$1"
+    rm -f "${BIN_DIR}/${id}"
+    rm -f "${APP_DIR}/${id}.desktop"
+    rm -f "${ICON_BASE}/scalable/apps/${id}.svg"
+    for size in 48 64 128 256 512; do
+        rm -f "${ICON_BASE}/${size}x${size}/apps/${id}.png"
+    done
+}
+
 case "${1:-install}" in
     uninstall)
         echo "Removing ${APP_ID}..."
-        rm -f "${BIN_DIR}/${BIN_NAME}"
-        rm -f "${APP_DIR}/${APP_ID}.desktop"
-        rm -f "${ICON_BASE}/scalable/apps/${APP_ID}.svg"
-        for size in 48 64 128 256 512; do
-            rm -f "${ICON_BASE}/${size}x${size}/apps/${APP_ID}.png"
-        done
+        remove_app "${APP_ID}"
+        remove_app "${LEGACY_ID}"
         update-desktop-database "${APP_DIR}" 2>/dev/null || true
         gtk-update-icon-cache "${ICON_BASE}" 2>/dev/null || true
         echo "Uninstalled."
@@ -49,6 +57,10 @@ if [[ ! -x "${BINARY}" ]]; then
     echo "Building release binary (this can take a minute on first run)..."
     (cd "${REPO_DIR}" && cargo build --release)
 fi
+
+# Clean up any install left behind by the app's previous name so two
+# entries don't show up in the launcher.
+remove_app "${LEGACY_ID}"
 
 # Ensure target dirs exist.
 mkdir -p "${BIN_DIR}"
@@ -75,7 +87,7 @@ echo "  → ${ICON_BASE}/{48,64,128,256,512}x.../apps/${APP_ID}.png"
 # Desktop entry. We substitute the absolute binary path into Exec=
 # and TryExec= so launchers (fuzzel/wofi/etc.) work regardless of the
 # compositor's PATH — Niri and friends don't source .bashrc, so a bare
-# `Exec=brett-clipper` is invisible to them when ~/.local/bin isn't in
+# `Exec=halo-clipper` is invisible to them when ~/.local/bin isn't in
 # the session env. Hardcoding the absolute path keeps the entry usable
 # from any launcher context.
 ABSOLUTE_BIN="${BIN_DIR}/${BIN_NAME}"
@@ -94,16 +106,16 @@ cat <<EOF
 
 Installed. Three things to check:
 
-  1. Your application launcher (Wofi/Rofi/etc) should list "Brett's Simple Clipper"
+  1. Your application launcher (Wofi/Rofi/etc) should list "Halo Clipper"
      after a brief refresh — log out + back in if it doesn't show up immediately.
 
   2. ~/.local/bin needs to be on PATH for the .desktop's Exec= to find it. Most
-     distros set this automatically; if running 'brett-clipper' in a shell fails:
+     distros set this automatically; if running 'halo-clipper' in a shell fails:
          export PATH="\$HOME/.local/bin:\$PATH"
      (add to ~/.bashrc / ~/.zshrc).
 
   3. Right-clicking a .mp4 / .mkv / .mov in your file manager should now offer
-     "Brett's Simple Clipper" in "Open With".
+     "Halo Clipper" in "Open With" — and it opens the file directly.
 
 Uninstall any time with: ${REPO_DIR}/install.sh uninstall
 EOF

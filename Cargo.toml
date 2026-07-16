@@ -1,12 +1,12 @@
 [package]
-name = "brett_clipper"
-version = "0.1.0"
+name = "halo_clipper"
+version = "0.5.0"
 edition = "2021"
-description = "Brett's Simple Clipper — minimal Linux video trimmer"
+description = "Halo Clipper — fast, native Linux video clipper"
 license = "MIT"
 
 [[bin]]
-name = "brett-clipper"
+name = "halo-clipper"
 path = "src/main.rs"
 
 [dependencies]

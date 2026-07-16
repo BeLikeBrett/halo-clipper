@@ -1,6 +1,8 @@
-# Brett's Simple Clipper
+# Halo Clipper
 
 A fast, native Linux video editor with a focus on getting clips out the door — not learning a DAW. Built in Rust + egui. Single ~11 MB binary. No bloat.
+
+> Formerly "Brett's Simple Clipper". The app migrates your old config and proxy cache automatically on first launch, and `./install.sh` cleans up the old menu entry.
 
 Two modes for two workflows:
 
@@ -11,18 +13,19 @@ Two modes for two workflows:
 
 ### Editing
 
-- Open any video ffmpeg can read (`mp4`, `mkv`, `mov`, `webm`, `avi`, `m4v`)
+- Open any video ffmpeg can read (`mp4`, `mkv`, `mov`, `webm`, `avi`, `m4v`) — via File → Open, the file dialog, "Open With" from a file manager, or `halo-clipper clip.mp4` on the command line
 - **Simple Clip mode**: Set In / Set Out / Clear, exports one range. Stream-copies when keyframe-aligned, re-encodes when not.
 - **Advanced mode**:
   - Multi-track timeline with V1 + one A track per source audio stream
   - **Split** at the playhead, **Delete** selected clips (with linked-partner cascade), **Detach Audio** to expose all source audio lanes
   - Drag clips horizontally with magnetic snap to clip boundaries
+  - Timeline gaps are first-class: they play (and export) as black + silence
   - Per-track audio gain (0 → 2.0, slider lives in the right-hand Edit panel)
   - Per-clip speed 0.25× → 4.0× with live mpv preview (chained `atempo` so audio stays in sync)
-  - Per-track text overlays — pick a font, color, size; drag the caption around on the live preview; burned in via `drawtext` at export
+  - Per-track text overlays — font, color, size, **outline, drop shadow, opacity**; drag the caption around on the live preview; burned in via `drawtext` at export, with pixel sizes scaled to the output resolution so the export matches the preview
   - Linked-by-default V+A: edits propagate together until you press **D** to detach
   - Full undo/redo (Ctrl+Z / Ctrl+Shift+Z) on every mutation
-  - Right-click any clip → Edit, opens the side panel for fine control
+  - Click any clip → the Edit side panel appears with gain / speed / caption controls; click empty lane (or the ✕) to dismiss
 
 ### Playback
 
@@ -37,10 +40,10 @@ Two modes for two workflows:
 | Mode | Behavior |
 |---|---|
 | **Auto** | Stream-copies in Simple Clip mode if the In mark is keyframe-aligned; otherwise re-encodes at libx264 CRF 18 to preserve source quality. Always re-encodes in Advanced mode (the filter graph requires decoded frames). |
-| **Discord Nitro** | Size-targeted CBR encode. A slider (50 MB → 475 MB at 25 MB steps) lets you pick how big the output should be. The encoder auto-picks resolution + bitrate based on duration so the final file lands just under target. Optimized for Discord's 500 MB Nitro upload cap. |
-| **Custom** | Pick your own resolution preset (Source / 480p / 720p / 1080p / 1440p / 4K), codec (any HW encoder ffmpeg advertised + libx264 / libx265), CRF or bitrate, preset, audio bitrate. "Advanced" toggle reveals the per-codec preset dropdown and audio bitrate slider. |
+| **Discord** | Size-targeted CBR encode. Tier chips for Discord's upload caps — **Free (10 MB), Nitro Basic (50 MB), Nitro (500 MB)** — plus a 10 → 475 MB slider for anything in between. The encoder auto-picks resolution + bitrate from the clip's duration, and steps the audio bitrate down on tight budgets so a long clip still fits the free tier. |
+| **Custom** | Resolution preset (Source / 480p / 720p / 1080p / 1440p / 4K), frame-rate cap (Source / 24 / 30 / 60), codec (any HW encoder ffmpeg advertised + libx264 / libx265), and **rate control**: constant quality (CRF / QP / CQ / ICQ — whichever the codec calls it, with a codec-appropriate slider range) or target bitrate with a live size estimate. "Advanced" reveals the per-codec encoder preset, audio codec (AAC / Opus), and audio bitrate. |
 
-The active GPU is auto-detected from `/sys/class/drm` and the recommended codec is starred in the codec dropdown. Hardware encoder detection runs `ffmpeg -encoders` once at startup and only offers what's actually available.
+The active GPU is auto-detected from `/sys/class/drm` and the recommended codec is starred in the codec dropdown. Hardware encoder detection runs `ffmpeg -encoders` once at startup and only offers what's actually available. Opus in an `.mp4` container automatically gets the `-strict -2` flag ffmpeg still requires.
 
 ### Performance
 
@@ -48,7 +51,7 @@ The four levers we pull for snappy editing on long, high-bitrate sources:
 
 1. **Hardware decode (VAAPI)** — When the encoder is VAAPI and the source codec is H.264/HEVC/VP9/MPEG-2/VC-1, frames decode straight onto the GPU, flow through `scale_vaapi`, and into the encoder without ever leaving VRAM. ~2–3× the throughput of SW decode on 4K sources. Falls back transparently for codecs VAAPI can't decode (AV1, VP8, exotic).
 
-2. **Scrub proxies** — On file open, a short-GOP H.264 proxy (GOP=12, 1080p max, libx264 veryfast CRF 22 — or h264_vaapi if available) generates in the background to `~/.cache/brett-clipper/proxies/<hash>.mp4`. mpv swaps to the proxy when it's ready. Result: timeline scrubbing snaps to 5+ keyframes per second instead of the 0.2 keyframes/sec a typical OBS recording offers. Cache-keyed by `(canonical_path, size, mtime)` so re-opening the same file is instant. Toggle "auto-clear on close" in File → Settings if disk space is tight.
+2. **Scrub proxies** — On file open, a short-GOP H.264 proxy (GOP=12, 1080p max, libx264 veryfast CRF 22 — or h264_vaapi if available) generates in the background to `~/.cache/halo-clipper/proxies/<hash>.mp4`. mpv swaps to the proxy when it's ready. Result: timeline scrubbing snaps to 5+ keyframes per second instead of the 0.2 keyframes/sec a typical OBS recording offers. Cache-keyed by `(canonical_path, size, mtime)` so re-opening the same file is instant. Settings offers an **All-intra** profile (every frame a keyframe — frame-exact scrubs, bigger proxies) and an auto-clear-on-close toggle.
 
 3. **mpv tuned for editing, not playback** — The defaults assume "press play and watch a movie." We override with `cache=yes`, `cache-secs=30`, `demuxer-readahead-secs=20`, `demuxer-max-bytes=2GiB`, `demuxer-max-back-bytes=2GiB`, `hr-seek-framedrop=yes`, `vd-lavc-fast=yes`, `video-latency-hacks=yes`. Re-scrubbing visited regions is instant.
 
@@ -73,14 +76,15 @@ cd ~/Projects/Brett
 
 That:
 - Builds the release binary if not already built
-- Copies it to `~/.local/bin/brett-clipper`
+- Copies it to `~/.local/bin/halo-clipper`
 - Drops icons into `~/.local/share/icons/hicolor/{48,64,128,256,512}x.../apps/` plus the scalable SVG
-- Writes `~/.local/share/applications/brett-clipper.desktop` with absolute paths substituted (so it works in any compositor regardless of session PATH)
+- Writes `~/.local/share/applications/halo-clipper.desktop` with absolute paths substituted (so it works in any compositor regardless of session PATH)
+- Removes any leftover `brett-clipper` install from before the rename
 - Refreshes the desktop database + icon cache
 
-Launch via your app menu / fuzzel / wofi / file-manager "Open With" — or from a shell as `brett-clipper`.
+Launch via your app menu / fuzzel / wofi / file-manager "Open With" — or from a shell as `halo-clipper` (optionally with a file path argument).
 
-Right-click any `.mp4` / `.mkv` / `.mov` / `.webm` / `.avi` / `.m4v` in your file manager → "Open With" → Brett's Simple Clipper.
+Right-click any `.mp4` / `.mkv` / `.mov` / `.webm` / `.avi` / `.m4v` in your file manager → "Open With" → Halo Clipper.
 
 Uninstall:
 
@@ -134,18 +138,17 @@ Module-by-module map of `src/`:
 
 | File | Purpose |
 |---|---|
-| `main.rs` | eframe entry, viewport + icon setup, DejaVu font registration |
+| `main.rs` | eframe entry, viewport + icon setup, DejaVu font registration, CLI file argument |
 | `app.rs` | All app state, UI layout, action dispatch, keyboard handling, modals |
 | `theme.rs` | Color palette + global egui style |
-| `track.rs` | `Clip` / `Track` / `TrackId` / `ClipId` / `LinkId` data model, split/delete/detach logic, project_cut_duration |
+| `track.rs` | `Clip` / `Track` / `TrackId` / `ClipId` / `LinkId` data model, `TextOverlay`, split/delete/detach logic, project_cut_duration |
 | `timeline.rs` | Custom timeline widgets — Simple Clip rail, Advanced multi-track with drag-and-snap, scrubber |
 | `player.rs` | libmpv FFI wrapper, render-context lifecycle, event thread, editing-tuned init properties |
 | `media.rs` | ffprobe JSON → `MediaInfo` (duration, dims, fps, codec, audio stream count) |
-| `proxy.rs` | Scrub-proxy generation, cache-keyed by `(path, size, mtime)`, clear_cache + cache_size_bytes for settings UI |
-| `settings.rs` | Persistent prefs loaded/saved at `~/.config/brett-clipper/config.json` (atomic write via .tmp + rename) |
-| `encode.rs` | `EncodeSettings`, `VideoCodec`, `ResolutionPreset`, `EncodeQuality`, `DiscordNitro` math, GPU vendor detection, HW encoder probe, `HwDecode` strategy + `is_vaapi_decodable` gate |
-| `export.rs` | Async export pipeline — `ExportPlan::{Simple, MultiTrack}`, ffmpeg subprocess with `-progress pipe:1` parsing, VAAPI device binding, state-machine `build_video_post_chain` that handles `scale_vaapi` vs `scale`, `hwdownload` around `drawtext`, final `hwupload`-or-`hwdownload` bridge |
-| `thumb.rs` | Background worker that pulls preview frames via `ffmpeg` (used as a still fallback when mpv isn't actively rendering) |
+| `proxy.rs` | Scrub-proxy generation (Standard / All-intra profiles), cache-keyed by `(path, size, mtime)`, clear_cache + cache_size_bytes for settings UI |
+| `settings.rs` | Persistent prefs loaded/saved at `~/.config/halo-clipper/config.json` (atomic write via .tmp + rename; auto-migrates from the old brett-clipper path) |
+| `encode.rs` | `EncodeSettings`, `VideoCodec` (with per-codec quality name/range/flags), `ResolutionPreset`, `EncodeQuality`, `DiscordNitro` tier math, GPU vendor detection, HW encoder probe, `HwDecode` strategy + `is_vaapi_decodable` gate |
+| `export.rs` | Async export pipeline — `ExportPlan::{Simple, MultiTrack}`, ffmpeg subprocess with `-progress pipe:1` parsing, VAAPI device binding, black-gap synthesis, state-machine `build_video_post_chain`, `build_drawtext` with output-resolution scaling |
 | `gl_loader.rs` | OpenGL function loader for libmpv's render context |
 | `video_fbo.rs` | Helper FBO that mpv renders into; we then blit-copy into the egui rect |
 
@@ -153,30 +156,29 @@ Module-by-module map of `src/`:
 
 1. `media::probe()` runs ffprobe, returns `MediaInfo`
 2. mpv loads the **source** immediately so editing can start right away
-3. If `proxy::proxy_exists(source)` is true, mpv re-loads the proxy at playhead 0 (cache hit, instant)
+3. If a proxy for the current quality profile is cached, mpv re-loads it at playhead 0 (cache hit, instant)
 4. Otherwise `proxy::spawn_transcode()` runs in the background; `update()` polls progress and updates the status bar
 5. When the proxy finishes, `tick_proxy()` swaps mpv to the proxy at the current playhead position
 6. `Project.proxy` stores the proxy path. **Export pipelines always read `Project.source`** — proxies are preview-only and have zero impact on output quality.
 
-### Export filter-graph state machine
+### Export filter-graph model
 
-`build_video_post_chain(hw_decode, resolution, drawtext_expr, encoder_wants_gpu)` in `export.rs` is the single source of truth. Tracks a `on_gpu: bool` through the chain:
+The multi-track graph is built from the cut timeline:
 
-- Starts on GPU iff HW decode is enabled
-- `scale_vaapi` (GPU) or `scale` (CPU)
-- `drawtext` is CPU-only — if currently on GPU, inserts `hwdownload, format=nv12` first
-- Final bridge to whatever pixel-domain the encoder expects
-
-Nine permutations covered by unit tests in `export.rs::tests`. Adding a new filter step means extending this one helper, not threading branches through both `run_simple` and `run_multitrack`.
+- **Video**: gaps between clips (and before the first / after the last, up to the shared timeline end) are synthesized as black `color=` segments — hwuploaded when the surrounding frames are VAAPI surfaces — then everything concats in cut order. Per-clip speed is applied per segment via `setpts`.
+- **Audio**: per-track `atrim` + `atempo`/`volume` chains with `anullsrc` silence in the gaps, padded to the same timeline end, then `amix` across unmuted tracks. Video and audio always come out the same length.
+- **Post-chain**: `build_video_post_chain(hw_decode, resolution, drawtext_expr, encoder_wants_gpu)` tracks a single `on_gpu` bool through scale → drawtext → encoder handoff, inserting `hwdownload`/`hwupload` bridges exactly where needed. Adding a new filter step means extending this one helper.
 
 ## Build from source
 
 ```bash
 cd ~/Projects/Brett
 cargo build --release          # ~9 sec recompile, ~1 min cold
-cargo test --release            # all 46 unit tests
+cargo test --release           # 69 tests, incl. real-ffmpeg end-to-end exports
 cargo clippy --release --all-targets
 ```
+
+The test suite shells out to `ffmpeg`/`ffprobe` for its end-to-end cases (synthetic sources in `$TMPDIR/halo-clipper-tests/`), and exercises the full VAAPI pipeline automatically when a render node + VAAPI-capable ffmpeg are present.
 
 Profile is already tuned for shipping:
 
@@ -188,34 +190,30 @@ codegen-units = 1
 strip = true
 ```
 
-Result: 11 MB stripped binary. See "Where the size goes" in the binary-size discussion (or `size target/release/brett-clipper`).
-
 ## Test coverage
 
-46 unit tests as of v0.4 across three areas:
+69 tests as of v0.5:
 
-- **`track::tests`** (12 tests) — clip splitting, link-group propagation, delete cascades, detach edge cases. Guards the data model against regressions.
-- **`encode::tests`** (20 tests) — codec args (`-c:v`/`-crf`/`-b:v`/`-maxrate`/`-bufsize`), CRF-safety coercion, resolution math, Discord Nitro budget math at multiple durations, slider-scales-bitrate proportionality, GPU vendor recommendation logic.
-- **`export::tests`** (14 tests) — exhaustive permutations of the filter-chain state machine (`HwDecode × scale × drawtext × encoder placement`), codec gating (`is_vaapi_decodable` accepts h264/hevc/vp9/mpeg2/vc1, rejects av1/vp8/etc.).
-
-Run via `cargo test --release`.
+- **`track::tests`** — clip splitting, link-group propagation, delete cascades, detach edge cases. Guards the data model against regressions.
+- **`encode::tests`** — codec args for every rate-control mode (CRF / QP / CQ / ICQ / CBR with maxrate), fps caps, resolution math, Discord tier/budget math including the adaptive audio step-down, GPU vendor recommendation logic.
+- **`export::tests`** — exhaustive permutations of the filter-chain state machine (`HwDecode × scale × drawtext × encoder placement`), input-seek rebasing, output-timeline math (gaps + speed), drawtext scaling/opacity, Opus container gating — plus **five end-to-end exports through real ffmpeg**: gap black/sync, speed sync, silent sources, Opus-in-MP4, and the full VAAPI GPU graph.
 
 ## Settings & cache
 
-User config lives at `~/.config/brett-clipper/config.json` (atomic write). Open via **File → Settings**.
+User config lives at `~/.config/halo-clipper/config.json` (atomic write). Open via **File → Settings**.
 
-Today's settings:
-
-- **Auto-clear cache on close** — wipes `~/.cache/brett-clipper/proxies/` on app exit. Off by default (caching is the point of the proxy feature). On = free the disk on quit.
+- **Scrub proxy quality** — Standard (GOP 12; small, smooth) or All-intra (every frame a keyframe; frame-exact scrubbing, bigger files). Applies to the next open; each profile caches separately.
+- **Auto-clear cache on close** — wipes `~/.cache/halo-clipper/proxies/` on app exit. Off by default (caching is the point of the proxy feature).
 - **Clear cache now** — manual button. Shows live cache size, reports MB freed.
 
-Proxy cache location: `~/.cache/brett-clipper/proxies/<16-hex>.mp4`. Each file is keyed by a hash of `(canonical_path, size, mtime_ns)`. Clearing it just regenerates proxies on next open of the relevant sources.
+Proxy cache location: `~/.cache/halo-clipper/proxies/<16-hex>[-ai].mp4`, keyed by a hash of `(canonical_path, size, mtime_ns)` plus the quality profile. A cache from the pre-rename app is migrated automatically.
 
 ## Design principles
 
 - **Native, not Electron.** No 200 MB framework, no JS runtime. ~11 MB binary, sub-second cold start.
 - **Subprocess ffmpeg, dynamic libmpv.** Updating system ffmpeg never requires recompile. mpv is the only direct link (via libmpv2 + libloading), and the linker handles version compatibility through the standard SONAME.
 - **Export quality is sacred.** The proxy never reaches the export pipeline. Whatever lands in your output file is encoded straight from the original source.
+- **Preview and export agree.** Timeline gaps show black in the preview and export as black. Caption sizing on the preview matches the burned-in result at any output resolution.
 - **Editing modes follow the user's intent.** Simple Clip is intentionally limited so it can stay fast. Advanced grows when you need real NLE features but never gets in the way of a quick mark-and-cut.
 - **Don't pretend you're a movie studio.** No project files yet — every open is a fresh session. Real users export and move on; we don't want to chase the long tail of "load a project from last week" until someone asks for it.
 
@@ -230,23 +228,26 @@ Done since v0.1:
 - ~~Per-clip speed control~~
 - ~~Text overlay with font picker + drag-to-position~~
 - ~~Multi-stream audio (one A track per source audio stream)~~
-- ~~Right-click → Edit side panel~~
-- ~~Auto / Discord Nitro / Custom export modes~~
-- ~~Discord Nitro target-size slider~~
+- ~~Click-to-select Edit side panel~~
+- ~~Auto / Discord / Custom export modes~~
+- ~~Discord tier presets + target-size slider~~
 - ~~Hardware encoder detection + GPU vendor probe~~
 - ~~VAAPI hardware decode for editing-rate scrubbing~~
-- ~~Scrub-proxy generation with disk cache~~
+- ~~Scrub-proxy generation with disk cache + quality profiles~~
 - ~~Persistent settings + cache management~~
-- ~~Linux desktop integration (icon, .desktop, install.sh)~~
+- ~~Linux desktop integration (icon, .desktop, install.sh, "Open With" file argument)~~
 - ~~Coherent custom button system + polished modals~~
+- ~~Constant-quality rate control on every codec family (CRF/QP/CQ/ICQ)~~
+- ~~Text overlay typography: outline, drop shadow, opacity~~
+- ~~Frame-rate cap in Custom export~~
+- ~~Opus audio option~~
 
 Possible next:
 
 - NVENC hardware decode path (currently NVENC users stay on SW decode)
-- Proxy-quality preset toggle (current GOP=12 is the default; "all-I" mode for pixel-perfect scrubs at the cost of disk)
 - Project file format (save/restore a session)
 - Keyboard shortcut editor in Settings
-- More text-overlay typography (drop shadow, stroke, opacity)
+- Freehand / shape annotations burned into export
 
 ## License
 

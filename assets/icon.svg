@@ -1,34 +1,54 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Halo Clipper app icon.
+     Family DNA from the HaloOS logo (Catppuccin Mocha, tilted halo ring,
+     rosewater→mauve→blue gradient) fused with editor language: a play mark
+     wearing the halo, above a timeline with a cut and the playhead parked
+     exactly on the cut point. -->
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-  <!-- Rounded-square background, app-matched dark navy -->
-  <rect x="0" y="0" width="512" height="512" rx="96" fill="#1d2530"/>
+  <defs>
+    <!-- Background: near-flat vertical fade for depth without noise -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#242438"/>
+      <stop offset="100%" stop-color="#181825"/>
+    </linearGradient>
+    <!-- The HaloOS ring gradient (same stops as the OS logo) -->
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#f5e0dc"/>
+      <stop offset="50%"  stop-color="#cba6f7"/>
+      <stop offset="100%" stop-color="#89b4fa"/>
+    </linearGradient>
+    <!-- Accent used for the "active clip" on the timeline -->
+    <linearGradient id="clip" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#cba6f7"/>
+      <stop offset="100%" stop-color="#89b4fa"/>
+    </linearGradient>
+    <!-- Soft glow behind the ring -->
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="55%"  stop-color="#cba6f7" stop-opacity="0"/>
+      <stop offset="80%"  stop-color="#cba6f7" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#cba6f7" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
 
-  <!-- Outer film frame: subtle accent border -->
-  <rect x="80" y="128" width="352" height="256" rx="16"
-        fill="#0d1117"
-        stroke="#4070a8" stroke-width="6"/>
+  <!-- Rounded-square plate -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
 
-  <!-- Sprocket holes — left column -->
-  <g fill="#4070a8">
-    <rect x="48" y="152" width="20" height="28" rx="4"/>
-    <rect x="48" y="196" width="20" height="28" rx="4"/>
-    <rect x="48" y="240" width="20" height="28" rx="4"/>
-    <rect x="48" y="284" width="20" height="28" rx="4"/>
-    <rect x="48" y="328" width="20" height="28" rx="4"/>
-  </g>
+  <!-- Glow + tilted halo ring, behind the play mark -->
+  <circle cx="256" cy="196" r="170" fill="url(#glow)"/>
+  <ellipse cx="256" cy="186" rx="146" ry="54" fill="none"
+           stroke="url(#ring)" stroke-width="16" stroke-linecap="round"
+           transform="rotate(-12 256 186)"/>
 
-  <!-- Sprocket holes — right column -->
-  <g fill="#4070a8">
-    <rect x="444" y="152" width="20" height="28" rx="4"/>
-    <rect x="444" y="196" width="20" height="28" rx="4"/>
-    <rect x="444" y="240" width="20" height="28" rx="4"/>
-    <rect x="444" y="284" width="20" height="28" rx="4"/>
-    <rect x="444" y="328" width="20" height="28" rx="4"/>
-  </g>
-
-  <!-- Play triangle, off-white -->
-  <path d="M 214 192 L 214 320 L 326 256 Z"
-        fill="#e4ecf8"
-        stroke="#e4ecf8" stroke-width="4"
+  <!-- Play mark (rounded corners via stroke) -->
+  <path d="M 212 122 L 212 278 L 348 200 Z"
+        fill="#e8ecf8" stroke="#e8ecf8" stroke-width="26"
         stroke-linejoin="round"/>
+
+  <!-- Timeline: active clip · cut · rest of the take -->
+  <rect x="88"  y="374" width="200" height="40" rx="13" fill="url(#clip)"/>
+  <rect x="316" y="374" width="108" height="40" rx="13" fill="#45475a"/>
+
+  <!-- Playhead parked on the cut -->
+  <path d="M 288 340 L 316 340 L 302 362 Z" fill="#f5e0dc"/>
+  <rect x="299" y="352" width="6" height="76" rx="3" fill="#f5e0dc"/>
 </svg>
