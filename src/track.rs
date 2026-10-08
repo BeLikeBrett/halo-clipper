@@ -83,7 +83,7 @@ impl Clip {
     }
 }
 
-/// Per-track text overlay (drawn into the video by ffmpeg's drawtext).
+/// Per-segment text overlay (drawn into the video by ffmpeg's drawtext).
 /// Position is normalized 0..=1 of the source frame so the same overlay
 /// reads identically at any resolution; rendered centered on (x, y).
 #[derive(Clone, Debug, PartialEq)]

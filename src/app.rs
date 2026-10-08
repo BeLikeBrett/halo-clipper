@@ -59,12 +59,9 @@ struct Project {
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
-    /// Optional drawtext overlay per track. Keyed by `TrackId` so the
-    /// caption applies to the whole track regardless of how it's been
-    /// split — adding text on any clip of V1 reads as "caption the V1
-    /// track" rather than "caption this one segment". The map is sparse
-    /// so untouched tracks pay no allocation cost.
-    text_overlays: HashMap<TrackId, TextOverlay>,
+    /// Optional caption per video segment. Splitting copies the caption
+    /// to both halves; each half can then be edited independently.
+    text_overlays: HashMap<ClipId, TextOverlay>,
     id_gen: IdGen,
     mode: EditMode,
 }
@@ -124,6 +121,40 @@ impl Project {
         }
     }
 
+    /// Preserve the caption on both independently editable split halves.
+    fn split_segments(&mut self, target_ids: &[ClipId], cut_ms: i64) -> Vec<ClipId> {
+        let captions_to_copy: Vec<(ClipId, TextOverlay)> = target_ids.iter()
+            .filter_map(|id| self.text_overlays.get(id).cloned().map(|o| (*id, o)))
+            .collect();
+        let new_ids = track::split_clips(&mut self.clips, target_ids, cut_ms, &self.id_gen);
+        for (left_id, overlay) in captions_to_copy {
+            // split_clip inserts the right half immediately after its
+            // original. Failed/boundary splits copy nothing.
+            if let Some(left_index) = self.clips.iter().position(|c| c.id == left_id) {
+                if let Some(right) = self.clips.get(left_index + 1) {
+                    if new_ids.contains(&right.id) {
+                        self.text_overlays.insert(right.id, overlay);
+                    }
+                }
+            }
+        }
+        new_ids
+    }
+
+    fn active_caption(&self) -> Option<(ClipId, &TextOverlay)> {
+        if self.mode != EditMode::MultiTrack { return None; }
+        let v = self.first_video_track()?;
+        let clip = track::clip_on_track_at(&self.clips, v, self.playhead_ms)?;
+        let overlay = self.text_overlays.get(&clip.id)?;
+        (!overlay.text.trim().is_empty()).then_some((clip.id, overlay))
+    }
+
+    fn video_captions(&self, track_id: TrackId) -> Vec<Option<TextOverlay>> {
+        sorted_track_clips(&self.clips, track_id).into_iter()
+            .map(|c| self.text_overlays.get(&c.id).cloned())
+            .collect()
+    }
+
     /// Stable canvas length for the Advanced timeline. Never shrinks
     /// below the original source duration — so deleting / left-dragging
     /// clips leaves empty space at the right edge instead of collapsing
@@ -162,7 +193,7 @@ struct UndoSnapshot {
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
-    text_overlays: HashMap<TrackId, TextOverlay>,
+    text_overlays: HashMap<ClipId, TextOverlay>,
 }
 
 impl UndoSnapshot {
@@ -322,11 +353,17 @@ pub struct ClipperApp {
     /// Custom-encode settings persist between modal sessions so the user
     /// doesn't lose their preferences each time they cancel + reopen.
     custom_encode: CustomEncode,
-    /// HW encoders the local ffmpeg build advertises. Detected once at
-    /// startup; surfaced in the Custom codec dropdown.
-    available_hw_codecs: Vec<VideoCodec>,
+    /// Optional encoders this machine can actually run — every hardware
+    /// encoder ffmpeg advertises, plus software AV1. Detected once at
+    /// startup (hardware AV1 entries are additionally test-encoded, see
+    /// `encode::verify_av1_encoders`); surfaced in the Custom codec
+    /// dropdown and used by the Discord planner.
+    available_codecs: Vec<VideoCodec>,
+    /// Discord mode's codec row: Auto (the size-aware picker) or a
+    /// pinned family. Session state, like the target-size slider.
+    discord_codec_choice: encode::CodecChoice,
     /// GPU vendor probe from /sys/class/drm. Used together with
-    /// `available_hw_codecs` to recommend the best encoder.
+    /// `available_codecs` to recommend the best encoder.
     detected_gpu: Option<GpuVendor>,
     export: Option<ExportHandle>,
     player: Arc<Player>,
@@ -399,15 +436,19 @@ impl ClipperApp {
         let player = Arc::new(Player::new()?);
         // One probe each — the results feed both the stored fields and
         // the Custom-encode defaults.
-        let available_hw_codecs = encode::detect_hw_encoders();
+        // Hardware AV1 gets a real test encode: ffmpeg lists the encoder
+        // on machines whose silicon has no AV1 encode block, and the
+        // Discord planner picks from this list without asking.
+        let available_codecs =
+            encode::verify_av1_encoders(encode::detect_available_codecs());
         let detected_gpu = encode::detect_gpu();
-        let recommended = encode::recommend_codec(detected_gpu, &available_hw_codecs);
+        let recommended = encode::recommend_codec(detected_gpu, &available_codecs);
         Ok(Self {
             project: None,
             status: "Open a video to begin.".into(),
             export_mode: ExportMode::Auto,
             custom_encode: CustomEncode::default_for(recommended),
-            available_hw_codecs,
+            available_codecs,
             detected_gpu,
             export: None,
             player,
@@ -428,6 +469,7 @@ impl ClipperApp {
             settings: Settings::load(),
             settings_open: false,
             discord_target_mb: encode::DiscordNitro::MAX_TARGET_MB,
+            discord_codec_choice: encode::CodecChoice::default(),
         })
     }
 
@@ -455,16 +497,15 @@ impl ClipperApp {
     }
 
     /// Build mpv's complete lavfi-complex filter graph from the current
-    /// project state (audio mix + per-clip video drawtext overlays) and
+    /// project state (audio mix) and
     /// push it to mpv when it differs from last frame. Edge-triggered so
     /// it doesn't fight the user's manual speaker-button mute every frame.
     ///
     /// SimpleClip: no filter — mpv plays the source's default streams;
     /// only the mute toggle is honored.
     ///
-    /// MultiTrack: combined chain — drawtext (gated by source-time
-    /// `enable=between(t,...)`) for any clip with a text overlay, plus
-    /// the audio mix from the unmuted audio tracks.
+    /// MultiTrack: audio mix from unmuted tracks. Segment captions are
+    /// composited in egui, independently of mpv's audio filter graph.
     fn sync_audio_mix(&mut self) {
         let (desired_filter, desired_mute) = self.build_lavfi_complex();
         if desired_filter != self.last_lavfi_complex {
@@ -546,7 +587,7 @@ impl ClipperApp {
     /// then ride on the GPU instead of libx264. Drops the wall-clock
     /// for a 14-min 4K source from ~6 minutes to ~2 minutes on AMD VCN.
     fn proxy_can_use_vaapi(&self) -> bool {
-        self.available_hw_codecs
+        self.available_codecs
             .iter()
             .any(|c| matches!(c, VideoCodec::VaapiH264))
     }
@@ -916,12 +957,7 @@ impl ClipperApp {
                         .map(|c| c.id)
                         .collect()
                 };
-                let new_ids = track::split_clips(
-                    &mut p.clips,
-                    &target_ids,
-                    p.playhead_ms,
-                    &p.id_gen,
-                );
+                let new_ids = p.split_segments(&target_ids, p.playhead_ms);
                 if new_ids.is_empty() {
                     self.undo_stack.pop();
                 }
@@ -951,6 +987,7 @@ impl ClipperApp {
                 for id in targets {
                     track::delete_with_links(&mut p.clips, id);
                 }
+                p.text_overlays.retain(|id, _| p.clips.iter().any(|c| c.id == *id));
                 p.selected_clips.clear();
                 // Playhead stays where it was. Canvas length is preserved
                 // via Project::canvas_length_ms, so deleted clips leave a
@@ -1154,7 +1191,19 @@ impl ClipperApp {
         // Source dimensions for resolution-preset math.
         let (src_w, src_h) = (project.media.width, project.media.height);
         let cut_duration_ms = self.cut_duration_ms_for_export(project);
-        let nitro_codec = encode::recommend_codec(self.detected_gpu, &self.available_hw_codecs);
+        // One plan, shared by both export paths below and computed the
+        // same way the Discord stats panel computes it, so what the user
+        // was shown is what gets encoded.
+        let nitro_plan = encode::NitroPlan::compute(
+            cut_duration_ms,
+            encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb),
+            src_w,
+            src_h,
+            project.media.fps,
+            self.discord_codec_choice,
+            self.detected_gpu,
+            &self.available_codecs,
+        );
 
         // Resolve the encode plan based on the user's chosen export mode.
         let resolve_encode = |has_modifications: bool, aligned_copy_possible: bool|
@@ -1169,29 +1218,15 @@ impl ClipperApp {
                         self.custom_encode.resolution.label(),
                     )),
                 ),
-                ExportMode::Discord => {
-                    let target_bytes =
-                        encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
-                    let settings = encode::DiscordNitro::settings_for(
-                        cut_duration_ms,
-                        target_bytes,
-                        src_w,
-                        src_h,
-                        nitro_codec,
-                    );
-                    let est_mb = encode::DiscordNitro::estimated_size_bytes(
-                        cut_duration_ms,
-                        target_bytes,
-                    ) as f64 / (1024.0 * 1024.0);
-                    (
-                        EncodeMode::Encode(settings),
-                        Some(format!(
-                            "Discord → {} CBR (≈ {:.0} MB target).",
-                            nitro_codec.display(),
-                            est_mb,
-                        )),
-                    )
-                }
+                ExportMode::Discord => (
+                    EncodeMode::Encode(nitro_plan.settings.clone()),
+                    Some(format!(
+                        "Discord → {} CBR at {} (≈ {:.0} MB target).",
+                        nitro_plan.codec.display(),
+                        nitro_plan.resolution.label(),
+                        nitro_plan.est_mb(),
+                    )),
+                ),
                 ExportMode::Auto => {
                     if !has_modifications && aligned_copy_possible {
                         (EncodeMode::Copy, Some("Auto → stream copy (in mark keyframe-aligned).".into()))
@@ -1279,22 +1314,14 @@ impl ClipperApp {
                         clips: collect_track_clips(&project.clips, t.id),
                     })
                     .collect();
-                let video_text_overlay = project.text_overlays.get(&video_track).cloned();
+                let video_text_overlays = project.video_captions(video_track);
                 // MultiTrack always re-encodes (filter_complex requires
                 // decode). Auto/Custom/Discord all route through the
                 // filter graph; they just produce different
                 // EncodeSettings.
-                let nitro_target_bytes =
-                    encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
                 let settings = match self.export_mode {
                     ExportMode::Custom => self.custom_encode.to_encode_settings(src_w, src_h),
-                    ExportMode::Discord => encode::DiscordNitro::settings_for(
-                        cut_duration_ms,
-                        nitro_target_bytes,
-                        src_w,
-                        src_h,
-                        nitro_codec,
-                    ),
+                    ExportMode::Discord => nitro_plan.settings.clone(),
                     ExportMode::Auto => EncodeSettings::default_for_source(src_w, src_h),
                 };
                 let note = Some(match self.export_mode {
@@ -1303,17 +1330,13 @@ impl ClipperApp {
                         settings.video_codec.display(),
                         self.custom_encode.resolution.label(),
                     ),
-                    ExportMode::Discord => {
-                        let est_mb = encode::DiscordNitro::estimated_size_bytes(
-                            cut_duration_ms,
-                            nitro_target_bytes,
-                        ) as f64 / (1024.0 * 1024.0);
-                        format!(
-                            "Discord → {} CBR (≈ {:.0} MB target; multi-track filter graph).",
-                            settings.video_codec.display(),
-                            est_mb,
-                        )
-                    }
+                    ExportMode::Discord => format!(
+                        "Discord → {} CBR at {} (≈ {:.0} MB target; multi-track \
+                         filter graph).",
+                        nitro_plan.codec.display(),
+                        nitro_plan.resolution.label(),
+                        nitro_plan.est_mb(),
+                    ),
                     ExportMode::Auto => {
                         "Auto → re-encode (multi-track filter graph; preserves quality).".into()
                     }
@@ -1327,7 +1350,7 @@ impl ClipperApp {
                         src_height: project.media.height,
                         src_fps: project.media.fps,
                         video_clips,
-                        video_text_overlay,
+                        video_text_overlays,
                         audio_tracks,
                         encode: settings,
                     },
@@ -1793,16 +1816,19 @@ impl ClipperApp {
         // The intermediate block scopes the borrow so the writes later
         // (push_undo, track / clip mutation) don't conflict.
         struct Snapshot {
+            clip_id: ClipId,
             track_kind: Option<TrackKind>,
             track_name: String,
             cut_start: i64,
             cut_end: i64,
             src_start: i64,
             src_end: i64,
-            /// Which audio tracks this Edit affects. For an audio clip:
-            /// just its own track. For a linked video clip: every audio
-            /// partner track. For an unlinked video clip: none.
-            audio_track_ids: Vec<TrackId>,
+            /// Which audio CLIPS this Edit affects. Gain is per-clip so
+            /// one loud segment can be pulled down without touching the
+            /// rest of the track. For an audio clip: just itself. For a
+            /// linked video clip: every audio partner clip in that link
+            /// group. For an unlinked video clip: none.
+            audio_clip_ids: Vec<ClipId>,
             initial_gain: f32,
             /// Every clip whose speed should change together — the
             /// selected clip + every link partner. Speed must match
@@ -1812,7 +1838,7 @@ impl ClipperApp {
         }
         let snap: Option<Snapshot> = 'snap: {
             let Some(project) = self.project.as_ref() else { break 'snap None };
-            let Some(&clip_id) = project.selected_clips.iter().next() else {
+            let Some(&clip_id) = project.selected_clips.iter().min() else {
                 break 'snap None
             };
             let Some(clip) = track::clip_by_id(&project.clips, clip_id) else {
@@ -1821,31 +1847,30 @@ impl ClipperApp {
             let track = project.tracks.iter().find(|t| t.id == clip.track_id);
             let kind = track.map(|t| t.kind);
 
-            let audio_track_ids: Vec<TrackId> = match kind {
-                Some(TrackKind::Audio) => vec![clip.track_id],
+            let audio_clip_ids: Vec<ClipId> = match kind {
+                Some(TrackKind::Audio) => vec![clip_id],
                 Some(TrackKind::Video) => match clip.link {
-                    Some(link) => {
-                        let mut set: std::collections::BTreeSet<TrackId> =
-                            std::collections::BTreeSet::new();
-                        for c in &project.clips {
-                            if c.link != Some(link) { continue; }
-                            if project.tracks.iter().any(|t| {
+                    // Only the audio partners of THIS link group — i.e.
+                    // this segment's audio, not the whole track.
+                    Some(link) => project
+                        .clips
+                        .iter()
+                        .filter(|c| c.link == Some(link))
+                        .filter(|c| {
+                            project.tracks.iter().any(|t| {
                                 t.id == c.track_id && t.kind == TrackKind::Audio
-                            }) {
-                                set.insert(c.track_id);
-                            }
-                        }
-                        set.into_iter().collect()
-                    }
+                            })
+                        })
+                        .map(|c| c.id)
+                        .collect(),
                     None => Vec::new(),
                 },
                 None => Vec::new(),
             };
-            let initial_gain = audio_track_ids
-                .iter()
-                .filter_map(|tid| project.tracks.iter().find(|t| t.id == *tid))
-                .map(|t| t.gain)
-                .next()
+            let initial_gain = audio_clip_ids
+                .first()
+                .and_then(|cid| track::clip_by_id(&project.clips, *cid))
+                .map(|c| c.gain)
                 .unwrap_or(1.0);
             // Speed applies to clip + link partners (so V/A stay synced).
             let speed_target_clip_ids: Vec<ClipId> = match clip.link {
@@ -1856,13 +1881,14 @@ impl ClipperApp {
                 None => vec![clip_id],
             };
             Some(Snapshot {
+                clip_id,
                 track_kind: kind,
                 track_name: track.map(|t| t.name.clone()).unwrap_or_default(),
                 cut_start: clip.cut_start_ms,
                 cut_end: clip.cut_end_ms(),
                 src_start: clip.src_start_ms,
                 src_end: clip.src_end_ms,
-                audio_track_ids,
+                audio_clip_ids,
                 initial_gain,
                 speed_target_clip_ids,
                 initial_speed: clip.speed,
@@ -1904,31 +1930,45 @@ impl ClipperApp {
         ui.add_space(14.0);
 
         // ─────────── Audio gain ───────────
-        if !snap.audio_track_ids.is_empty() {
+        if !snap.audio_clip_ids.is_empty() {
             ui.label(RichText::new("Audio").size(13.5).strong()
                 .color(theme::TEXT_PRIMARY));
             ui.add_space(6.0);
-            let target_count = snap.audio_track_ids.len();
             let mut gain = snap.initial_gain;
             let resp = ui.add(
                 egui::Slider::new(&mut gain, 0.0..=2.0)
                     .step_by(0.01)
-                    .text(if target_count == 1 { "Gain" } else { "Gain (all linked)" }),
+                    .text("Gain"),
             );
             if resp.drag_started() {
                 self.push_undo();
             }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (preset, label) in
+                    [(0.0_f32, "Mute"), (0.5, "-6 dB"), (1.0, "1×"), (1.5, "+3.5 dB")]
+                {
+                    let active = (gain - preset).abs() < 0.005;
+                    if speed_preset_chip(ui, label, active).clicked() {
+                        self.push_undo();
+                        gain = preset;
+                    }
+                }
+            });
             if (gain - snap.initial_gain).abs() > 0.0001 {
                 if let Some(p) = self.project.as_mut() {
-                    for tid in &snap.audio_track_ids {
-                        if let Some(t) = p.tracks.iter_mut().find(|t| t.id == *tid) {
-                            t.gain = gain;
+                    for cid in &snap.audio_clip_ids {
+                        if let Some(c) = p.clips.iter_mut().find(|c| c.id == *cid) {
+                            c.gain = gain.clamp(0.0, 2.0);
                         }
                     }
                 }
             }
             ui.add_space(4.0);
-            ui.label(RichText::new("0 = silent · 1 = original · 2 = +6 dB. Live in preview + export.")
+            ui.label(RichText::new(
+                "0 = silent · 1 = original · 2 = +6 dB. This segment only — \
+                 split the clip to make one part quieter. Live in preview + export.")
                 .size(11.5).color(theme::TEXT_MUTED));
             ui.add_space(14.0);
             ui.separator();
@@ -1972,46 +2012,32 @@ impl ClipperApp {
         ui.label(RichText::new("Linked V+A move together. Live in preview + export.")
             .size(11.5).color(theme::TEXT_MUTED));
 
-        // ─────────── Text overlay (per-track, V tracks only) ───────────
+        // ─────────── Text overlay (per-segment, V tracks only) ───────────
         if snap.track_kind == Some(TrackKind::Video) {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(10.0);
             ui.label(RichText::new("Text overlay").color(theme::TEXT_MUTED).small());
 
-            // The overlay is keyed by the clip's TRACK so any clip on V1
-            // edits the V1-wide caption — no need to split first.
-            let track_id_for_text: Option<TrackId> = self
-                .project
-                .as_ref()
-                .and_then(|p| {
-                    let cid = *p.selected_clips.iter().next()?;
-                    track::clip_by_id(&p.clips, cid).map(|c| c.track_id)
-                });
-            let mut overlay_state: Option<TextOverlay> = track_id_for_text
-                .and_then(|tid| {
-                    self.project
-                        .as_ref()
-                        .and_then(|p| p.text_overlays.get(&tid).cloned())
-                });
+            // Caption settings belong only to the video segment being edited.
+            let clip_id_for_text = snap.clip_id;
+            let mut overlay_state = self.project.as_ref()
+                .and_then(|p| p.text_overlays.get(&clip_id_for_text).cloned());
             let mut enabled = overlay_state.is_some();
             let prev_enabled = enabled;
 
-            ui.checkbox(&mut enabled, "Burn caption into this track");
+            ui.checkbox(&mut enabled, "Burn caption into this segment");
             if enabled != prev_enabled {
                 self.push_undo();
-                if let (Some(tid), Some(p)) = (track_id_for_text, self.project.as_mut()) {
+                if let Some(p) = self.project.as_mut() {
                     if enabled {
-                        p.text_overlays.insert(tid, TextOverlay::default());
+                        p.text_overlays.insert(clip_id_for_text, TextOverlay::default());
                     } else {
-                        p.text_overlays.remove(&tid);
+                        p.text_overlays.remove(&clip_id_for_text);
                     }
                 }
-                overlay_state = track_id_for_text.and_then(|tid| {
-                    self.project
-                        .as_ref()
-                        .and_then(|p| p.text_overlays.get(&tid).cloned())
-                });
+                overlay_state = self.project.as_ref()
+                    .and_then(|p| p.text_overlays.get(&clip_id_for_text).cloned());
             }
 
             if let Some(mut overlay) = overlay_state {
@@ -2096,13 +2122,13 @@ impl ClipperApp {
                     overlay.shadow = shadow;
                 }
 
-                ui.label(RichText::new("Applies to the whole track. Drag the handle on the preview to reposition.")
+                ui.label(RichText::new("Applies to this segment only. Drag the handle on the preview to reposition.")
                     .small().color(theme::TEXT_MUTED.linear_multiply(0.7)));
 
                 // Write back if anything actually changed.
                 if overlay != original {
-                    if let (Some(tid), Some(p)) = (track_id_for_text, self.project.as_mut()) {
-                        p.text_overlays.insert(tid, overlay);
+                    if let Some(p) = self.project.as_mut() {
+                        p.text_overlays.insert(clip_id_for_text, overlay);
                     }
                 }
             }
@@ -2173,7 +2199,7 @@ impl ClipperApp {
         &mut self,
         ui: &mut egui::Ui,
         preview_rect: &egui::Rect,
-        track_id: TrackId,
+        clip_id: ClipId,
         overlay: &TextOverlay,
     ) {
         // font_size_px is in SOURCE pixels; scale by preview height / source
@@ -2265,7 +2291,7 @@ impl ClipperApp {
         );
         let resp = ui.interact(
             handle,
-            egui::Id::new(("text_handle", track_id)),
+            egui::Id::new(("text_handle", clip_id)),
             egui::Sense::click_and_drag(),
         );
         if resp.hovered() || resp.dragged() {
@@ -2287,7 +2313,7 @@ impl ClipperApp {
                 let dx = delta.x / preview_rect.width().max(1.0);
                 let dy = delta.y / preview_rect.height().max(1.0);
                 if let Some(p) = self.project.as_mut() {
-                    if let Some(o) = p.text_overlays.get_mut(&track_id) {
+                    if let Some(o) = p.text_overlays.get_mut(&clip_id) {
                         o.x = (o.x + dx).clamp(0.0, 1.0);
                         o.y = (o.y + dy).clamp(0.0, 1.0);
                     }
@@ -2384,20 +2410,12 @@ impl ClipperApp {
                 }
             });
 
-        // Draggable text-overlay handle. Only meaningful in Advanced
-        // mode when the V1 track has a non-empty caption; lets the user
-        // drag the caption around on the preview instead of fiddling
-        // with X/Y sliders.
-        if let Some(p) = self.project.as_ref() {
-            if p.mode == EditMode::MultiTrack {
-                if let Some(v) = p.first_video_track() {
-                    if let Some(overlay) = p.text_overlays.get(&v).cloned() {
-                        if !overlay.text.trim().is_empty() {
-                            self.show_text_overlay_handle(ui, &preview_rect, v, &overlay);
-                        }
-                    }
-                }
-            }
+        // Draw only the caption on the video segment under the playhead.
+        let active_caption = self.project.as_ref()
+            .and_then(Project::active_caption)
+            .map(|(id, overlay)| (id, overlay.clone()));
+        if let Some((clip_id, overlay)) = active_caption {
+            self.show_text_overlay_handle(ui, &preview_rect, clip_id, &overlay);
         }
 
         // Preview-local controls row directly under the preview frame:
@@ -3255,38 +3273,76 @@ impl ClipperApp {
         );
         ui.add_space(14.0);
 
+        // ── Codec row: Auto, or pin a family ──
+        // Auto is right almost always, but "almost" is why this row
+        // exists: someone posting to a server full of phone clients may
+        // want H.264 regardless of what the size math prefers, and
+        // someone who knows their audience may want AV1 anyway.
+        let av1_available = encode::DiscordNitro::best_av1(
+            self.detected_gpu,
+            &self.available_codecs,
+        )
+        .is_some();
+        ui.label(
+            RichText::new("Codec")
+                .size(13.0)
+                .strong()
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for choice in encode::CodecChoice::ALL {
+                let active = self.discord_codec_choice == *choice;
+                let selectable = *choice != encode::CodecChoice::Av1 || av1_available;
+                let resp = ui
+                    .add_enabled_ui(selectable, |ui| {
+                        speed_preset_chip(ui, choice.label(), active)
+                    })
+                    .inner;
+                if resp.clicked() {
+                    self.discord_codec_choice = *choice;
+                }
+                let tip = if selectable {
+                    choice.hint()
+                } else {
+                    "No usable AV1 encoder on this machine"
+                };
+                resp.on_hover_text(tip);
+            }
+        });
+        ui.add_space(14.0);
+
         // ── Live stats reflecting the slider value ──
+        // Same NitroPlan::compute the export uses, so the panel can't
+        // promise a codec or resolution the encode won't deliver.
         let target_bytes =
             encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
-        let total_kbps_raw =
-            encode::DiscordNitro::total_kbps_for(duration_ms, target_bytes);
-        let video_kbps =
-            encode::DiscordNitro::video_kbps_for(duration_ms, target_bytes);
-        let audio_kbps =
-            encode::DiscordNitro::audio_kbps_for(duration_ms, target_bytes);
+        let plan = encode::NitroPlan::compute(
+            duration_ms,
+            target_bytes,
+            project.media.width,
+            project.media.height,
+            project.media.fps,
+            self.discord_codec_choice,
+            self.detected_gpu,
+            &self.available_codecs,
+        );
+        let video_kbps = plan.video_kbps;
+        let audio_kbps = plan.audio_kbps;
         // True when the MAX_BITRATE_KBPS global ceiling is doing more
         // work than the slider. Short clips can't usefully consume the
         // full target; we surface that so the user understands why a
         // 15-second clip at the 475 MB slider position still lands
         // smaller than expected — the cap, not the slider, is the
         // binding constraint.
-        let cap_dominates =
-            total_kbps_raw >= encode::DiscordNitro::MAX_BITRATE_KBPS;
-        let resolution = encode::DiscordNitro::resolution_for_bitrate(video_kbps);
-        let dims = resolution
-            .dimensions(project.media.width, project.media.height)
-            .unwrap_or((project.media.width, project.media.height));
-        let est_mb_raw = encode::DiscordNitro::estimated_size_bytes(
-            duration_ms,
-            target_bytes,
-        ) as f64
-            / (1024.0 * 1024.0);
+        let cap_dominates = plan.cap_dominates;
+        let resolution = plan.resolution;
+        let dims = plan.dims;
         // Round to the nearest 5 MB. The 0.948 fudge in the estimate is
         // accurate to ~±5%, so "≈ 57 MB" implies more precision than we
         // actually have — "≈ 55 MB" reads as a ballpark, which it is.
-        let est_mb_rounded = ((est_mb_raw / 5.0).round() * 5.0).max(5.0) as i64;
-        let recommended_codec =
-            encode::recommend_codec(self.detected_gpu, &self.available_hw_codecs);
+        let est_mb_rounded = ((plan.est_mb() / 5.0).round() * 5.0).max(5.0) as i64;
 
         let rows: [(&str, String); 5] = [
             (
@@ -3310,7 +3366,7 @@ impl ClipperApp {
                 "Resolution",
                 format!("{} ({}×{})", resolution.label(), dims.0, dims.1),
             ),
-            ("Codec", recommended_codec.display().to_string()),
+            ("Codec", plan.codec.display().to_string()),
             ("Approx. output size", format!("≈ {est_mb_rounded} MB  ±10%")),
         ];
 
@@ -3358,6 +3414,18 @@ impl ClipperApp {
             theme::TEXT_MUTED
         };
         ui.label(RichText::new(note).size(12.5).color(note_color));
+        ui.add_space(6.0);
+        // Why this codec — the AV1 switch changes encode time and
+        // playback compatibility, so it shouldn't happen silently.
+        ui.label(
+            RichText::new(plan.codec_note())
+                .size(12.5)
+                .color(if plan.codec.is_av1() {
+                    theme::ACCENT.linear_multiply(0.85)
+                } else {
+                    theme::TEXT_MUTED
+                }),
+        );
     }
 
     /// The body of the Custom export panel. Headline controls:
@@ -3429,7 +3497,7 @@ impl ClipperApp {
         // Recommendation banner — surfaces what the GPU probe came up
         // with so the user doesn't have to know which codec maps to
         // their hardware.
-        let recommended = encode::recommend_codec(self.detected_gpu, &self.available_hw_codecs);
+        let recommended = encode::recommend_codec(self.detected_gpu, &self.available_codecs);
         let banner = match self.detected_gpu {
             Some(g) if recommended != VideoCodec::X264 => format!(
                 "Detected {} GPU → {} recommended for fastest encode.",
@@ -3461,7 +3529,7 @@ impl ClipperApp {
             ui.label(RichText::new("Codec").color(theme::TEXT_MUTED).small());
             let mut all_codecs: Vec<VideoCodec> =
                 vec![VideoCodec::X264, VideoCodec::X265];
-            all_codecs.extend(self.available_hw_codecs.iter().copied());
+            all_codecs.extend(self.available_codecs.iter().copied());
             let current = self.custom_encode.video_codec;
             let selected_text = if current == recommended {
                 format!("{}  ★", current.display())
@@ -3576,7 +3644,13 @@ impl ClipperApp {
                         "ultrafast", "superfast", "veryfast", "faster", "fast",
                         "medium", "slow", "slower", "veryslow",
                     ],
-                    VideoCodec::NvencH264 | VideoCodec::NvencHevc => {
+                    // SVT-AV1 numbers its presets: 0 slowest, 13 fastest.
+                    // Below 4 the encode is slower than most people will
+                    // sit through, so the list starts at 4.
+                    VideoCodec::SvtAv1 => &[
+                        "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
+                    ],
+                    VideoCodec::NvencH264 | VideoCodec::NvencHevc | VideoCodec::NvencAv1 => {
                         &["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
                     }
                     VideoCodec::QsvH264 | VideoCodec::QsvHevc => {
@@ -3585,7 +3659,14 @@ impl ClipperApp {
                     VideoCodec::AmfH264 | VideoCodec::AmfHevc => {
                         &["speed", "balanced", "quality"]
                     }
-                    VideoCodec::VaapiH264 | VideoCodec::VaapiHevc => &[""],
+                    // VAAPI has no preset knob at all; av1_qsv / av1_amf
+                    // take a bare number with no named aliases, so both
+                    // stay on the encoder's own default.
+                    VideoCodec::VaapiH264
+                    | VideoCodec::VaapiHevc
+                    | VideoCodec::VaapiAv1
+                    | VideoCodec::QsvAv1
+                    | VideoCodec::AmfAv1 => &[""],
                 };
                 egui::ComboBox::from_id_salt("custom_preset")
                     .selected_text(if self.custom_encode.video_preset.is_empty() {
@@ -3605,10 +3686,14 @@ impl ClipperApp {
                     });
                 if matches!(
                     self.custom_encode.video_codec,
-                    VideoCodec::VaapiH264 | VideoCodec::VaapiHevc
+                    VideoCodec::VaapiH264
+                        | VideoCodec::VaapiHevc
+                        | VideoCodec::VaapiAv1
+                        | VideoCodec::QsvAv1
+                        | VideoCodec::AmfAv1
                 ) {
                     ui.label(
-                        RichText::new("(VAAPI has no preset knob)")
+                        RichText::new("(no preset knob on this encoder)")
                             .small()
                             .color(theme::TEXT_MUTED.linear_multiply(0.7)),
                     );
@@ -3643,12 +3728,14 @@ impl ClipperApp {
             });
         }
 
-        if self.available_hw_codecs.is_empty() {
+        if self.available_codecs.is_empty() {
             ui.add_space(6.0);
             ui.label(
-                RichText::new("No hardware encoders detected in your ffmpeg build.")
-                    .small()
-                    .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+                RichText::new(
+                    "No hardware encoders or AV1 support detected in your ffmpeg build.",
+                )
+                .small()
+                .color(theme::TEXT_MUTED.linear_multiply(0.7)),
             );
         }
     }
@@ -4002,17 +4089,29 @@ fn build_audio_chain(p: &Project) -> Option<String> {
                 .any(|t| t.id == c.track_id && t.kind == TrackKind::Audio)
     });
     let stream_exists = |idx: &usize| *idx < p.media.audio_stream_count;
+    // Effective gain = track gain × the gain of the clip currently under
+    // the playhead on that track. Gain is a per-clip property, and mpv's
+    // volume filter is a single scalar, so the preview follows whichever
+    // segment is playing — the same edge-triggered trick `sync_clip_speed`
+    // uses. The chain string changes when the playhead crosses into a
+    // clip with a different gain, and `sync_audio_mix` pushes it then.
+    let effective_gain = |t: &Track| -> f32 {
+        let clip_gain = track::clip_on_track_at(&p.clips, t.id, p.playhead_ms)
+            .map(|c| c.gain)
+            .unwrap_or(1.0);
+        (t.gain * clip_gain).max(0.0)
+    };
     let unmuted: Vec<(usize, f32)> = if any_audio_detached {
         p.tracks
             .iter()
             .filter(|t| t.kind == TrackKind::Audio && !t.muted)
-            .filter_map(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, t.gain.max(0.0))))
+            .filter_map(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, effective_gain(t))))
             .collect()
     } else {
         p.tracks
             .iter()
             .find(|t| t.kind == TrackKind::Audio && !t.muted)
-            .and_then(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, t.gain.max(0.0))))
+            .and_then(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, effective_gain(t))))
             .into_iter()
             .collect()
     };
@@ -4097,12 +4196,17 @@ fn find_snap_target(
     best.map(|(t, _)| t)
 }
 
+/// Shared ordering for exported ranges and their segment captions.
+fn sorted_track_clips(clips: &[Clip], track_id: TrackId) -> Vec<&Clip> {
+    let mut out: Vec<&Clip> = clips.iter().filter(|c| c.track_id == track_id).collect();
+    out.sort_by_key(|c| c.cut_start_ms);
+    out
+}
+
 /// Pull every clip on `track_id` in cut-start order and project it into
 /// the export-layer's `ClipRange` shape.
 fn collect_track_clips(clips: &[Clip], track_id: TrackId) -> Vec<ClipRange> {
-    let mut out: Vec<&Clip> = clips.iter().filter(|c| c.track_id == track_id).collect();
-    out.sort_by_key(|c| c.cut_start_ms);
-    out.into_iter()
+    sorted_track_clips(clips, track_id).into_iter()
         .map(|c| ClipRange {
             cut_start_ms: c.cut_start_ms,
             src_start_ms: c.src_start_ms,
@@ -4489,3 +4593,65 @@ fn stat_grid_row(ui: &mut egui::Ui, k1: &str, v1: &str, k2: &str, v2: &str) {
     ui.end_row();
 }
 
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    fn project() -> Project {
+        let mut p = Project {
+            source: PathBuf::from("test.mp4"), proxy: None,
+            media: MediaInfo {
+                duration_ms: 6_000, width: 320, height: 180, fps: 30.0,
+                video_codec: "h264".into(), audio_codec: None, audio_stream_count: 0,
+            },
+            playhead_ms: 0, in_ms: None, out_ms: None, simple_audio_muted: false,
+            tracks: Vec::new(), clips: Vec::new(), selected_clips: HashSet::new(),
+            text_overlays: HashMap::new(), id_gen: IdGen::default(), mode: EditMode::MultiTrack,
+        };
+        p.ensure_tracks_initialized();
+        p
+    }
+
+    #[test]
+    fn split_captions_edit_independently_and_undo_restores_them() {
+        let mut p = project();
+        let left = p.clips[0].id;
+        p.text_overlays.insert(left, TextOverlay { text: "Before".into(), ..Default::default() });
+        let before = UndoSnapshot::capture(&p);
+        let right = p.split_segments(&[left], 2_000)[0];
+        assert_eq!(p.text_overlays[&right].text, "Before");
+        p.text_overlays.get_mut(&right).unwrap().text = "After".into();
+        assert_eq!(p.text_overlays[&left].text, "Before");
+        p.playhead_ms = 1_999;
+        assert_eq!(p.active_caption().unwrap().1.text, "Before");
+        p.playhead_ms = 2_000;
+        assert_eq!(p.active_caption().unwrap().1.text, "After");
+        let after = UndoSnapshot::capture(&p);
+        before.apply(&mut p);
+        assert!(!p.text_overlays.contains_key(&right));
+        assert_eq!(p.clips[0].src_end_ms, 6_000);
+        after.apply(&mut p);
+        assert_eq!(p.active_caption().unwrap().1.text, "After");
+    }
+
+    #[test]
+    fn captions_follow_moved_segments_and_disappear_in_gaps() {
+        let mut p = project();
+        let left = p.clips[0].id;
+        let right = p.split_segments(&[left], 2_000)[0];
+        p.text_overlays.insert(left, TextOverlay { text: "First".into(), ..Default::default() });
+        p.text_overlays.insert(right, TextOverlay { text: "Second".into(), ..Default::default() });
+        p.clips.iter_mut().find(|c| c.id == left).unwrap().cut_start_ms = 7_000;
+        p.clips.iter_mut().find(|c| c.id == right).unwrap().cut_start_ms = 0;
+        let captions = p.video_captions(p.first_video_track().unwrap());
+        assert_eq!(captions[0].as_ref().unwrap().text, "Second");
+        assert_eq!(captions[1].as_ref().unwrap().text, "First");
+        p.playhead_ms = 5_000;
+        assert!(p.active_caption().is_none());
+        p.playhead_ms = 7_000;
+        assert_eq!(p.active_caption().unwrap().1.text, "First");
+        p.text_overlays.remove(&left);
+        assert!(p.active_caption().is_none());
+    }
+}

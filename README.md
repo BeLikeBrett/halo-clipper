@@ -7,7 +7,7 @@ A fast, native Linux video editor with a focus on getting clips out the door —
 Two modes for two workflows:
 
 - **Simple Clip** — drop a video in, mark In/Out, export. The fastest way to grab a 20-second highlight.
-- **Advanced** — multi-track NLE: split, delete, drag clips, per-track audio gain, per-clip speed, burned-in text overlays. Still simpler than Resolve, way faster than Premiere.
+- **Advanced** — multi-track NLE: split, delete, drag clips, per-clip audio gain, per-clip speed, burned-in text overlays. Still simpler than Resolve, way faster than Premiere.
 
 ## What it does
 
@@ -20,12 +20,12 @@ Two modes for two workflows:
   - **Split** at the playhead, **Delete** selected clips (with linked-partner cascade), **Detach Audio** to expose all source audio lanes
   - Drag clips horizontally with magnetic snap to clip boundaries
   - Timeline gaps are first-class: they play (and export) as black + silence
-  - Per-track audio gain (0 → 2.0, slider lives in the right-hand Edit panel)
+  - **Per-clip** audio gain (0 → 2.0, slider + preset chips in the right-hand Edit panel) — split a clip and one segment can be quiet while the rest stays loud. Applies to the selected clip and its linked V/A partner, never the whole track.
   - Per-clip speed 0.25× → 4.0× with live mpv preview (chained `atempo` so audio stays in sync)
-  - Per-track text overlays — font, color, size, **outline, drop shadow, opacity**; drag the caption around on the live preview; burned in via `drawtext` at export, with pixel sizes scaled to the output resolution so the export matches the preview
+  - Per-segment text overlays — font, color, size, **outline, drop shadow, opacity**; drag the caption around on the live preview; burned in only during that segment via `drawtext` at export (splits copy the caption to independently editable halves), with pixel sizes scaled to the output resolution so the export matches the preview
   - Linked-by-default V+A: edits propagate together until you press **D** to detach
   - Full undo/redo (Ctrl+Z / Ctrl+Shift+Z) on every mutation
-  - Click any clip → the Edit side panel appears with gain / speed / caption controls; click empty lane (or the ✕) to dismiss
+  - Click any clip → the Edit side panel appears with gain / speed / caption controls, all scoped to that clip; click empty lane (or the ✕) to dismiss
 
 ### Playback
 
@@ -40,10 +40,23 @@ Two modes for two workflows:
 | Mode | Behavior |
 |---|---|
 | **Auto** | Stream-copies in Simple Clip mode if the In mark is keyframe-aligned; otherwise re-encodes at libx264 CRF 18 to preserve source quality. Always re-encodes in Advanced mode (the filter graph requires decoded frames). |
-| **Discord** | Size-targeted CBR encode. Tier chips for Discord's upload caps — **Free (10 MB), Nitro Basic (50 MB), Nitro (500 MB)** — plus a 10 → 475 MB slider for anything in between. The encoder auto-picks resolution + bitrate from the clip's duration, and steps the audio bitrate down on tight budgets so a long clip still fits the free tier. |
-| **Custom** | Resolution preset (Source / 480p / 720p / 1080p / 1440p / 4K), frame-rate cap (Source / 24 / 30 / 60), codec (any HW encoder ffmpeg advertised + libx264 / libx265), and **rate control**: constant quality (CRF / QP / CQ / ICQ — whichever the codec calls it, with a codec-appropriate slider range) or target bitrate with a live size estimate. "Advanced" reveals the per-codec encoder preset, audio codec (AAC / Opus), and audio bitrate. |
+| **Discord** | Size-targeted CBR encode. Tier chips for Discord's upload caps — **Free (20 MB), Nitro Basic (50 MB), Nitro (500 MB)** — plus a 10 → 475 MB slider for anything in between. The encoder auto-picks codec, resolution, and bitrate from the clip's duration, and steps the audio bitrate down on tight budgets so a long clip still fits the free tier. See **Codec auto-selection** below. |
+| **Custom** | Resolution preset (Source / 480p / 720p / 1080p / 1440p / 4K), frame-rate cap (Source / 24 / 30 / 60), codec (any HW encoder ffmpeg advertised, plus libx264 / libx265 / SVT-AV1), and **rate control**: constant quality (CRF / QP / CQ / ICQ — whichever the codec calls it, with a codec-appropriate slider range) or target bitrate with a live size estimate. "Advanced" reveals the per-codec encoder preset, audio codec (AAC / Opus), and audio bitrate. |
 
-The active GPU is auto-detected from `/sys/class/drm` and the recommended codec is starred in the codec dropdown. Hardware encoder detection runs `ffmpeg -encoders` once at startup and only offers what's actually available. Opus in an `.mp4` container automatically gets the `-strict -2` flag ffmpeg still requires.
+The active GPU is auto-detected from `/sys/class/drm` and the recommended codec is starred in the codec dropdown. Encoder detection runs `ffmpeg -encoders` once at startup and only offers what's actually available. Hardware **AV1** encoders get a second check — a 2-frame test encode — because ffmpeg advertises `av1_vaapi` / `av1_nvenc` on machines whose silicon has no AV1 encode block, and a phantom entry would only fail once an export was already running. Opus in an `.mp4` container automatically gets the `-strict -2` flag ffmpeg still requires.
+
+#### Codec auto-selection (Discord mode)
+
+Discord plays AV1 in MP4, and AV1 needs roughly 40% less bitrate than H.264 for the same picture — which is exactly what a hard size cap is short of. Halo Clipper switches to it only when it actually helps:
+
+1. Work out the video bitrate the target size allows, and the resolution H.264 would be forced down to.
+2. Compute **bits per pixel per frame** at that resolution. Below **0.10 bpp** H.264 starts smearing detail — and a 60 fps clip crosses that line at twice the bitrate a 30 fps one does, since the same bits are split over twice as many frames.
+3. Under the threshold, switch to the best available AV1 encoder (GPU-matched first — VAAPI on AMD, NVENC on NVIDIA, QSV on Intel — then any hardware AV1, then software SVT-AV1). The extra efficiency is spent on resolution: the same 20 MB that only carried 720p on H.264 carries 1080p on AV1.
+4. Over the threshold, stay on H.264 — it embeds in every Discord client and encodes several times faster, and the efficiency would buy nothing.
+
+Software SVT-AV1 scales its preset by clip length (6 for ≤1 min, up to 12 past 15 min) so a long VOD doesn't turn into a coffee break. The stats panel names the chosen codec and says what the choice bought.
+
+**Override:** the panel's codec row is **Auto / H.264 / AV1**. Auto runs the decision above; the other two pin the family and let bitrate and resolution follow from it. Forcing H.264 when Auto wanted AV1 tells you what it costs ("Auto would have held 1080p instead of 720p"), and the AV1 button is disabled outright on machines with no usable AV1 encoder.
 
 ### Performance
 
@@ -147,7 +160,7 @@ Module-by-module map of `src/`:
 | `media.rs` | ffprobe JSON → `MediaInfo` (duration, dims, fps, codec, audio stream count) |
 | `proxy.rs` | Scrub-proxy generation (Standard / All-intra profiles), cache-keyed by `(path, size, mtime)`, clear_cache + cache_size_bytes for settings UI |
 | `settings.rs` | Persistent prefs loaded/saved at `~/.config/halo-clipper/config.json` (atomic write via .tmp + rename; auto-migrates from the old brett-clipper path) |
-| `encode.rs` | `EncodeSettings`, `VideoCodec` (with per-codec quality name/range/flags), `ResolutionPreset`, `EncodeQuality`, `DiscordNitro` tier math, GPU vendor detection, HW encoder probe, `HwDecode` strategy + `is_vaapi_decodable` gate |
+| `encode.rs` | `EncodeSettings`, `VideoCodec` (with per-codec quality name/range/flags + `bitrate_efficiency`), `ResolutionPreset`, `EncodeQuality`, `DiscordNitro` tier math + AV1 codec picker, `NitroPlan` (one plan shared by the stats panel and the export), GPU vendor detection, encoder probe + AV1 capability verification, `HwDecode` strategy + `is_vaapi_decodable` gate |
 | `export.rs` | Async export pipeline — `ExportPlan::{Simple, MultiTrack}`, ffmpeg subprocess with `-progress pipe:1` parsing, VAAPI device binding, black-gap synthesis, state-machine `build_video_post_chain`, `build_drawtext` with output-resolution scaling |
 | `gl_loader.rs` | OpenGL function loader for libmpv's render context |
 | `video_fbo.rs` | Helper FBO that mpv renders into; we then blit-copy into the egui rect |
@@ -165,9 +178,9 @@ Module-by-module map of `src/`:
 
 The multi-track graph is built from the cut timeline:
 
-- **Video**: gaps between clips (and before the first / after the last, up to the shared timeline end) are synthesized as black `color=` segments — hwuploaded when the surrounding frames are VAAPI surfaces — then everything concats in cut order. Per-clip speed is applied per segment via `setpts`.
+- **Video**: gaps between clips (and before the first / after the last, up to the shared timeline end) are synthesized as black `color=` segments — hwuploaded when the surrounding frames are VAAPI surfaces — then everything concats in cut order. Per-clip speed is applied per segment via `setpts`. Each segment is scaled and its own caption is burned before concat, so captions never extend into another segment or a black gap.
 - **Audio**: per-track `atrim` + `atempo`/`volume` chains with `anullsrc` silence in the gaps, padded to the same timeline end, then `amix` across unmuted tracks. Video and audio always come out the same length.
-- **Post-chain**: `build_video_post_chain(hw_decode, resolution, drawtext_expr, encoder_wants_gpu)` tracks a single `on_gpu` bool through scale → drawtext → encoder handoff, inserting `hwdownload`/`hwupload` bridges exactly where needed. Adding a new filter step means extending this one helper.
+- **Segment post-chain**: `build_video_post_chain(hw_decode, resolution, drawtext_expr, encoder_wants_gpu)` tracks a single `on_gpu` bool through scale → drawtext → encoder handoff, inserting `hwdownload`/`hwupload` bridges exactly where needed. Adding a new filter step means extending this one helper.
 
 ## Build from source
 
@@ -195,7 +208,7 @@ strip = true
 69 tests as of v0.5:
 
 - **`track::tests`** — clip splitting, link-group propagation, delete cascades, detach edge cases. Guards the data model against regressions.
-- **`encode::tests`** — codec args for every rate-control mode (CRF / QP / CQ / ICQ / CBR with maxrate), fps caps, resolution math, Discord tier/budget math including the adaptive audio step-down, GPU vendor recommendation logic.
+- **`encode::tests`** — codec args for every rate-control mode (CRF / QP / CQ / ICQ / CBR with maxrate, and the libsvtav1 exception that rejects `-maxrate`), fps caps, resolution math, Discord tier/budget math including the adaptive audio step-down, the AV1-vs-H.264 decision at both frame rates, and GPU vendor recommendation logic.
 - **`export::tests`** — exhaustive permutations of the filter-chain state machine (`HwDecode × scale × drawtext × encoder placement`), input-seek rebasing, output-timeline math (gaps + speed), drawtext scaling/opacity, Opus container gating — plus **five end-to-end exports through real ffmpeg**: gap black/sync, speed sync, silent sources, Opus-in-MP4, and the full VAAPI GPU graph.
 
 ## Settings & cache

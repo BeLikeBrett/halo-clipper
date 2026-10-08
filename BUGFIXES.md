@@ -5,6 +5,52 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-08-27 — Edit panel: audio gain applied to the whole track, not the clip
+
+### Symptom
+
+Pull the Gain slider down on one loud segment and *every* segment on
+that audio track got quieter — in the preview and in the export. There
+was no way to duck a single moment (say, a spot where your voice spikes)
+without ducking the entire clip. Speed, sitting right below it in the
+same panel, was correctly per-clip, which made the gain behavior read as
+a bug rather than a design choice. It was.
+
+### Root cause
+
+`Clip` already carried a per-clip `gain` field, `export.rs` already
+emitted `volume=` per clip inside the concat, and `split_clip` already
+copied gain to both halves. The Edit panel was the only piece that never
+got the message: its snapshot collected `audio_track_ids` and the slider
+wrote `Track::gain`, so `Clip::gain` was dead weight everywhere except
+the export filter graph, which faithfully applied a value nothing could
+change. The preview mix (`build_audio_chain`) read track gain too.
+
+### Fix
+
+`src/app.rs`:
+
+1. The Edit panel snapshot now collects `audio_clip_ids` — the selected
+   clip itself for an audio clip, or the audio partners in that clip's
+   link group for a video clip — and the slider writes `Clip::gain` on
+   each. Track gain is left alone (still applied after the concat, still
+   available for a future mixer).
+2. `build_audio_chain` multiplies each track's gain by the gain of the
+   clip currently under the playhead, so the preview follows the segment
+   being played. mpv's volume filter is a single scalar, so this is the
+   same edge-triggered trick `sync_clip_speed` already used for speed —
+   the chain string changes at a clip boundary and `sync_audio_mix`
+   pushes it.
+3. Added Mute / −6 dB / 1× / +3.5 dB preset chips next to the slider,
+   matching the speed row.
+
+### Note
+
+Gain is per *clip*, so ducking part of a take still starts with a split
+(**S**) — the panel now says so.
+
+---
+
 ## 2026-07-16 — Advanced export: A/V desync after any timeline gap
 
 ### Symptom

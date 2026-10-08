@@ -1,6 +1,6 @@
 [package]
 name = "halo_clipper"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Halo Clipper — fast, native Linux video clipper"
 license = "MIT"
