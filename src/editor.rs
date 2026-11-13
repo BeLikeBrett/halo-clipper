@@ -7,6 +7,41 @@ enum EditorDrag {
     Track(TrackId),
 }
 impl ClipperApp {
+    pub(super) fn show_quick_properties(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &self.project else { return };
+        let Some(c) = p
+            .selected_clips
+            .iter()
+            .min()
+            .and_then(|id| track::clip_by_id(&p.clips, *id))
+            .copied()
+        else {
+            return;
+        };
+        if !p
+            .tracks
+            .iter()
+            .any(|t| t.id == c.track_id && t.kind == TrackKind::Video)
+        {
+            return;
+        }
+        let mut opacity = c.transform.opacity;
+        let response = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
+        if response.drag_started() || (response.changed() && !response.dragged()) {
+            self.push_undo();
+        }
+        if response.changed() {
+            if let Some(c) = self
+                .project
+                .as_mut()
+                .and_then(|p| p.clips.iter_mut().find(|clip| clip.id == c.id))
+            {
+                c.transform.opacity = opacity;
+            }
+        }
+        ui.add_space(8.0);
+    }
+
     pub(super) fn show_media_bin(&mut self, ui: &mut egui::Ui) {
         let advanced = self
             .project

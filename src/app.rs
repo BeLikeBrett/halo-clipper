@@ -1902,6 +1902,8 @@ impl ClipperApp {
         ui.separator();
         ui.add_space(10.0);
 
+        self.show_quick_properties(ui);
+
         // Snapshot all data we need before touching `self.project` mutably.
         // The intermediate block scopes the borrow so the writes later
         // (push_undo, track / clip mutation) don't conflict.
