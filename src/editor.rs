@@ -18,12 +18,47 @@ impl ClipperApp {
         else {
             return;
         };
-        if !p
-            .tracks
-            .iter()
-            .any(|t| t.id == c.track_id && t.kind == TrackKind::Video)
-        {
+        let action = if p.can_attach_ids(&p.selected_clips) {
+            Some(("Attach Audio", ClipAction::AttachSelected))
+        } else if p.can_detach_ids(&p.selected_clips) {
+            Some(("Detach Audio", ClipAction::DetachSelected))
+        } else {
+            None
+        };
+        if let Some((label, action)) = action {
+            if ui.button(label).on_hover_text("Collapse or expose audio without changing its edits. D detaches; Shift+D attaches.").clicked() { self.apply_clip_action(action); }
+            ui.add_space(8.0);
+        }
+        if !self.project.as_ref().is_some_and(|p| p.is_video(c.id)) {
             return;
+        }
+        let mut transform = c.transform;
+        let previous = transform;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut transform.fit, crate::framing::Fit::Fit, "Fit")
+                .on_hover_text("Show the whole video");
+            ui.selectable_value(&mut transform.fit, crate::framing::Fit::Fill, "Fill")
+                .on_hover_text("Fill the canvas, cropping the edges");
+            if ui.small_button("Reset").clicked() {
+                transform = Default::default();
+            }
+        });
+        let zoom = ui.add(
+            egui::Slider::new(&mut transform.scale, 0.03..=8.0)
+                .logarithmic(true)
+                .text("Zoom"),
+        );
+        if transform != previous {
+            if zoom.drag_started() || !zoom.dragged() {
+                self.push_undo();
+            }
+            if let Some(clip) = self
+                .project
+                .as_mut()
+                .and_then(|p| p.clips.iter_mut().find(|clip| clip.id == c.id))
+            {
+                clip.transform = transform;
+            }
         }
         let mut opacity = c.transform.opacity;
         let response = ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
@@ -107,27 +142,38 @@ impl ClipperApp {
                         },
                     );
                     let icon = egui::Rect::from_min_size(
-                        rect.min + egui::vec2(9.0, 12.0),
-                        egui::vec2(30.0, 36.0),
+                        rect.min + egui::vec2(6.0, 10.0),
+                        egui::vec2(64.0, 40.0),
                     );
-                    ui.painter().rect_filled(
-                        icon,
-                        3.0,
-                        if video {
-                            Color32::from_rgb(46, 62, 79)
+                    ui.painter().rect_filled(icon, 2.0, theme::BG_PREVIEW);
+                    if video {
+                        if let Some(image) = self.thumbnails.get(ui.ctx(), &asset.source.path) {
+                            ui.painter().image(
+                                image.id(),
+                                icon,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
                         } else {
-                            Color32::from_rgb(40, 66, 57)
-                        },
-                    );
-                    ui.painter().text(
-                        icon.center(),
-                        Align2::CENTER_CENTER,
-                        if video { "V" } else { "A" },
-                        egui::FontId::monospace(13.0),
-                        theme::TEXT_MUTED,
-                    );
+                            ui.painter().text(
+                                icon.center(),
+                                Align2::CENTER_CENTER,
+                                "…",
+                                egui::FontId::proportional(14.0),
+                                theme::TEXT_MUTED,
+                            );
+                        }
+                    } else {
+                        ui.painter().text(
+                            icon.center(),
+                            Align2::CENTER_CENTER,
+                            "♫",
+                            egui::FontId::proportional(20.0),
+                            theme::TEXT_MUTED,
+                        );
+                    }
                     let textrect = egui::Rect::from_min_max(
-                        rect.min + egui::vec2(48.0, 9.0),
+                        rect.min + egui::vec2(78.0, 9.0),
                         rect.max - egui::vec2(23.0, 8.0),
                     );
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(textrect));
@@ -291,12 +337,21 @@ impl ClipperApp {
         let Some(p) = self.project.as_ref() else {
             return;
         };
-        let tracks = p.tracks.clone();
-        let clips = p.clips.clone();
-        let selected = p.selected_clips.clone();
+        let (tracks, clips, compound_labels) = p.timeline_view();
+        let selected: HashSet<_> = p
+            .selected_clips
+            .iter()
+            .flat_map(|id| p.edit_ids(*id))
+            .collect();
+        let real_indices: HashMap<_, _> = p
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id, i))
+            .collect();
         let duration = p.canvas_length_ms().max(1000);
         let playhead = p.playhead_ms;
-        let labels: HashMap<_, _> = clips
+        let mut labels: HashMap<_, _> = clips
             .iter()
             .map(|c| {
                 (
@@ -310,6 +365,7 @@ impl ClipperApp {
                 )
             })
             .collect();
+        labels.extend(compound_labels);
         let payload = egui::DragAndDrop::payload::<EditorDrag>(ui.ctx());
         let asset_durations: HashMap<_, _> = p
             .assets
@@ -508,17 +564,39 @@ impl ClipperApp {
                         });
                         response.context_menu(|ui| {
                             if ui.button("Split at playhead  ·  S").clicked() {
-                                select = Some(c.id);
+                                if !selected.contains(&c.id) {
+                                    select = Some(c.id);
+                                }
                                 context_action = Some(ClipAction::Split);
                                 ui.close_menu();
                             }
-                            if ui.button("Detach audio  ·  D").clicked() {
-                                select = Some(c.id);
+                            let context_selection = if selected.contains(&c.id) {
+                                p.selected_clips.clone()
+                            } else {
+                                [c.id].into_iter().collect()
+                            };
+                            if p.can_detach_ids(&context_selection)
+                                && ui.button("Detach audio  ·  D").clicked()
+                            {
+                                if !selected.contains(&c.id) {
+                                    select = Some(c.id);
+                                }
                                 context_action = Some(ClipAction::DetachSelected);
                                 ui.close_menu();
                             }
+                            if p.can_attach_ids(&context_selection)
+                                && ui.button("Attach audio  ·  Shift+D").clicked()
+                            {
+                                if !selected.contains(&c.id) {
+                                    select = Some(c.id);
+                                }
+                                context_action = Some(ClipAction::AttachSelected);
+                                ui.close_menu();
+                            }
                             if ui.button("Delete  ·  Del").clicked() {
-                                select = Some(c.id);
+                                if !selected.contains(&c.id) {
+                                    select = Some(c.id);
+                                }
                                 context_action = Some(ClipAction::DeleteSelected);
                                 ui.close_menu();
                             }
@@ -557,11 +635,17 @@ impl ClipperApp {
                         let row =
                             ((pos.y - (rect.top() + ruler)) / lane_h).floor().max(0.0) as usize;
                         let within = (pos.y - (rect.top() + ruler)).rem_euclid(lane_h);
-                        let index = if within > lane_h * 0.5 { row + 1 } else { row };
+                        let visual_index = if within > lane_h * 0.5 { row + 1 } else { row };
+                        let index = tracks
+                            .get(visual_index)
+                            .and_then(|t| real_indices.get(&t.id))
+                            .copied()
+                            .unwrap_or(self.project.as_ref().unwrap().tracks.len());
                         match payload.as_ref() {
                             EditorDrag::Track(_) => {
-                                let y =
-                                    rect.top() + ruler + index.min(tracks.len()) as f32 * lane_h;
+                                let y = rect.top()
+                                    + ruler
+                                    + visual_index.min(tracks.len()) as f32 * lane_h;
                                 painter.line_segment(
                                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                                     Stroke::new(2.0_f32, theme::ACCENT),
@@ -590,6 +674,18 @@ impl ClipperApp {
                                     }
                                     _ => unreachable!(),
                                 };
+                                let videos =
+                                    tracks.iter().filter(|t| t.kind == TrackKind::Video).count();
+                                let insertion = if kind == TrackKind::Video {
+                                    visual_index.min(videos)
+                                } else {
+                                    visual_index.max(videos)
+                                };
+                                let index = tracks
+                                    .get(insertion)
+                                    .and_then(|t| real_indices.get(&t.id))
+                                    .copied()
+                                    .unwrap_or(self.project.as_ref().unwrap().tracks.len());
                                 let mut start = (time_at(pos.x) - grab).max(0);
                                 if !ui.input(|i| i.modifiers.shift) {
                                     let threshold = (12.0 / width * duration as f32).ceil() as i64;
@@ -611,7 +707,9 @@ impl ClipperApp {
                                     }
                                 }
                                 let near_edge = within < 7.0 || within > lane_h - 7.0;
-                                let target = if near_edge {
+                                let target = if near_edge
+                                    || matches!(payload.as_ref(), EditorDrag::Asset(_))
+                                {
                                     None
                                 } else {
                                     tracks.get(row).filter(|t| t.kind == kind).map(|t| t.id)
@@ -627,15 +725,21 @@ impl ClipperApp {
                                 let y = if target.is_some() {
                                     rect.top() + ruler + row as f32 * lane_h + 4.0
                                 } else {
-                                    rect.top() + ruler + index.min(tracks.len()) as f32 * lane_h
+                                    rect.top() + ruler + insertion.min(tracks.len()) as f32 * lane_h
                                 };
                                 let ghost = egui::Rect::from_min_size(
                                     egui::pos2(x_of(start), y),
                                     egui::vec2(
                                         (length as f32 / duration as f32 * width).max(10.0),
-                                        if target.is_some() { lane_h - 8.0 } else { 5.0 },
+                                        lane_h - 8.0,
                                     ),
                                 );
+                                if target.is_none() {
+                                    painter.line_segment(
+                                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                                        Stroke::new(2.0_f32, theme::ACCENT),
+                                    );
+                                }
                                 painter.rect_filled(
                                     ghost,
                                     2.0,
@@ -665,15 +769,21 @@ impl ClipperApp {
             }
         }
         if let Some(id) = select {
+            ui.ctx().request_repaint();
             if let Some(p) = &mut self.project {
                 let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
                 if !additive {
                     p.selected_clips.clear();
                 }
-                p.selected_clips.insert(id);
+                if additive && p.selected_clips.contains(&id) {
+                    p.selected_clips.remove(&id);
+                } else {
+                    p.selected_clips.insert(id);
+                }
             }
         }
         if let Some(ms) = seek {
+            ui.ctx().request_repaint();
             if let Some(p) = &mut self.project {
                 p.playhead_ms = ms;
             }
@@ -704,10 +814,12 @@ impl ClipperApp {
                     EditorDrag::Track(id) => p.reorder_track(id, index),
                 }
             }
+            ui.ctx().request_repaint();
             egui::DragAndDrop::clear_payload(ui.ctx());
             self.live.pause();
         }
         if let Some(action) = context_action {
+            ui.ctx().request_repaint();
             self.apply_clip_action(action);
             if let Some(p) = &mut self.project {
                 p.prune_tracks();

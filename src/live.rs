@@ -221,7 +221,7 @@ impl LivePreview {
             }
         }
     }
-    pub fn paint(&self, ui: &egui::Ui, canvas: egui::Rect) {
+    pub fn paint(&self, ui: &egui::Ui, canvas: egui::Rect, background: crate::framing::Background) {
         let layers = self.frames.clone();
         let gpu = self.gpu.clone();
         let retired = self.retired.clone();
@@ -233,7 +233,7 @@ impl LivePreview {
                         fbo.destroy(painter.gl());
                     }
                 }
-                paint_layers(&layers, &gpu, canvas, info, painter);
+                paint_layers(&layers, &gpu, canvas, background, info, painter);
             })),
         });
     }
@@ -251,6 +251,7 @@ impl LivePreview {
         if let Some(gpu) = self.gpu.lock().unwrap().take() {
             unsafe {
                 gl.delete_program(gpu.program);
+                gl.delete_program(gpu.blur_program);
                 gl.delete_vertex_array(gpu.vao);
             }
         }
@@ -259,35 +260,94 @@ impl LivePreview {
 }
 struct CompositeGpu {
     program: glow::NativeProgram,
+    blur_program: glow::NativeProgram,
     vao: glow::NativeVertexArray,
 }
+const VERTEX: &str = r#"#version 330 core
+out vec2 uv;
+void main() {
+    vec2 p=vec2((gl_VertexID==1||gl_VertexID==3)?1.0:-1.0,gl_VertexID>=2?1.0:-1.0);
+    uv=(p+1.0)*0.5;
+    gl_Position=vec4(p,0,1);
+}"#;
+const FOREGROUND: &str = r#"#version 330 core
+in vec2 uv; out vec4 color;
+uniform sampler2D video;
+uniform float opacity;
+void main() { color=vec4(texture(video,uv).rgb,opacity); }
+"#;
+const BLUR: &str = r#"#version 330 core
+in vec2 uv; out vec4 color;
+uniform sampler2D video;
+uniform vec2 blur_step;
+void main() {
+    vec3 rgb=vec3(0); float total=0;
+    for(int x=-4;x<=4;x++) {
+        for(int y=-4;y<=4;y++) {
+            float weight=exp(-0.125*float(x*x+y*y));
+            rgb+=texture(video,clamp(uv+vec2(x,y)*blur_step*0.5,vec2(0.001),vec2(0.999))).rgb*weight;
+            total+=weight;
+        }
+    }
+    color=vec4(rgb/total,1);
+}"#;
 impl CompositeGpu {
     unsafe fn new(gl: &glow::Context) -> anyhow::Result<Self> {
+        let program = Self::program(gl, FOREGROUND)?;
+        let blur_program = match Self::program(gl, BLUR) {
+            Ok(p) => p,
+            Err(e) => {
+                gl.delete_program(program);
+                return Err(e);
+            }
+        };
+        let vao = gl.create_vertex_array().map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            program,
+            blur_program,
+            vao,
+        })
+    }
+    unsafe fn program(gl: &glow::Context, fragment: &str) -> anyhow::Result<glow::NativeProgram> {
         let program = gl.create_program().map_err(anyhow::Error::msg)?;
         let mut shaders = Vec::new();
-        for (kind,source) in [(glow::VERTEX_SHADER,"#version 330 core\nout vec2 uv;void main(){vec2 p=vec2((gl_VertexID==1||gl_VertexID==3)?1.0:-1.0,gl_VertexID>=2?1.0:-1.0);uv=(p+1.0)*0.5;gl_Position=vec4(p,0,1);}"),(glow::FRAGMENT_SHADER,"#version 330 core\nin vec2 uv;out vec4 color;uniform sampler2D video;uniform float opacity;void main(){vec4 c=texture(video,uv);color=vec4(c.rgb,opacity);}")]{
-            let shader=gl.create_shader(kind).map_err(anyhow::Error::msg)?;gl.shader_source(shader,source);gl.compile_shader(shader);
-            if !gl.get_shader_compile_status(shader){let e=gl.get_shader_info_log(shader);gl.delete_shader(shader);gl.delete_program(program);anyhow::bail!("{e}");}
-            gl.attach_shader(program,shader);shaders.push(shader);
+        for (kind, source) in [
+            (glow::VERTEX_SHADER, VERTEX),
+            (glow::FRAGMENT_SHADER, fragment),
+        ] {
+            let shader = gl.create_shader(kind).map_err(anyhow::Error::msg)?;
+            gl.shader_source(shader, source);
+            gl.compile_shader(shader);
+            if !gl.get_shader_compile_status(shader) {
+                let error = gl.get_shader_info_log(shader);
+                gl.delete_shader(shader);
+                for compiled in shaders {
+                    gl.delete_shader(compiled);
+                }
+                gl.delete_program(program);
+                anyhow::bail!("{error}");
+            }
+            gl.attach_shader(program, shader);
+            shaders.push(shader);
         }
         gl.link_program(program);
         for shader in shaders {
             gl.detach_shader(program, shader);
             gl.delete_shader(shader);
         }
-        anyhow::ensure!(
-            gl.get_program_link_status(program),
-            "{}",
-            gl.get_program_info_log(program)
-        );
-        let vao = gl.create_vertex_array().map_err(anyhow::Error::msg)?;
-        Ok(Self { program, vao })
+        if !gl.get_program_link_status(program) {
+            let error = gl.get_program_info_log(program);
+            gl.delete_program(program);
+            anyhow::bail!("{error}");
+        }
+        Ok(program)
     }
 }
 unsafe fn paint_layers(
     layers: &[FrameLayer],
     gpu: &Mutex<Option<CompositeGpu>>,
     canvas: egui::Rect,
+    background: crate::framing::Background,
     info: egui::PaintCallbackInfo,
     painter: &egui_glow::Painter,
 ) {
@@ -330,8 +390,28 @@ unsafe fn paint_layers(
     }
     let gpu = gpu.as_ref().unwrap();
     let pixels = vp.width_px as f32 / canvas.width();
-    for layer in layers {
-        let rect = super::canvas::layer_rect(canvas, layer.width, layer.height, layer.transform);
+    let background_layer = layers
+        .iter()
+        .find(|l| l.transform.opacity > 0.0)
+        .map(|l| l.id);
+    // Render the blurred canvas first; foreground passes retain all transforms.
+    let passes = layers
+        .iter()
+        .filter(|l| {
+            background == crate::framing::Background::Blur && Some(l.id) == background_layer
+        })
+        .map(|l| (l, true))
+        .chain(layers.iter().map(|l| (l, false)));
+    for (layer, blur) in passes {
+        let transform = if blur {
+            track::Transform {
+                fit: crate::framing::Fit::Fill,
+                ..Default::default()
+            }
+        } else {
+            layer.transform
+        };
+        let rect = super::canvas::layer_rect(canvas, layer.width, layer.height, transform);
         if !rect.intersects(canvas) {
             continue;
         }
@@ -362,15 +442,26 @@ unsafe fn paint_layers(
             (rect.width() * pixels).round().max(1.0) as i32,
             (rect.height() * pixels).round().max(1.0) as i32,
         );
-        gl.use_program(Some(gpu.program));
+        let program = if blur { gpu.blur_program } else { gpu.program };
+        gl.use_program(Some(program));
         gl.bind_vertex_array(Some(gpu.vao));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_sampler(0, None);
         gl.bind_texture(glow::TEXTURE_2D, Some(fbo.texture()));
-        gl.uniform_1_i32(gl.get_uniform_location(gpu.program, "video").as_ref(), 0);
+        gl.uniform_1_i32(gl.get_uniform_location(program, "video").as_ref(), 0);
         gl.uniform_1_f32(
-            gl.get_uniform_location(gpu.program, "opacity").as_ref(),
-            layer.transform.opacity,
+            gl.get_uniform_location(program, "opacity").as_ref(),
+            transform.opacity,
+        );
+        let sigma = if blur {
+            canvas.width().min(canvas.height()) / 50.0
+        } else {
+            0.0
+        };
+        gl.uniform_2_f32(
+            gl.get_uniform_location(program, "blur_step").as_ref(),
+            sigma / rect.width(),
+            sigma / rect.height(),
         );
         gl.enable(glow::BLEND);
         gl.blend_func_separate(

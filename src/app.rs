@@ -11,12 +11,16 @@
 mod canvas;
 #[path = "editor.rs"]
 mod editor;
+#[path = "grouping.rs"]
+mod grouping;
 #[path = "layers.rs"]
 mod layers;
 #[path = "live.rs"]
 mod live;
 #[path = "support.rs"]
 mod support;
+#[path = "thumbnails.rs"]
+mod thumbnails;
 
 use crate::encode::{
     self, AudioCodec, EncodeQuality, EncodeSettings, GpuVendor, ResolutionPreset, VideoCodec,
@@ -67,7 +71,8 @@ struct Project {
     simple_audio_muted: bool,
     // MultiTrack state
     assets: Vec<MediaAsset>,
-    canvas_override: Option<(u32, u32)>,
+    canvas: crate::framing::CanvasSettings,
+    groups: HashMap<LinkId, grouping::MediaGroup>,
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
@@ -196,6 +201,7 @@ impl Project {
                     gain: c.gain * t.gain,
                     transform: c.transform,
                     caption: self.text_overlays.get(&c.id).cloned(),
+                    source_width: info.width,
                     source_height: info.height,
                 });
             }
@@ -205,6 +211,7 @@ impl Project {
             height: self.canvas_media().height,
             fps: self.canvas_media().fps,
             duration_ms: self.content_end_ms(),
+            background: self.canvas.background,
             segments,
         }
     }
@@ -215,7 +222,9 @@ impl Project {
             .iter()
             .filter_map(|id| self.text_overlays.get(id).cloned().map(|o| (*id, o)))
             .collect();
+        let before = self.clips.clone();
         let new_ids = track::split_clips(&mut self.clips, target_ids, cut_ms, &self.id_gen);
+        self.remember_split_groups(&before, &new_ids, target_ids, cut_ms);
         for (left_id, overlay) in captions_to_copy {
             // split_clip inserts the right half immediately after its
             // original. Failed/boundary splits copy nothing.
@@ -290,7 +299,8 @@ struct UndoSnapshot {
     out_ms: Option<i64>,
     simple_audio_muted: bool,
     assets: Vec<MediaAsset>,
-    canvas_override: Option<(u32, u32)>,
+    canvas: crate::framing::CanvasSettings,
+    groups: HashMap<LinkId, grouping::MediaGroup>,
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
@@ -307,7 +317,8 @@ impl UndoSnapshot {
             out_ms: p.out_ms,
             simple_audio_muted: p.simple_audio_muted,
             assets: p.assets.clone(),
-            canvas_override: p.canvas_override,
+            canvas: p.canvas,
+            groups: p.groups.clone(),
             tracks: p.tracks.clone(),
             clips: p.clips.clone(),
             selected_clips: p.selected_clips.clone(),
@@ -323,7 +334,8 @@ impl UndoSnapshot {
         p.out_ms = self.out_ms;
         p.simple_audio_muted = self.simple_audio_muted;
         p.assets = self.assets;
-        p.canvas_override = self.canvas_override;
+        p.canvas = self.canvas;
+        p.groups = self.groups;
         p.tracks = self.tracks;
         p.clips = self.clips;
         p.selected_clips = self.selected_clips;
@@ -447,6 +459,7 @@ enum ClipAction {
     DeleteSelected,
     /// Multi-track "Detach": break the link on the selected clip's group.
     DetachSelected,
+    AttachSelected,
 }
 
 #[derive(Default)]
@@ -462,7 +475,7 @@ pub struct ClipperApp {
     updater: crate::updater::Updater,
     support_open: bool,
     live: live::LivePreview,
-    inspector_open: bool,
+    thumbnails: thumbnails::Thumbnails,
     canvas_drag: Option<canvas::CanvasDrag>,
     status: String,
     export_mode: ExportMode,
@@ -573,7 +586,7 @@ impl ClipperApp {
             updater,
             support_open: false,
             live: live::LivePreview::default(),
-            inspector_open: false,
+            thumbnails: thumbnails::Thumbnails::default(),
             canvas_drag: None,
             status: "Open a video to begin.".into(),
             export_mode: ExportMode::Auto,
@@ -884,7 +897,8 @@ impl ClipperApp {
                     out_ms: None,
                     simple_audio_muted: false,
                     assets: Vec::new(),
-                    canvas_override: None,
+                    canvas: Default::default(),
+                    groups: HashMap::new(),
                     tracks: Vec::new(),
                     clips: Vec::new(),
                     selected_clips: HashSet::new(),
@@ -990,15 +1004,7 @@ impl ClipperApp {
 
         // Apply the delta uniformly to the link group — clamped against
         // every member's individual bounds so the group keeps alignment.
-        let group: Vec<ClipId> = match primary_link {
-            Some(l) => p
-                .clips
-                .iter()
-                .filter(|c| c.link == Some(l))
-                .map(|c| c.id)
-                .collect(),
-            None => vec![id],
-        };
+        let group: Vec<ClipId> = p.edit_ids(id).into_iter().collect();
         let mut allowed = group_delta;
         for cid in &group {
             let Some(c) = track::clip_by_id(&p.clips, *cid) else {
@@ -1061,33 +1067,16 @@ impl ClipperApp {
                         .map(|c| c.id)
                         .collect()
                 } else {
-                    let mut linked: HashSet<LinkId> = HashSet::new();
-                    let mut unlinked: HashSet<ClipId> = HashSet::new();
-                    for id in &p.selected_clips {
-                        let Some(c) = track::clip_by_id(&p.clips, *id) else {
-                            continue;
-                        };
-                        match c.link {
-                            Some(l) => {
-                                linked.insert(l);
-                            }
-                            None => {
-                                unlinked.insert(c.id);
-                            }
-                        }
-                    }
-                    p.clips
+                    p.selected_clips
                         .iter()
-                        .filter(|c| c.contains_cut(p.playhead_ms))
-                        .filter(|c| match c.link {
-                            Some(l) => linked.contains(&l),
-                            None => unlinked.contains(&c.id),
-                        })
-                        .map(|c| c.id)
+                        .flat_map(|id| p.edit_ids(*id))
+                        .collect::<HashSet<_>>()
+                        .into_iter()
                         .collect()
                 };
+                let groups_before = p.groups.len();
                 let new_ids = p.split_segments(&target_ids, p.playhead_ms);
-                if new_ids.is_empty() {
+                if new_ids.is_empty() && p.groups.len() == groups_before {
                     self.undo_stack.pop();
                 }
             }
@@ -1112,9 +1101,8 @@ impl ClipperApp {
                 // project. That made the very first Delete a no-op in the
                 // default (everything-linked) state, since every clip
                 // shares a single LinkId. Trust Ctrl+Z instead.
-                for id in targets {
-                    track::delete_with_links(&mut p.clips, id);
-                }
+                let ids: HashSet<_> = targets.into_iter().flat_map(|id| p.edit_ids(id)).collect();
+                p.clips.retain(|c| !ids.contains(&c.id));
                 p.text_overlays
                     .retain(|id, _| p.clips.iter().any(|c| c.id == *id));
                 p.selected_clips.clear();
@@ -1123,18 +1111,12 @@ impl ClipperApp {
                 // visible hole rather than collapsing the timeline.
             }
             ClipAction::DetachSelected => {
-                let targets: Vec<ClipId> = p.selected_clips.iter().copied().collect();
-                if targets.is_empty() {
+                if !p.detach_selection() {
                     self.undo_stack.pop();
-                    return;
                 }
-                let mut any = false;
-                for id in targets {
-                    if track::detach_links(&mut p.clips, id) {
-                        any = true;
-                    }
-                }
-                if !any {
+            }
+            ClipAction::AttachSelected => {
+                if !p.attach_selection() {
                     self.undo_stack.pop();
                 }
             }
@@ -1495,8 +1477,16 @@ impl ClipperApp {
                     }
                     // D = Detach (only meaningful when a clip is selected
                     // and its link group has more than one member).
-                    if i.key_pressed(egui::Key::D) && i.modifiers.is_none() {
-                        deferred_action = Some(ClipAction::DetachSelected);
+                    if i.key_pressed(egui::Key::D)
+                        && !i.modifiers.ctrl
+                        && !i.modifiers.command
+                        && !i.modifiers.alt
+                    {
+                        deferred_action = Some(if i.modifiers.shift {
+                            ClipAction::AttachSelected
+                        } else {
+                            ClipAction::DetachSelected
+                        });
                     }
                 }
             }
@@ -1515,6 +1505,7 @@ impl ClipperApp {
         });
 
         if let Some(action) = deferred_action {
+            ctx.request_repaint();
             self.apply_clip_action(action);
         }
         actions
@@ -1531,7 +1522,15 @@ impl eframe::App for ClipperApp {
                 .collect::<Vec<_>>()
         });
         for path in dropped {
-            self.open_path(path);
+            if self
+                .project
+                .as_ref()
+                .is_some_and(|p| p.mode == EditMode::MultiTrack)
+            {
+                self.add_layer_path(path);
+            } else {
+                self.open_path(path);
+            }
         }
         self.updater.poll();
         if self.proxy_handle.is_some()
@@ -1753,7 +1752,6 @@ impl eframe::App for ClipperApp {
             .project
             .as_ref()
             .is_some_and(|p| p.mode == EditMode::MultiTrack && !p.selected_clips.is_empty())
-            && self.inspector_open
         {
             egui::SidePanel::right("edit_panel")
                 .resizable(true)
@@ -1901,7 +1899,7 @@ impl ClipperApp {
         });
         ui.add_space(8.0);
         ui.separator();
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         self.show_quick_properties(ui);
 
@@ -1942,42 +1940,24 @@ impl ClipperApp {
             let track = project.tracks.iter().find(|t| t.id == clip.track_id);
             let kind = track.map(|t| t.kind);
 
-            let audio_clip_ids: Vec<ClipId> = match kind {
-                Some(TrackKind::Audio) => vec![clip_id],
-                Some(TrackKind::Video) => match clip.link {
-                    // Only the audio partners of THIS link group — i.e.
-                    // this segment's audio, not the whole track.
-                    Some(link) => project
-                        .clips
-                        .iter()
-                        .filter(|c| c.link == Some(link))
-                        .filter(|c| {
-                            project
-                                .tracks
-                                .iter()
-                                .any(|t| t.id == c.track_id && t.kind == TrackKind::Audio)
-                        })
-                        .map(|c| c.id)
-                        .collect(),
-                    None => Vec::new(),
-                },
-                None => Vec::new(),
+            let mut audio_clip_ids: Vec<ClipId> = if kind == Some(TrackKind::Audio) {
+                vec![clip_id]
+            } else {
+                project
+                    .edit_ids(clip_id)
+                    .into_iter()
+                    .filter(|id| !project.is_video(*id))
+                    .collect()
             };
+            audio_clip_ids.sort_unstable();
             let initial_gain = audio_clip_ids
                 .first()
                 .and_then(|cid| track::clip_by_id(&project.clips, *cid))
                 .map(|c| c.gain)
                 .unwrap_or(1.0);
             // Speed applies to clip + link partners (so V/A stay synced).
-            let speed_target_clip_ids: Vec<ClipId> = match clip.link {
-                Some(link) => project
-                    .clips
-                    .iter()
-                    .filter(|c| c.link == Some(link))
-                    .map(|c| c.id)
-                    .collect(),
-                None => vec![clip_id],
-            };
+            let speed_target_clip_ids: Vec<ClipId> =
+                project.edit_ids(clip_id).into_iter().collect();
             Some(Snapshot {
                 clip_id,
                 track_kind: kind,
@@ -2000,46 +1980,44 @@ impl ClipperApp {
             return;
         };
 
-        // Info block — what this Edit panel is editing.
-        ui.label(
-            RichText::new(format!(
-                "{} clip on {}",
-                match snap.track_kind {
-                    Some(TrackKind::Video) => "Video",
-                    Some(TrackKind::Audio) => "Audio",
-                    None => "Unknown",
-                },
-                snap.track_name,
-            ))
-            .size(14.0)
-            .color(theme::TEXT_PRIMARY)
-            .strong(),
-        );
+        ui.collapsing("Clip details", |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} clip on {}",
+                    match snap.track_kind {
+                        Some(TrackKind::Video) => "Video",
+                        Some(TrackKind::Audio) => "Audio",
+                        None => "Unknown",
+                    },
+                    snap.track_name,
+                ))
+                .size(14.0)
+                .color(theme::TEXT_PRIMARY)
+                .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "Position  {} → {}",
+                    media::format_timestamp(snap.cut_start),
+                    media::format_timestamp(snap.cut_end),
+                ))
+                .size(12.0)
+                .color(theme::TEXT_MUTED)
+                .monospace(),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Source    {} → {}",
+                    media::format_timestamp(snap.src_start),
+                    media::format_timestamp(snap.src_end),
+                ))
+                .size(12.0)
+                .color(theme::TEXT_MUTED)
+                .monospace(),
+            );
+        });
         ui.add_space(6.0);
-        ui.label(
-            RichText::new(format!(
-                "Position  {} → {}",
-                media::format_timestamp(snap.cut_start),
-                media::format_timestamp(snap.cut_end),
-            ))
-            .size(12.0)
-            .color(theme::TEXT_MUTED)
-            .monospace(),
-        );
-        ui.label(
-            RichText::new(format!(
-                "Source    {} → {}",
-                media::format_timestamp(snap.src_start),
-                media::format_timestamp(snap.src_end),
-            ))
-            .size(12.0)
-            .color(theme::TEXT_MUTED)
-            .monospace(),
-        );
-
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(14.0);
 
         // ─────────── Audio gain ───────────
         if !snap.audio_clip_ids.is_empty() {
@@ -2056,7 +2034,7 @@ impl ClipperApp {
                     .step_by(0.01)
                     .text("Gain"),
             );
-            if resp.drag_started() {
+            if resp.drag_started() || (resp.changed() && !resp.dragged()) {
                 self.push_undo();
             }
             ui.add_space(6.0);
@@ -2084,18 +2062,9 @@ impl ClipperApp {
                     }
                 }
             }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "0 = silent · 1 = original · 2 = +6 dB. This segment only — \
-                 split the clip to make one part quieter. Live in preview + export.",
-                )
-                .size(11.5)
-                .color(theme::TEXT_MUTED),
-            );
-            ui.add_space(14.0);
+            ui.add_space(6.0);
             ui.separator();
-            ui.add_space(14.0);
+            ui.add_space(6.0);
         }
 
         // ─────────── Speed ───────────
@@ -2116,7 +2085,7 @@ impl ClipperApp {
                     "×"
                 }),
         );
-        if speed_resp.drag_started() {
+        if speed_resp.drag_started() || (speed_resp.changed() && !speed_resp.dragged()) {
             self.push_undo();
         }
         ui.add_space(6.0);
@@ -2139,18 +2108,12 @@ impl ClipperApp {
                 }
             }
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Linked V+A move together. Live in preview + export.")
-                .size(11.5)
-                .color(theme::TEXT_MUTED),
-        );
 
         // ─────────── Text overlay (per-segment, V tracks only) ───────────
         if snap.track_kind == Some(TrackKind::Video) {
-            ui.add_space(10.0);
+            ui.add_space(6.0);
             ui.separator();
-            ui.add_space(10.0);
+            ui.add_space(6.0);
             ui.label(
                 RichText::new("Text overlay")
                     .color(theme::TEXT_MUTED)
@@ -2273,8 +2236,11 @@ impl ClipperApp {
                     overlay.shadow = shadow;
                 }
 
-                ui.label(RichText::new("Applies to this segment only. Use Horiz / Vert to position; layered previews rebuild after edits.")
-                    .small().color(theme::TEXT_MUTED.linear_multiply(0.7)));
+                ui.label(
+                    RichText::new("Applies to this video segment in preview and export.")
+                        .small()
+                        .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+                );
 
                 // Write back if anything actually changed.
                 if overlay != original {
@@ -4833,7 +4799,8 @@ mod caption_tests {
             out_ms: None,
             simple_audio_muted: false,
             assets: Vec::new(),
-            canvas_override: None,
+            canvas: Default::default(),
+            groups: HashMap::new(),
             tracks: Vec::new(),
             clips: Vec::new(),
             selected_clips: HashSet::new(),

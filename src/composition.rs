@@ -22,6 +22,7 @@ pub struct Segment {
     pub gain: f32,
     pub transform: Transform,
     pub caption: Option<TextOverlay>,
+    pub source_width: u32,
     pub source_height: u32,
 }
 #[derive(Clone, Debug)]
@@ -30,6 +31,7 @@ pub struct Composition {
     pub height: u32,
     pub fps: f64,
     pub duration_ms: i64,
+    pub background: crate::framing::Background,
     /// Video in bottom-to-top paint order, then audio in any order.
     pub segments: Vec<Segment>,
 }
@@ -89,9 +91,34 @@ impl Composition {
             .arg(&s.source);
         }
         let mut graph =
-            format!("color=c=black:s={w}x{h}:r={fps:.6}:d={duration:.6},format=yuv420p[base];");
+            format!("color=c=0x{:02x}{:02x}{:02x}:s={w}x{h}:r={fps:.6}:d={duration:.6},format=yuv420p[base];", self.background.rgb()[0], self.background.rgb()[1], self.background.rgb()[2]);
         let mut current = "base".to_string();
         let mut audio = Vec::new();
+        if self.background == crate::framing::Background::Blur {
+            for (i, s) in segments
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.audio_index.is_none())
+            {
+                let speed = s.speed.clamp(0.25, 4.0);
+                let start = s.start_ms as f64 / 1000.0;
+                graph.push_str(&format!("[{i}:v:0]split=2[src{i}][back{i}];[back{i}]setpts=(PTS-STARTPTS)/{speed:.6},scale={w}:{h}:force_original_aspect_ratio=increase:force_divisible_by=2,crop={w}:{h},setsar=1,fps={fps:.6},gblur=sigma={:.3},setpts=PTS+{start:.6}/TB[bg{i}];", w.min(h) as f32 / 50.0));
+            }
+            // Paint backgrounds front-to-back so the lowest active video wins,
+            // including when the bottom lane has a gap.
+            for (i, s) in segments
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, s)| s.audio_index.is_none())
+            {
+                let start = s.start_ms as f64 / 1000.0;
+                let end = s.end_ms as f64 / 1000.0;
+                graph.push_str(&format!("[{current}][bg{i}]overlay=eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})*{}'[canvas{i}];", if s.transform.opacity > 0.0 {1} else {0}));
+                current = format!("canvas{i}");
+            }
+        }
+
         for (i, s) in segments.iter().enumerate() {
             let start = s.start_ms as f64 / 1000.0;
             let end = s.end_ms as f64 / 1000.0;
@@ -103,13 +130,29 @@ impl Composition {
                 let t = s.transform;
                 let sw = ((w as f32 * t.scale.clamp(0.03, 8.0)) as u32 / 2 * 2).max(2);
                 let sh = ((h as f32 * t.scale.clamp(0.03, 8.0)) as u32 / 2 * 2).max(2);
-                graph.push_str(&format!("[{i}:v:0]setpts=(PTS-STARTPTS)/{speed:.6},scale=w={sw}:h={sh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1,fps={fps:.6},format=rgba"));
+                let input = if self.background == crate::framing::Background::Blur {
+                    format!("[src{i}]")
+                } else {
+                    format!("[{i}:v:0]")
+                };
+                let fit = if t.fit == crate::framing::Fit::Fill {
+                    "increase"
+                } else {
+                    "decrease"
+                };
+                graph.push_str(&format!("{input}setpts=(PTS-STARTPTS)/{speed:.6},scale=w={sw}:h={sh}:force_original_aspect_ratio={fit}:force_divisible_by=2,setsar=1,fps={fps:.6},format=rgba"));
                 if let Some(c) = &s.caption {
                     if !c.text.trim().is_empty() {
                         graph.push(',');
                         graph.push_str(&super::export::build_drawtext(
                             c,
-                            sh as f64 / s.source_height.max(1) as f64,
+                            if t.fit == crate::framing::Fit::Fill {
+                                (sw as f64 / s.source_width.max(1) as f64)
+                                    .max(sh as f64 / s.source_height.max(1) as f64)
+                            } else {
+                                (sw as f64 / s.source_width.max(1) as f64)
+                                    .min(sh as f64 / s.source_height.max(1) as f64)
+                            },
                         ));
                     }
                 }
@@ -209,6 +252,7 @@ mod tests {
             gain: 1.0,
             transform: Transform::default(),
             caption: None,
+            source_width: 64,
             source_height: 64,
         }
     }
@@ -245,7 +289,8 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let index = (y * 64 + x) * 3;
+        let width = crate::media::probe(path).unwrap().width as usize;
+        let index = (y * width + x) * 3;
         out.stdout[index..index + 3].try_into().unwrap()
     }
     #[test]
@@ -262,6 +307,7 @@ mod tests {
             height: 64,
             fps: 30.0,
             duration_ms: 3000,
+            background: Default::default(),
             segments: vec![base, top],
         };
         let path = render(c.clone(), d.join("out.mp4"));
@@ -278,6 +324,82 @@ mod tests {
         let path = render(reversed, d.join("reverse.mp4"));
         let center = pixel(&path, "1.5", 32, 32);
         assert!(center[0] > 200 && center[2] < 30, "{center:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+    #[test]
+    fn portrait_fit_fill_zoom_and_backgrounds_are_exported_and_gaps_stay_empty() {
+        let d = dir();
+        let source = d.join("split-colors.mp4");
+        let result = crate::platform::command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:s=128x64:r=30:d=1,drawbox=x=64:y=0:w=64:h=64:color=blue:t=fill",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let c = Composition {
+            width: 64,
+            height: 128,
+            fps: 30.0,
+            duration_ms: 2000,
+            background: Default::default(),
+            segments: vec![segment(source, 0, 1000)],
+        };
+        let fit = render(c.clone(), d.join("fit.mp4"));
+        assert!(pixel(&fit, "0.5", 5, 5).iter().all(|v| *v < 20));
+        assert!(pixel(&fit, "0.5", 5, 64)[0] > 200);
+        let mut colored = c.clone();
+        colored.background = crate::framing::Background::Color([0, 180, 0]);
+        let path = render(colored, d.join("color.mp4"));
+        assert!(pixel(&path, "0.5", 5, 5)[1] > 140);
+        let mut blurred = c.clone();
+        blurred.background = crate::framing::Background::Blur;
+        let path = render(blurred, d.join("blur.mp4"));
+        let seam = pixel(&path, "0.5", 31, 5);
+        assert!(seam[0] > 25 && seam[2] > 25, "{seam:?}");
+        assert!(pixel(&path, "1.5", 5, 5).iter().all(|v| *v < 20));
+        let mut filled = c.clone();
+        filled.segments[0].transform.fit = crate::framing::Fit::Fill;
+        let path = render(filled, d.join("fill.mp4"));
+        assert!(pixel(&path, "0.5", 5, 5)[0] > 200);
+        let mut zoomed = c;
+        zoomed.segments[0].transform.scale = 4.0;
+        let path = render(zoomed, d.join("zoom.mp4"));
+        assert!(pixel(&path, "0.5", 5, 5)[0] > 200);
+        let info = crate::media::probe(&path).unwrap();
+        assert_eq!((info.width, info.height), (64, 128));
+        let _ = std::fs::remove_dir_all(d);
+    }
+    #[test]
+    fn blur_uses_lowest_active_video_and_falls_back_through_gaps() {
+        let d = dir();
+        let red = video(&d, "red.mp4", "red");
+        let blue = video(&d, "blue.mp4", "blue");
+        let base = segment(red, 0, 1000);
+        let top = segment(blue, 0, 2000);
+        let c = Composition {
+            width: 64,
+            height: 128,
+            fps: 30.0,
+            duration_ms: 3000,
+            background: crate::framing::Background::Blur,
+            segments: vec![base, top],
+        };
+        let path = render(c, d.join("fallback.mp4"));
+        assert!(pixel(&path, "0.5", 4, 4)[0] > 200); // behind the blue foreground, base remains the canvas
+        assert!(pixel(&path, "1.5", 4, 4)[2] > 200); // base ended; use the remaining video
+        assert!(pixel(&path, "2.5", 4, 4).iter().all(|v| *v < 20));
         let _ = std::fs::remove_dir_all(d);
     }
     #[test]
@@ -308,6 +430,7 @@ mod tests {
             height: 64,
             fps: 30.0,
             duration_ms: 3000,
+            background: Default::default(),
             segments: vec![s],
         };
         let path = render(c, d.join("audio.mp4"));
@@ -347,6 +470,7 @@ mod window_placement_tests {
             height: 1080,
             fps: 30.0,
             duration_ms: 1000,
+            background: Default::default(),
             segments: vec![Segment {
                 source: PathBuf::from("window.mp4"),
                 audio_index: None,
@@ -357,12 +481,14 @@ mod window_placement_tests {
                 speed: 1.0,
                 gain: 1.0,
                 transform: Transform {
+                    fit: Default::default(),
                     scale: 0.5,
                     x: 1.1,
                     y: -0.1,
                     opacity: 1.0,
                 },
                 caption: None,
+                source_width: 1920,
                 source_height: 1080,
             }],
         };

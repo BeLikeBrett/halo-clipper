@@ -45,6 +45,7 @@ pub struct MediaAsset {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
+    pub fit: crate::framing::Fit,
     pub scale: f32,
     pub x: f32,
     pub y: f32,
@@ -53,6 +54,7 @@ pub struct Transform {
 impl Default for Transform {
     fn default() -> Self {
         Self {
+            fit: crate::framing::Fit::Fit,
             scale: 1.0,
             x: 0.5,
             y: 0.5,
@@ -354,6 +356,7 @@ pub fn split_all_at(clips: &mut Vec<Clip>, cut_ms: i64, id_gen: &IdGen) -> Vec<C
 
 /// Delete `target` and every clip that shares its link. If `target` is
 /// unlinked, only it is removed.
+#[cfg(test)]
 pub fn delete_with_links(clips: &mut Vec<Clip>, target: ClipId) {
     let link = clip_by_id(clips, target).and_then(|c| c.link);
     match link {
@@ -364,6 +367,7 @@ pub fn delete_with_links(clips: &mut Vec<Clip>, target: ClipId) {
 
 /// Break the link on `target` and every clip that shares it.
 /// Returns true if anything changed.
+#[cfg(test)]
 pub fn detach_links(clips: &mut [Clip], target: ClipId) -> bool {
     let Some(link) = clip_by_id(clips, target).and_then(|c| c.link) else {
         return false;

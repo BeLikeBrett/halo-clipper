@@ -12,7 +12,8 @@ impl Project {
             out_ms: None,
             simple_audio_muted: false,
             assets: Vec::new(),
-            canvas_override: None,
+            canvas: Default::default(),
+            groups: HashMap::new(),
             tracks: Vec::new(),
             clips: Vec::new(),
             selected_clips: HashSet::new(),
@@ -73,10 +74,7 @@ impl Project {
             })
             .cloned()
             .unwrap_or_else(Self::blank_media);
-        if let Some((w, h)) = self.canvas_override {
-            media.width = w;
-            media.height = h;
-        }
+        (media.width, media.height) = self.canvas.aspect.dimensions(media.width, media.height);
         media
     }
     pub(super) fn import_asset(&mut self, source: LayerSource) -> TrackId {
@@ -196,8 +194,7 @@ impl Project {
         let start = start.max(0);
         let end = start + asset.source.media.duration_ms;
         let has_video = asset.source.media.width > 0;
-        let link = (has_video && asset.source.media.audio_stream_count > 0)
-            .then(|| self.id_gen.next_link());
+        let link = has_video.then(|| self.id_gen.next_link());
         let mut selected = None;
         if has_video {
             let lane = self
@@ -246,10 +243,30 @@ impl Project {
             }
             self.clips.push(clip);
         }
+        if let Some(link) = link {
+            let members = self
+                .clips
+                .iter()
+                .filter(|c| c.link == Some(link))
+                .map(|c| c.id)
+                .collect();
+            self.groups.insert(
+                link,
+                grouping::MediaGroup {
+                    members,
+                    attached: true,
+                },
+            );
+        }
         self.selected_clips = selected.into_iter().collect();
         selected
     }
     pub(super) fn prune_tracks(&mut self) {
+        for g in self.groups.values_mut() {
+            g.members
+                .retain(|id| self.clips.iter().any(|c| c.id == *id));
+        }
+        self.groups.retain(|_, g| !g.members.is_empty());
         self.tracks
             .retain(|t| self.clips.iter().any(|c| c.track_id == t.id));
     }
@@ -289,12 +306,7 @@ impl Project {
         else {
             return;
         };
-        let group: HashSet<_> = self
-            .clips
-            .iter()
-            .filter(|c| c.id == id || (primary.link.is_some() && c.link == primary.link))
-            .map(|c| c.id)
-            .collect();
+        let group = self.edit_ids(id);
         let lower = self
             .clips
             .iter()
@@ -302,7 +314,7 @@ impl Project {
             .map(|c| c.cut_start_ms)
             .min()
             .unwrap_or(0);
-        let delta = (start - primary.cut_start_ms).max(-lower);
+        let delta = (start - self.group_bounds(id).0).max(-lower);
         let start = primary.cut_start_ms + delta;
         let lane = target
             .filter(|tid| self.tracks.iter().any(|t| t.id == *tid && t.kind == kind))

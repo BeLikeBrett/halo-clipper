@@ -27,7 +27,8 @@ keyframe-aligned clips when possible and re-encodes when needed.
 
 - **Import** adds video and audio to the media bin. Nothing is placed on the
   timeline automatically. Drag a media item to the time and lane you want; a
-  drop indicator shows where it will land. Drop between lanes to create a layer.
+  full clip preview shows where it will land. Imported clips snap into a new
+  layer above or below the lane under the pointer; hold Shift to bypass time snapping.
 - Drag clips horizontally to change timing or vertically to another lane.
   Drag a track name up or down to change its layer order. Video at the top
   appears in front; audio lanes mix together.
@@ -35,16 +36,23 @@ keyframe-aligned clips when possible and re-encodes when needed.
   drag its corner handles to resize it while keeping its aspect ratio. Videos
   can extend outside the canvas. Transform edits update immediately on the GPU.
 - The canvas automatically follows the largest-resolution video **placed on
-  the timeline**. Importing alone does not change it. The preview's resolution
-  menu provides an explicit manual override; Custom export settings can override
-  the output size as well.
+  the timeline**. Importing alone does not change it. Choose Original, 16:9,
+  9:16 (Reels / TikTok), 1:1, or 4:5 above the preview. These formats retain
+  native source detail without a resolution picker. Fit shows the whole video;
+  Fill crops to the canvas. Zoom, placement, and black / color / blurred video
+  backgrounds carry through to export. Custom export can still override size.
 - Hover a media item and click **×** to remove it and its timeline instances.
   Removing the last item leaves a blank editor. Import again whenever you want.
+- Video and its audio start as one combined bar. **Detach Audio** (**D**) exposes
+  the audio. **Attach Audio** (**Shift+D**) collapses it again, preserving source
+  trims, cuts, gaps, offsets, speed, gain, and deleted pieces. Attachment changes
+  grouping, never the rendered result. Detached splits remember their association.
+  Ctrl+click multiple video/audio pieces to attach them as one compound bar.
 - Split with **S**, delete with **Delete**, and undo / redo with **Ctrl+Z** /
-  **Ctrl+Shift+Z**. Linked audio follows video until detached with **D**.
-- **Inspector** is optional. Open it for gain, speed, opacity and captions;
-  selecting a clip does not open a side panel automatically. Right-click a clip
-  for edit actions, or a track name to mute / hide that track.
+  **Ctrl+Shift+Z**. Attached pieces edit together; detached pieces edit independently.
+- Click a clip to show its controls for framing, audio, speed, opacity, and
+  captions. Right-click a clip for edit actions, or a track name to mute / hide
+  that track. Read-only clip details stay collapsed until needed.
 - Each active video and audio lane uses an independent live decoder. Timeline
   playback, scrubbing and transform edits do not rebuild a rendered timeline.
   Exports always read the original media through the shared composition model.
@@ -70,7 +78,7 @@ FFmpeg, with a GPU upload when the selected encoder requires it. Proxy media nev
 | I / O | Set In / Out in Simple Clip |
 | S | Cycle Simple Clip marks; split selected / intersecting Advanced clips |
 | Delete | Delete selected Advanced segments and linked partners |
-| D | Detach linked audio |
+| D / Shift+D | Detach / attach audio, preserving edits |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 | Ctrl+click | Add / remove a segment from selection |
 

@@ -7,6 +7,7 @@ mod composition;
 mod diagnostics;
 mod encode;
 mod export;
+mod framing;
 mod gl_loader;
 mod media;
 mod platform;

@@ -2,7 +2,14 @@ use super::*;
 use crate::track::Transform;
 
 pub(super) fn layer_rect(canvas: egui::Rect, width: u32, height: u32, t: Transform) -> egui::Rect {
-    let fit = (canvas.width() / width.max(1) as f32).min(canvas.height() / height.max(1) as f32);
+    let ratios = (
+        canvas.width() / width.max(1) as f32,
+        canvas.height() / height.max(1) as f32,
+    );
+    let fit = match t.fit {
+        crate::framing::Fit::Fit => ratios.0.min(ratios.1),
+        crate::framing::Fit::Fill => ratios.0.max(ratios.1),
+    };
     let size = egui::vec2(width as f32 * fit * t.scale, height as f32 * fit * t.scale);
     egui::Rect::from_center_size(
         egui::pos2(
@@ -26,51 +33,57 @@ impl ClipperApp {
             return;
         };
         let media = p.canvas_media();
-        let mut canvas_override = p.canvas_override;
-        let previous_override = canvas_override;
-        ui.horizontal(|ui| {
+        let mut settings = p.canvas;
+        let previous = settings;
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Preview").small().color(theme::TEXT_MUTED));
-            egui::ComboBox::from_id_salt("canvas_resolution")
-                .selected_text(if canvas_override.is_none() {
-                    format!("Auto · {} × {}", media.width, media.height)
-                } else {
-                    format!("{} × {}", media.width, media.height)
-                })
-                .width(160.0)
+            egui::ComboBox::from_id_salt("canvas_format")
+                .selected_text(settings.aspect.label())
+                .width(174.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut canvas_override,
-                        None,
-                        "Auto · largest timeline video",
-                    );
-                    for (w, h) in [
-                        (1280, 720),
-                        (1920, 1080),
-                        (2560, 1440),
-                        (3840, 2160),
-                        (1080, 1920),
-                    ] {
-                        ui.selectable_value(
-                            &mut canvas_override,
-                            Some((w, h)),
-                            format!("{w} × {h}"),
-                        );
+                    for aspect in crate::framing::Aspect::ALL {
+                        ui.selectable_value(&mut settings.aspect, aspect, aspect.label());
                     }
                 });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .selectable_label(self.inspector_open, "Inspector")
-                    .on_hover_text("Audio, speed and captions")
-                    .clicked()
-                {
-                    self.inspector_open = !self.inspector_open;
-                }
+            ui.menu_button("Background", |ui| {
+                ui.selectable_value(
+                    &mut settings.background,
+                    crate::framing::Background::Black,
+                    "Black",
+                );
+                ui.selectable_value(
+                    &mut settings.background,
+                    crate::framing::Background::Blur,
+                    "Blur video",
+                );
+                let mut rgb = settings.background.rgb();
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            matches!(settings.background, crate::framing::Background::Color(_)),
+                            "Color",
+                        )
+                        .clicked()
+                    {
+                        settings.background = crate::framing::Background::Color([32, 32, 32]);
+                    }
+                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        settings.background = crate::framing::Background::Color(rgb);
+                    }
+                });
             });
+            ui.label(
+                RichText::new(format!("{} × {}", media.width, media.height))
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            )
+            .on_hover_text("Uses the highest resolution video placed on the timeline");
         });
-        if canvas_override != previous_override {
+        if settings != previous {
+            ui.ctx().request_repaint();
             self.push_undo();
             if let Some(p) = &mut self.project {
-                p.canvas_override = canvas_override;
+                p.canvas = settings;
             }
         }
         ui.add_space(8.0);
@@ -79,7 +92,9 @@ impl ClipperApp {
         let w = available.width().min(available.height() * aspect).max(1.0);
         let h = w / aspect;
         let canvas = egui::Rect::from_center_size(available.center(), egui::vec2(w, h));
-        ui.painter().rect_filled(canvas, 2.0, Color32::BLACK);
+        let rgb = settings.background.rgb();
+        ui.painter()
+            .rect_filled(canvas, 2.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         let bg = ui.interact(
             canvas,
             ui.id().with("canvas_background"),
@@ -161,8 +176,10 @@ impl ClipperApp {
         if bg.clicked() && !clicked {
             selected = None;
         }
-        if let Some(p) = &mut self.project {
-            p.selected_clips = selected.into_iter().collect();
+        if clicked || bg.clicked() || start_drag.is_some() {
+            if let Some(p) = &mut self.project {
+                p.selected_clips = selected.into_iter().collect();
+            }
         }
         if let Some(drag) = start_drag {
             self.push_undo();
@@ -208,7 +225,7 @@ impl ClipperApp {
                 frame.transform = c.transform;
             }
         }
-        self.live.paint(ui, canvas);
+        self.live.paint(ui, canvas, settings.background);
         if let Some(layer) = self
             .live
             .frames
