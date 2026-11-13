@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.10.0
+## 0.10.1
+
+- Keep animated clip dimensions correct across Windows and Linux media runtimes.
 
 - Keep text export timing accurate on older Linux FFmpeg releases as well
   as the bundled Windows runtime.

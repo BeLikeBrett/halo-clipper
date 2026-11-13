@@ -192,7 +192,7 @@ to 1920 × 1080, and scales it into the viewport. Framebuffer allocation is
 included in the GL state guard. This avoids reallocating on divider/window
 resize and avoids fractional-size upscaler artifacts on software graphics.
 
-## Color mixing and clip motion (0.10.0)
+## Color mixing and clip motion (0.10.1)
 
 - Text, outline, and box each support solid custom colors or two-color gradients
   in the collapsed Color mix section. Gradient direction, three palette shortcuts,
@@ -234,3 +234,6 @@ The first video initializes an empty Simple workspace; an empty Advanced
 workspace keeps its mode. Duplicate paths are skipped, invalid files report
 an error while valid files in the same batch still import. An Advanced batch
 uses one undo step. The Import button remains available.
+
+Import numbers are stable, one-based, independent of track IDs, and preserved
+in undo snapshots. Timeline and drag labels retain the same media number.

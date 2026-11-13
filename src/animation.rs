@@ -113,10 +113,6 @@ impl Animation {
         let (a, b) = self.durations(duration_ms);
         let duration = duration_ms as f32 / 1000.0;
         let mut filters = String::new();
-        let zoom = self.zoom_expression("t", duration_ms);
-        if self.intro.zoom() != 0.0 || self.outro.zoom() != 0.0 {
-            filters.push_str(&format!(",scale=w='max(2,trunc(iw*({zoom})/2)*2)':h='max(2,trunc(ih*({zoom})/2)*2)':eval=frame"));
-        }
         for (effect, start, length, way) in [
             (self.intro, 0.0, a / 1000.0, "in"),
             (self.outro, duration - b / 1000.0, b / 1000.0, "out"),
@@ -137,6 +133,10 @@ impl Animation {
                 };
                 filters.push_str(&format!(",geq=r='r(X,Y)+(255-r(X,Y))*{amount:.6}*{}':g='g(X,Y)+(255-g(X,Y))*{amount:.6}*{}':b='b(X,Y)+(255-b(X,Y))*{amount:.6}*{}':a='alpha(X,Y)':enable='{enable}'", self.flash_expression(way, duration, length), self.flash_expression(way, duration, length), self.flash_expression(way, duration, length)));
             }
+        }
+        let zoom = self.zoom_expression("t", duration_ms);
+        if self.intro.zoom() != 0.0 || self.outro.zoom() != 0.0 {
+            filters.push_str(&format!(",scale=w='max(2,trunc(iw*({zoom})/2)*2)':h='max(2,trunc(ih*({zoom})/2)*2)':eval=frame"));
         }
         filters
     }

@@ -132,7 +132,7 @@ impl Composition {
             {
                 let start = s.start_ms as f64 / 1000.0;
                 let end = s.end_ms as f64 / 1000.0;
-                graph.push_str(&format!("[{current}][bg{i}]overlay=eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})*{}'[canvas{i}];", if s.transform.opacity > 0.0 {1} else {0}));
+                graph.push_str(&format!("[{current}][bg{i}]overlay=format=rgb:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})*{}'[canvas{i}];", if s.transform.opacity > 0.0 {1} else {0}));
                 current = format!("canvas{i}");
             }
         }
@@ -158,10 +158,10 @@ impl Composition {
                 } else {
                     "decrease"
                 };
-                graph.push_str(&format!("{input}setpts=(PTS-STARTPTS)/{speed:.6},scale=w={sw}:h={sh}:force_original_aspect_ratio={fit}:force_divisible_by=2,setsar=1,fps={fps:.6},format=rgba"));
+                graph.push_str(&format!("{input}setpts=(PTS-STARTPTS)/{speed:.6},scale=w={sw}:h={sh}:force_original_aspect_ratio={fit}:force_divisible_by=2,setsar=1,fps={fps:.6},format=rgba,colorchannelmixer=aa={:.6}", t.opacity.clamp(0.0,1.0)));
                 graph.push_str(&s.animation.filters(s.end_ms - s.start_ms));
                 let dx = s.animation.x_expression(s.start_ms, s.end_ms - s.start_ms);
-                graph.push_str(&format!(",colorchannelmixer=aa={:.6},setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='W*{:.6}-w/2+W*({dx})':y='H*{:.6}-h/2':eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.opacity.clamp(0.0,1.0), t.x, t.y));
+                graph.push_str(&format!(",setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='W*{:.6}-w/2+W*({dx})':y='H*{:.6}-h/2':format=rgb:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.x, t.y));
                 current = format!("mix{i}");
             }
         }
@@ -170,7 +170,7 @@ impl Composition {
             let start = t.start_ms as f64 / 1000.0;
             let end = t.end_ms as f64 / 1000.0;
             graph.push_str(&format!(
-                "[{input}:v]format=rgba,setpts=PTS-STARTPTS+{start:.6}/TB[text{k}];[{current}][text{k}]overlay=x={}:y={}:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[titled{k}];",
+                "[{input}:v]format=rgba,setpts=PTS-STARTPTS+{start:.6}/TB[text{k}];[{current}][text{k}]overlay=x={}:y={}:format=rgb:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[titled{k}];",
                 t.x, t.y,
             ));
             current = format!("titled{k}");
@@ -317,6 +317,62 @@ mod tests {
         let index = (y * width + x) * 3;
         out.stdout[index..index + 3].try_into().unwrap()
     }
+    #[test]
+    fn animated_zoom_changes_framing_and_returns_to_original_size() {
+        use crate::animation::{Animation, Effect};
+        let d = dir();
+        let source = d.join("border.mp4");
+        let output = crate::platform::command("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:s=64x64:r=30:d=2,drawbox=x=0:y=0:w=64:h=64:color=white:t=4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        for effect in [Effect::SnapZoom, Effect::PullBack, Effect::Whip] {
+            let mut top = segment(source.clone(), 0, 2000);
+            top.animation = Animation {
+                intro: effect,
+                in_ms: 500.0,
+                amount: 1.0,
+                ..Default::default()
+            };
+            let c = Composition {
+                width: 64,
+                height: 64,
+                fps: 30.0,
+                duration_ms: 2000,
+                background: Default::default(),
+                segments: vec![top],
+                texts: vec![],
+            };
+            let path = render(c, d.join(format!("border-{effect:?}.mp4")));
+            let start = pixel(&path, "0", 2, 2);
+            let middle = pixel(&path, "1.0", 2, 2);
+            assert!(
+                middle.iter().all(|v| *v > 200),
+                "{effect:?} did not settle: {middle:?}"
+            );
+            if effect == Effect::SnapZoom {
+                assert!(start[0] > 180 && start[1] < 80, "{start:?}");
+            } else {
+                assert!(start.iter().all(|v| *v < 30), "{effect:?}: {start:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn clip_animations_export_on_both_edges_of_a_delayed_segment() {
         use crate::animation::{Animation, Effect};
