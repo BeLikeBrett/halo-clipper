@@ -97,7 +97,16 @@ impl Composition {
             .arg(&s.source);
         }
         for t in texts {
-            cmd.args(["-f", "concat", "-safe", "0", "-i"]).arg(&t.list);
+            cmd.args([
+                "-r",
+                &format!("{:.6}", t.fps),
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+            ])
+            .arg(&t.list);
         }
         let mut graph =
             format!("color=c=0x{:02x}{:02x}{:02x}:s={w}x{h}:r={fps:.6}:d={duration:.6},format=yuv420p[base];", self.background.rgb()[0], self.background.rgb()[1], self.background.rgb()[2]);

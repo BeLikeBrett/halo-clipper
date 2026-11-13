@@ -2,6 +2,9 @@
 
 ## 0.10.0
 
+- Keep text export timing accurate on older Linux FFmpeg releases as well
+  as the bundled Windows runtime.
+
 - Subtle, stable import-order numbers on Media names, drag labels, and
   timeline clips (1 · filename, 2 · filename).
 

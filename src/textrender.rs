@@ -699,6 +699,7 @@ fn box_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal
 /// where the frame's top-left lands on the output canvas.
 pub struct ExportLayer {
     pub list: PathBuf,
+    pub fps: f64,
     pub x: i32,
     pub y: i32,
     pub start_ms: i64,
@@ -706,8 +707,9 @@ pub struct ExportLayer {
 }
 
 /// Renders every non-empty text layer to PNG frames under `dir`. Frames
-/// are only written when the animation state changes; held states become
-/// long `duration` entries in the concat list.
+/// are only written when the animation state changes. Held frames reuse
+/// the same PNG path; the input frame rate supplies exact timestamps, even
+/// on FFmpeg 4.4 (which lacks the concat `option` directive).
 pub fn write_export_layers(
     items: &[TextItem],
     width: u32,
@@ -749,21 +751,15 @@ pub fn write_export_layers(
         let mut list = String::from("ffconcat version 1.0\n");
         for (path, count) in &entries {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            list.push_str(&format!(
-                "file '{name}'\noption framerate {fps:.6}\nduration {:.9}\n",
-                *count as f64 * frame_ms / 1000.0
-            ));
-        }
-        // The concat demuxer ignores the final entry's duration unless the
-        // file is listed once more.
-        if let Some((path, _)) = entries.last() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            list.push_str(&format!("file '{name}'\noption framerate {fps:.6}\n"));
+            for _ in 0..*count {
+                list.push_str(&format!("file '{name}'\n"));
+            }
         }
         let list_path = dir.join(format!("text{n}.ffconcat"));
         std::fs::write(&list_path, list)?;
         layers.push(ExportLayer {
             list: list_path,
+            fps,
             x: (item.x * w - size.0 as f32 * 0.5).round() as i32,
             y: (item.y * h - size.1 as f32 * 0.5).round() as i32,
             start_ms: item.start_ms,
@@ -927,10 +923,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let layers =
             write_export_layers(&[item("Smooth")], 320, 180, 60.0, &dir, || false).unwrap();
-        let probe = crate::platform::command("ffprobe")
-            .args(["-v", "error", "-f", "concat", "-safe", "0", "-i"])
+        // Decode with the same input-rate override as the compositor. A
+        // concat PNG's default 25 fps must never quantize 60 fps animation.
+        let probe = crate::platform::command("ffmpeg")
+            .args([
+                "-v", "error", "-threads", "1", "-r", "60", "-f", "concat", "-safe", "0", "-i",
+            ])
             .arg(&layers[0].list)
-            .args(["-show_entries", "packet=pts_time", "-of", "json"])
+            .args(["-f", "framemd5", "-"])
             .output()
             .unwrap();
         assert!(
@@ -938,20 +938,15 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&probe.stderr)
         );
-        let packets: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
-        let times: Vec<f64> = packets["packets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["pts_time"].as_str().unwrap().parse().unwrap())
+        let output = String::from_utf8_lossy(&probe.stdout);
+        assert!(output.contains("#tb 0: 1/60"), "{output}");
+        let pts: Vec<i64> = output
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| line.split(',').nth(2).unwrap().trim().parse().unwrap())
             .collect();
-        for (index, time) in times.iter().take(8).enumerate() {
-            assert!(
-                (time - index as f64 / 60.0).abs() < 0.00001,
-                "frame {index}: {time}"
-            );
-        }
-        assert!((times.last().unwrap() - 2.0).abs() < 0.00001);
+        assert_eq!(pts.len(), 120);
+        assert!(pts.iter().enumerate().all(|(i, pts)| *pts == i as i64));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
