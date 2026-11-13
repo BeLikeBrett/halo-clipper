@@ -273,9 +273,9 @@ mod tests {
         let mut encode = EncodeSettings::default_for_source(c.width, c.height);
         encode.video_preset = "ultrafast".into();
         let h = export::spawn(ExportPlan::Layered {
-            composition: c,
+            composition: c.clone(),
             destination: path.clone(),
-            encode,
+            encode: encode.clone(),
         })
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -283,7 +283,18 @@ mod tests {
             match h.progress().phase {
                 ExportPhase::Done => break,
                 ExportPhase::Running => {}
-                other => panic!("{other:?}"),
+                other => {
+                    // Retry only the failing synthetic test export with verbose
+                    // diagnostics: platform media runtimes can differ.
+                    let mut command = c.command(&path, &encode, &[]).unwrap();
+                    command.args(["-loglevel", "verbose"]);
+                    let output = command.output().unwrap();
+                    panic!(
+                        "{}: {other:?}\n{}",
+                        path.display(),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
             };
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(20));
