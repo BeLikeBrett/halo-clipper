@@ -48,7 +48,8 @@ The release workflow is the executable specification:
   archives and verifies their hashes before extracting them.
 - Generate `mpv.lib` from the DLL exports with `dumpbin` and `lib`, as shown in
   `.github/workflows/release.yml`. Add the import-library directory using
-  `RUSTFLAGS=-L native=<absolute-directory>`. Put libmpv and the FFmpeg `bin`
+  `RUSTFLAGS=-C target-feature=+crt-static -L native=<absolute-directory>`
+  to keep the Microsoft runtime self-contained. Put libmpv and the FFmpeg `bin`
   directory on PATH for tests.
 - Run `cargo test --release --locked` and `cargo build --release --locked`.
 - Run `python scripts/package-windows.py dist/runtime target/release/halo-clipper.exe`.

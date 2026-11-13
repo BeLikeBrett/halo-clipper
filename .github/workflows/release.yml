@@ -37,7 +37,7 @@ jobs:
           lib /nologo /machine:x64 /def:dist/runtime/mpv-dev/mpv.def /out:dist/runtime/mpv-dev/mpv.lib
           $mpv = (Resolve-Path dist/runtime/mpv-dev).Path
           $ffmpeg = (Get-ChildItem dist/runtime/ffmpeg -Filter ffprobe.exe -Recurse | Select-Object -First 1).DirectoryName
-          "RUSTFLAGS=-L native=$mpv" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTFLAGS=-C target-feature=+crt-static -L native=$mpv" | Out-File -FilePath $env:GITHUB_ENV -Append
           $mpv | Out-File -FilePath $env:GITHUB_PATH -Append
           $ffmpeg | Out-File -FilePath $env:GITHUB_PATH -Append
       - run: cargo test --release --locked
