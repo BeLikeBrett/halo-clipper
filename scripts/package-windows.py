@@ -1,23 +1,74 @@
 #!/usr/bin/env python3
-import json,pathlib,shutil,sys
-root=pathlib.Path(__file__).resolve().parents[1]
-runtime=pathlib.Path(sys.argv[1]);binary=pathlib.Path(sys.argv[2]);payload=root/'dist/windows'
-payload.mkdir(parents=True,exist_ok=True)
-shutil.copy2(binary,payload/'halo-clipper.exe')
-for name,folder in [('libmpv-2.dll','mpv-dev'),('ffmpeg.exe','ffmpeg'),('ffprobe.exe','ffmpeg'),('mpv.exe','mpv'),('d3dcompiler_43.dll','mpv')]:
-    matches=list((runtime/folder).rglob(name))
-    # ffmpeg folder may contain the old shinchiro single-tool archive as well.
-    source=next((p for p in matches if 'ffmpeg-n8.' in str(p)),matches[0] if matches else None)
-    if not source: raise SystemExit(f'Missing runtime: {name}')
-    shutil.copy2(source,payload/name)
-for name in ['LICENSE','THIRD-PARTY-NOTICES.md']:shutil.copy2(root/name,payload/name)
-shutil.copy2(root/'packaging/runtime-lock.json',payload/'runtime-lock.json')
-licenses=payload/'licenses';licenses.mkdir(exist_ok=True)
-shutil.copy2(root/'assets/fonts/LICENSE',licenses/'DejaVu-LICENSE')
-for font in ['Inter','JetBrainsMono']:shutil.copy2(root/f'assets/fonts/{font}-LICENSE.txt',licenses/f'{font}-LICENSE')
-for source in runtime.rglob('*'):
-    if source.is_file() and ('LICENSE' in source.name.upper() or 'COPYING' in source.name.upper()) and source.suffix not in ['.7z','.zip']:
-        name='-'.join(source.relative_to(runtime).parts)
-        shutil.copy2(source,licenses/name)
-shutil.make_archive(str(root/'dist/Halo-Clipper-windows-x86_64'),'zip',root/'dist','windows')
-print(payload)
+"""Assemble the Windows payload (dist/windows) and the portable zip.
+
+Usage: package-windows.py <runtime-dir> <halo-clipper.exe>
+
+<runtime-dir> is the output of fetch-windows-runtime.py (mpv-dev/, mpv/,
+ffmpeg/ subfolders). The payload folder is rebuilt from scratch so files
+from an older runtime never ride along into the installer.
+"""
+
+import pathlib
+import shutil
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PAYLOAD = ROOT / "dist" / "windows"
+
+# (file name, runtime subfolder it is found in)
+RUNTIME_FILES = [
+    ("libmpv-2.dll", "mpv-dev"),
+    ("ffmpeg.exe", "ffmpeg"),
+    ("ffprobe.exe", "ffmpeg"),
+    ("mpv.exe", "mpv"),
+    ("d3dcompiler_43.dll", "mpv"),
+]
+
+
+def find_runtime_file(runtime: pathlib.Path, name: str, folder: str) -> pathlib.Path:
+    matches = sorted((runtime / folder).rglob(name))
+    if not matches:
+        raise SystemExit(f"Missing runtime file: {folder}/**/{name}")
+    # The ffmpeg folder can hold both the pinned n8 build and an older
+    # single-tool archive; prefer the pinned one.
+    pinned = [p for p in matches if "ffmpeg-n8." in str(p)]
+    return (pinned or matches)[0]
+
+
+def is_license(path: pathlib.Path) -> bool:
+    upper = path.name.upper()
+    return path.is_file() and ("LICENSE" in upper or "COPYING" in upper) and path.suffix not in (".7z", ".zip")
+
+
+def main() -> None:
+    if len(sys.argv) != 3:
+        raise SystemExit(__doc__)
+    runtime = pathlib.Path(sys.argv[1])
+    binary = pathlib.Path(sys.argv[2])
+
+    shutil.rmtree(PAYLOAD, ignore_errors=True)
+    PAYLOAD.mkdir(parents=True)
+
+    shutil.copy2(binary, PAYLOAD / "halo-clipper.exe")
+    for name, folder in RUNTIME_FILES:
+        shutil.copy2(find_runtime_file(runtime, name, folder), PAYLOAD / name)
+    for name in ("LICENSE", "THIRD-PARTY-NOTICES.md"):
+        shutil.copy2(ROOT / name, PAYLOAD / name)
+    shutil.copy2(ROOT / "packaging" / "runtime-lock.json", PAYLOAD / "runtime-lock.json")
+
+    licenses = PAYLOAD / "licenses"
+    licenses.mkdir()
+    fonts = ROOT / "assets" / "fonts"
+    shutil.copy2(fonts / "LICENSE", licenses / "DejaVu-LICENSE")
+    for font in ("Inter", "JetBrainsMono"):
+        shutil.copy2(fonts / f"{font}-LICENSE.txt", licenses / f"{font}-LICENSE")
+    for source in runtime.rglob("*"):
+        if is_license(source):
+            shutil.copy2(source, licenses / "-".join(source.relative_to(runtime).parts))
+
+    shutil.make_archive(str(ROOT / "dist" / "Halo-Clipper-windows-x86_64"), "zip", ROOT / "dist", "windows")
+    print(PAYLOAD)
+
+
+if __name__ == "__main__":
+    main()

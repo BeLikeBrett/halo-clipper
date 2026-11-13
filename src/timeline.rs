@@ -123,9 +123,8 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
     painter.rect_filled(lane_rect, 4.0, Color32::from_rgb(12, 14, 18));
 
     // Full-source clip block — always rendered (the source is always
-    // there in Simple Clip mode). Uses a warm teal fill that reads
-    // visually distinct from Advanced's cool slate-blue.
-    let clip_fill = Color32::from_rgb(60, 92, 84);
+    // there in Simple Clip mode). Same fill as an Advanced video clip.
+    let clip_fill = theme::CLIP_VIDEO;
     let block = Rect::from_min_max(
         egui::pos2(lane_rect.left(), lane_rect.top() + 1.0),
         egui::pos2(lane_rect.right(), lane_rect.bottom() - 1.0),
@@ -150,6 +149,20 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
         let x0 = (lane_area_left + (lo as f32 / dur) * lane_area_width).max(lane_area_left);
         let x1 = (lane_area_left + (hi as f32 / dur) * lane_area_width).min(lane_area_right);
         if x1 > x0 + 1.0 {
+            // Shade what won't export so the kept range stands out.
+            let shade = Color32::from_black_alpha(120);
+            for (a, b) in [(block.left(), x0), (x1, block.right())] {
+                if b > a {
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            egui::pos2(a, block.top()),
+                            egui::pos2(b, block.bottom()),
+                        ),
+                        0.0,
+                        shade,
+                    );
+                }
+            }
             let sel = Rect::from_min_max(
                 egui::pos2(x0, lane_rect.top() + 1.0),
                 egui::pos2(x1, lane_rect.bottom() - 1.0),

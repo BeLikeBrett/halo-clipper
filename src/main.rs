@@ -12,6 +12,7 @@ mod gl_interop;
 mod gl_loader;
 mod media;
 mod mpv_render;
+mod picker;
 mod platform;
 mod player;
 mod proxy;
@@ -73,6 +74,8 @@ fn main() -> eframe::Result<()> {
         "Halo Clipper",
         native_options,
         Box::new(move |cc| {
+            #[cfg(windows)]
+            platform::use_exe_icon(cc);
             load_caption_fonts(&cc.egui_ctx);
             match ClipperApp::new(cc) {
                 Ok(mut app) => {

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Halo Clipper icon, small-size cut (16–32 px: taskbar, title bar,
+     Explorer details view). Same plate, ring and play mark as icon.svg,
+     with heavier strokes and the timeline reduced to two thick bars so
+     nothing dissolves into sub-pixel mush. -->
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#2a2a42"/>
+      <stop offset="100%" stop-color="#181825"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#f5e0dc"/>
+      <stop offset="50%"  stop-color="#cba6f7"/>
+      <stop offset="100%" stop-color="#89b4fa"/>
+    </linearGradient>
+    <linearGradient id="clip" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#cba6f7"/>
+      <stop offset="100%" stop-color="#89b4fa"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="104" fill="url(#bg)"/>
+  <ellipse cx="256" cy="196" rx="170" ry="66" fill="none"
+           stroke="url(#ring)" stroke-width="34" stroke-linecap="round"
+           transform="rotate(-12 256 196)"/>
+  <path d="M 198 108 L 198 288 L 356 198 Z"
+        fill="#e8ecf8" stroke="#e8ecf8" stroke-width="34"
+        stroke-linejoin="round"/>
+  <rect x="72"  y="364" width="236" height="72" rx="24" fill="url(#clip)"/>
+  <rect x="336" y="364" width="104" height="72" rx="24" fill="#585b70"/>
+</svg>

@@ -35,14 +35,17 @@ pub const ACCENT_IN: Color32 = Color32::from_rgb(110, 214, 150);
 pub const ACCENT_OUT: Color32 = Color32::from_rgb(238, 132, 132);
 pub const ACCENT_OK: Color32 = Color32::from_rgb(110, 214, 150);
 pub const ACCENT_ERR: Color32 = Color32::from_rgb(238, 116, 116);
-/// Timeline playhead. Warm so it never reads as a selection outline.
-pub const PLAYHEAD: Color32 = Color32::from_rgb(255, 196, 92);
+/// Timeline playhead. A soft white: the brightest mark on the timeline
+/// without adding a fourth hue next to the blue accent and the clip fills.
+pub const PLAYHEAD: Color32 = Color32::from_rgb(236, 239, 245);
 
 // ── Timeline clip fills ─────────────────────────────────────────────────
 pub const CLIP_VIDEO: Color32 = Color32::from_rgb(46, 74, 112);
 pub const CLIP_VIDEO_EDGE: Color32 = Color32::from_rgb(78, 116, 166);
-pub const CLIP_AUDIO: Color32 = Color32::from_rgb(34, 84, 70);
-pub const CLIP_AUDIO_EDGE: Color32 = Color32::from_rgb(62, 132, 110);
+/// Teal sits next to the video blue on the colour wheel, so the two lanes
+/// read as one family while staying distinguishable at a glance.
+pub const CLIP_AUDIO: Color32 = Color32::from_rgb(30, 80, 88);
+pub const CLIP_AUDIO_EDGE: Color32 = Color32::from_rgb(58, 132, 140);
 
 /// Primary action buttons (Export, Begin Export). Same hue family as
 /// ACCENT, lower saturation, so the call to action doesn't glare.
@@ -79,6 +82,10 @@ pub fn mono(size: f32) -> FontId {
 }
 
 pub fn apply(ctx: &Context) {
+    // The app is dark-only. egui otherwise follows the OS preference, and
+    // on a light-mode Windows (or GNOME) desktop the stock widgets would
+    // switch to the light style while the custom surfaces stay dark.
+    ctx.set_theme(egui::Theme::Dark);
     let mut visuals = Visuals::dark();
 
     visuals.panel_fill = BG_PANEL;
@@ -142,9 +149,9 @@ pub fn apply(ctx: &Context) {
     visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.open.rounding = rounding;
 
-    ctx.set_visuals(visuals);
+    ctx.set_visuals_of(egui::Theme::Dark, visuals);
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(11.0, 5.0);
     style.spacing.menu_margin = egui::Margin::same(6.0);
@@ -161,5 +168,5 @@ pub fn apply(ctx: &Context) {
     // Labels are not selectable: an I-beam over every caption competes with
     // the pointing hand of the control underneath it.
     style.interaction.selectable_labels = false;
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }

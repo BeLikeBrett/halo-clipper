@@ -15,31 +15,97 @@ const RIGHT_PAD: f32 = 10.0;
 /// Vertical inset of a clip inside its lane.
 const CLIP_INSET: f32 = 4.0;
 
-/// Horizontal time mapping shared by the ruler and the lanes, plus the
+/// Horizontal time mapping shared by the ruler and the lanes: the visible
+/// window `[start, start + span)` spread across the lane width, plus the
 /// top of the first lane for row hit-testing.
 #[derive(Clone, Copy, Debug)]
 struct Lanes {
     left: f32,
     width: f32,
     top: f32,
-    duration: i64,
+    start: i64,
+    span: i64,
 }
 impl Lanes {
+    /// Whole timeline fitted to the width.
+    #[cfg(test)]
     fn new(rect: egui::Rect, duration: i64) -> Self {
+        Self::window(rect, 0, duration)
+    }
+    fn window(rect: egui::Rect, start: i64, span: i64) -> Self {
         Self {
             left: rect.left() + HEADER_W,
             width: (rect.width() - HEADER_W - RIGHT_PAD).max(1.0),
             top: rect.top(),
-            duration: duration.max(1),
+            start,
+            span: span.max(1),
         }
     }
+    fn right(&self) -> f32 {
+        self.left + self.width
+    }
     fn x_of(&self, time: i64) -> f32 {
-        self.left + time as f32 / self.duration as f32 * self.width
+        self.left + (time - self.start) as f32 / self.span as f32 * self.width
     }
     fn time_at(&self, x: f32) -> i64 {
-        (((x - self.left) / self.width) * self.duration as f32)
+        (self.start as f32 + (x - self.left) / self.width * self.span as f32)
             .round()
             .max(0.0) as i64
+    }
+    /// Multiples of `step` that fall inside (or just around) the window.
+    fn ticks(&self, step: i64) -> impl Iterator<Item = i64> {
+        let step = step.max(1);
+        let first = self.start / step;
+        let last = (self.start + self.span) / step + 1;
+        (first..=last).map(move |n| n * step)
+    }
+}
+
+/// Horizontal zoom of the Advanced timeline. `zoom == 1` fits everything
+/// (the default); Ctrl+wheel zooms around the pointer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineZoom {
+    zoom: f32,
+    start: i64,
+}
+impl Default for TimelineZoom {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            start: 0,
+        }
+    }
+}
+impl TimelineZoom {
+    /// Closest useful view: ~0.4 s across the whole lane width.
+    const MIN_SPAN_MS: f32 = 400.0;
+
+    fn span(&self, duration: i64) -> i64 {
+        (duration as f32 / self.zoom).round().max(1.0) as i64
+    }
+    fn clamp(&mut self, duration: i64) {
+        let max_zoom = (duration as f32 / Self::MIN_SPAN_MS).max(1.0);
+        self.zoom = self.zoom.clamp(1.0, max_zoom);
+        self.start = self.start.clamp(0, (duration - self.span(duration)).max(0));
+    }
+    /// Zooms by `factor`, keeping `anchor` at the same fraction of the width.
+    fn zoom_at(&mut self, factor: f32, anchor: i64, fraction: f32, duration: i64) {
+        self.zoom *= factor;
+        self.clamp(duration);
+        self.start = anchor - (fraction * self.span(duration) as f32).round() as i64;
+        self.clamp(duration);
+    }
+    fn pan(&mut self, delta_ms: i64, duration: i64) {
+        self.start += delta_ms;
+        self.clamp(duration);
+    }
+    /// Pages the view so a moving playhead never runs off-screen.
+    fn follow(&mut self, playhead: i64, duration: i64) {
+        let span = self.span(duration);
+        if playhead < self.start || playhead > self.start + span {
+            self.start = playhead - span / 10;
+            self.clamp(duration);
+        }
     }
 }
 
@@ -137,7 +203,7 @@ fn placement(
     let mut start = (lanes.time_at(pos.x) - grab).max(0);
     let mut snap = None;
     if !ctx.input(|i| i.modifiers.shift) {
-        let threshold = (12.0 / lanes.width * lanes.duration as f32).ceil() as i64;
+        let threshold = (12.0 / lanes.width * lanes.span as f32).ceil() as i64;
         let mut candidates = vec![
             (0, 0),
             (p.playhead_ms, p.playhead_ms),
@@ -276,7 +342,10 @@ fn paint_clip(painter: &egui::Painter, block: egui::Rect, look: &ClipLook) {
     );
 
     let clip = painter.with_clip_rect(block.intersect(painter.clip_rect()));
+    // Content sticks to the visible part of a clip scrolled half off-screen.
+    let visible_left = block.left().max(painter.clip_rect().left());
     let mut body = block.shrink2(egui::vec2(8.0, 5.0));
+    body.min.x = visible_left + 8.0;
     if let Some(muted) = look.linked_audio {
         let strip = egui::Rect::from_min_max(
             egui::pos2(block.left() + 1.0, block.bottom() - 11.0),
@@ -307,7 +376,7 @@ fn paint_clip(painter: &egui::Painter, block: egui::Rect, look: &ClipLook) {
     if let Some(texture) = look.thumb.filter(|_| block.width() > 120.0) {
         let h = body.height() + 4.0;
         let thumb = egui::Rect::from_min_size(
-            egui::pos2(block.left() + 4.0, body.center().y - h * 0.5),
+            egui::pos2(visible_left + 4.0, body.center().y - h * 0.5),
             egui::vec2(h * 16.0 / 9.0, h),
         );
         clip.image(
@@ -931,14 +1000,49 @@ impl ClipperApp {
             egui::vec2(ui.available_width(), RULER_HEIGHT),
             egui::Sense::hover(),
         );
-        let ruler_lanes = Lanes::new(ruler_rect, duration);
-        let step = ruler_step(duration, ruler_lanes.width);
-
         let footer_h = 26.0;
         // Exact budget: scroll + spacing + footer must not exceed what the
         // panel offers, or the resizable panel grows a little every frame.
         let height =
             (ui.available_height() - footer_h - ui.spacing().item_spacing.y).max(LANE_HEIGHT);
+
+        // ── Zoom / pan ── Ctrl+wheel zooms around the pointer; Shift+wheel or
+        // a sideways swipe pans. The view lives in egui memory: it is a
+        // viewing preference, not part of the edit.
+        let view_id = ui.id().with("timeline_zoom");
+        let mut view: TimelineZoom = ui.data(|d| d.get_temp(view_id)).unwrap_or_default();
+        view.clamp(duration);
+        let current = Lanes::window(ruler_rect, view.start, view.span(duration));
+        let timeline_area = egui::Rect::from_min_max(
+            egui::pos2(current.left, ruler_rect.top()),
+            egui::pos2(ruler_rect.right(), ruler_rect.bottom() + height),
+        );
+        if let Some(pointer) = ui
+            .ctx()
+            .pointer_hover_pos()
+            .filter(|pos| timeline_area.contains(*pos))
+        {
+            let (zoom, pan) = ui.input_mut(|i| {
+                let pan = i.smooth_scroll_delta.x;
+                i.smooth_scroll_delta.x = 0.0;
+                (i.zoom_delta(), pan)
+            });
+            if (zoom - 1.0).abs() > f32::EPSILON {
+                let fraction = ((pointer.x - current.left) / current.width).clamp(0.0, 1.0);
+                view.zoom_at(zoom, current.time_at(pointer.x), fraction, duration);
+            }
+            if pan != 0.0 {
+                let ms = -pan / current.width * view.span(duration) as f32;
+                view.pan(ms.round() as i64, duration);
+            }
+        }
+        if self.live.playing {
+            view.follow(playhead, duration);
+        }
+        ui.data_mut(|d| d.insert_temp(view_id, view));
+        let span = view.span(duration);
+        let ruler_lanes = Lanes::window(ruler_rect, view.start, span);
+        let step = ruler_step(span, ruler_lanes.width);
         let lane_bg = theme::BG_PANEL;
         let empty_bg = theme::BG_HEADER;
         let header_bg = Color32::from_rgb(23, 24, 29);
@@ -956,9 +1060,13 @@ impl ClipperApp {
                     egui::vec2(ui.available_width(), total_h),
                     egui::Sense::hover(),
                 );
-                let lanes = Lanes::new(rect, duration);
+                let lanes = Lanes::window(rect, view.start, span);
                 let left = lanes.left;
                 let painter = ui.painter_at(rect);
+                // Everything time-positioned is clipped to the lane area so
+                // zoomed clips never slide under the track headers.
+                let lane_area = egui::Rect::from_min_max(egui::pos2(left, rect.top()), rect.max);
+                let lane_painter = painter.with_clip_rect(lane_area.intersect(painter.clip_rect()));
                 painter.rect_filled(rect, 0.0, empty_bg);
                 painter.rect_filled(
                     egui::Rect::from_min_max(rect.min, egui::pos2(left, rect.bottom())),
@@ -1012,9 +1120,9 @@ impl ClipperApp {
                     );
                     let lane = egui::Rect::from_min_max(egui::pos2(left, top), row.max);
                     painter.rect_filled(lane, 0.0, lane_bg);
-                    for n in 0..=duration / step {
-                        let x = lanes.x_of(n * step);
-                        painter.line_segment(
+                    for t in lanes.ticks(step) {
+                        let x = lanes.x_of(t);
+                        lane_painter.line_segment(
                             [egui::pos2(x, top), egui::pos2(x, top + lane_h)],
                             Stroke::new(1.0_f32, theme::BORDER_SUBTLE),
                         );
@@ -1160,8 +1268,12 @@ impl ClipperApp {
                             egui::pos2(x0, top + CLIP_INSET),
                             egui::pos2(x1.max(x0 + 4.0), top + lane_h - CLIP_INSET),
                         );
+                        let hit = block.intersect(lane_area);
+                        if !hit.is_positive() {
+                            continue;
+                        }
                         paint_clip(
-                            &painter,
+                            &lane_painter,
                             block,
                             &ClipLook {
                                 label: labels.get(&c.id).map(String::as_str).unwrap_or("Clip"),
@@ -1179,7 +1291,7 @@ impl ClipperApp {
                         );
                         let response = ui
                             .interact(
-                                block,
+                                hit,
                                 ui.id().with(("timeline_clip", c.id)),
                                 egui::Sense::click_and_drag(),
                             )
@@ -1236,7 +1348,7 @@ impl ClipperApp {
                     // Edit points on top of both neighbours.
                     for pair in row_clips.windows(2).filter(|w| joined(w[0], w[1])) {
                         paint_seam(
-                            &painter,
+                            &lane_painter,
                             lanes.x_of(pair[1].cut_start_ms),
                             top + CLIP_INSET,
                             top + lane_h - CLIP_INSET,
@@ -1320,7 +1432,7 @@ impl ClipperApp {
                             EditorDrag::Track(_) => (None, None, place.label.clone()),
                         };
                         paint_clip(
-                            &painter,
+                            &lane_painter,
                             ghost,
                             &ClipLook {
                                 label: &label,
@@ -1338,7 +1450,7 @@ impl ClipperApp {
                         );
                         if let Some(time) = place.snap {
                             let x = lanes.x_of(time);
-                            painter.line_segment(
+                            lane_painter.line_segment(
                                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                                 Stroke::new(1.0_f32, theme::ACCENT),
                             );
@@ -1372,38 +1484,34 @@ impl ClipperApp {
                 }
 
                 // ── Playhead line (grabbable a few px either side) ──
-                let x = lanes.x_of(playhead).clamp(left, rect.right());
                 let viewport = ui.clip_rect().intersect(rect);
-                let line_hit = egui::Rect::from_min_max(
-                    egui::pos2(x - 5.0, viewport.top()),
-                    egui::pos2(x + 5.0, viewport.bottom()),
-                );
-                let line =
-                    ui.interact(line_hit, ui.id().with("playhead_line"), egui::Sense::drag());
-                if line.hovered() || line.dragged() {
-                    ui.ctx().set_cursor_icon(if line.dragged() {
-                        egui::CursorIcon::Grabbing
-                    } else {
-                        egui::CursorIcon::Grab
-                    });
-                }
-                if line.dragged() {
-                    seek = line
-                        .interact_pointer_pos()
-                        .map(|pos| lanes.time_at(pos.x).min(duration));
-                    scrubbing = true;
-                }
-                painter.line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    Stroke::new(
-                        if line.hovered() || line.dragged() {
-                            2.0_f32
+                let x = lanes.x_of(playhead);
+                if (left..=lanes.right() + 1.0).contains(&x) {
+                    let line_hit = egui::Rect::from_min_max(
+                        egui::pos2(x - 5.0, viewport.top()),
+                        egui::pos2(x + 5.0, viewport.bottom()),
+                    );
+                    let line =
+                        ui.interact(line_hit, ui.id().with("playhead_line"), egui::Sense::drag());
+                    let hot = line.hovered() || line.dragged();
+                    if hot {
+                        ui.ctx().set_cursor_icon(if line.dragged() {
+                            egui::CursorIcon::Grabbing
                         } else {
-                            1.5
-                        },
-                        theme::PLAYHEAD,
-                    ),
-                );
+                            egui::CursorIcon::Grab
+                        });
+                    }
+                    if line.dragged() {
+                        seek = line
+                            .interact_pointer_pos()
+                            .map(|pos| lanes.time_at(pos.x).min(duration));
+                        scrubbing = true;
+                    }
+                    lane_painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        Stroke::new(if hot { 2.0_f32 } else { 1.5 }, theme::PLAYHEAD),
+                    );
+                }
                 viewport
             });
 
@@ -1435,12 +1543,18 @@ impl ClipperApp {
             [header.right_top(), header.right_bottom()],
             Stroke::new(1.0_f32, theme::BORDER),
         );
+        let ticks = painter.with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(ruler_lanes.left, ruler_rect.top()),
+            ruler_rect.max,
+        ));
         let minor = (step / 5).max(1);
-        for n in 0..=duration / minor {
-            let t = n * minor;
+        for t in ruler_lanes
+            .ticks(minor)
+            .filter(|t| (0..=duration).contains(t))
+        {
             let x = ruler_lanes.x_of(t);
             let major = t % step == 0;
-            painter.line_segment(
+            ticks.line_segment(
                 [
                     egui::pos2(x, ruler_rect.bottom() - if major { 9.0 } else { 4.0 }),
                     egui::pos2(x, ruler_rect.bottom()),
@@ -1455,7 +1569,7 @@ impl ClipperApp {
                 ),
             );
             if major {
-                painter.text(
+                ticks.text(
                     egui::pos2(x + 4.0, ruler_rect.top() + 10.0),
                     Align2::LEFT_CENTER,
                     ruler_label(t, step),
@@ -1474,12 +1588,16 @@ impl ClipperApp {
             ui.id().with("timeline_ruler"),
             egui::Sense::click_and_drag(),
         );
-        let ph_x = ruler_lanes
-            .x_of(playhead)
-            .clamp(ruler_lanes.left, ruler_rect.right());
+        let in_view = |x: f32| (ruler_lanes.left - 1.0..=ruler_lanes.right() + 1.0).contains(&x);
+        let ph_x = ruler_lanes.x_of(playhead);
+        // Off-screen (zoomed away) the head has no hit area at all.
         let head_hit = egui::Rect::from_center_size(
             egui::pos2(ph_x, ruler_rect.center().y),
-            egui::vec2(28.0, RULER_HEIGHT + 8.0),
+            if in_view(ph_x) {
+                egui::vec2(28.0, RULER_HEIGHT + 8.0)
+            } else {
+                egui::Vec2::ZERO
+            },
         );
         let head = ui.interact(head_hit, ui.id().with("playhead_head"), egui::Sense::drag());
         let dragging_head = head.dragged() || ruler.dragged() || scrubbing;
@@ -1499,9 +1617,12 @@ impl ClipperApp {
             }
         }
         let shown = seek.unwrap_or(playhead);
-        let ph_x = ruler_lanes
-            .x_of(shown)
-            .clamp(ruler_lanes.left, ruler_rect.right());
+        if scrubbing && seek.is_some() {
+            // Scrubbing past either edge of a zoomed view drags it along.
+            view.follow(shown, duration);
+            ui.data_mut(|d| d.insert_temp(view_id, view));
+        }
+        let ph_x = ruler_lanes.x_of(shown);
         // Live readout in the header cell — the time stays visible however
         // far the lanes are scrolled.
         painter.text(
@@ -1515,21 +1636,23 @@ impl ClipperApp {
                 theme::TEXT_SECONDARY
             },
         );
-        ui.painter_at(ruler_rect.expand2(egui::vec2(0.0, 1.0)))
-            .line_segment(
-                [
-                    egui::pos2(ph_x, ruler_rect.bottom() - 6.0),
-                    egui::pos2(ph_x, ruler_rect.bottom() + 1.0),
-                ],
-                Stroke::new(1.5_f32, theme::PLAYHEAD),
+        if in_view(ph_x) {
+            ui.painter_at(ruler_rect.expand2(egui::vec2(0.0, 1.0)))
+                .line_segment(
+                    [
+                        egui::pos2(ph_x, ruler_rect.bottom() - 6.0),
+                        egui::pos2(ph_x, ruler_rect.bottom() + 1.0),
+                    ],
+                    Stroke::new(1.5_f32, theme::PLAYHEAD),
+                );
+            paint_playhead_head(
+                &ui.painter_at(ruler_rect.expand2(egui::vec2(10.0, 0.0))),
+                ph_x,
+                ruler_rect.top() + 3.0,
+                ruler_rect.bottom() - 1.0,
+                head.hovered() || dragging_head,
             );
-        paint_playhead_head(
-            &ui.painter_at(ruler_rect.expand2(egui::vec2(10.0, 0.0))),
-            ph_x,
-            ruler_rect.top() + 3.0,
-            ruler_rect.bottom() - 1.0,
-            head.hovered() || dragging_head,
-        );
+        }
         self.user_dragging_seek = scrubbing;
 
         if clear {
@@ -1604,14 +1727,18 @@ impl ClipperApp {
                 p.prune_tracks();
             }
         }
-        self.show_shortcut_footer(ui, footer_h);
+        if self.show_shortcut_footer(ui, footer_h, view.zoom) {
+            ui.data_mut(|d| d.insert_temp(view_id, TimelineZoom::default()));
+            ui.ctx().request_repaint();
+        }
         // The panel remembers the height its content used; claiming the
         // whole rect keeps a short frame from shrinking it for good.
         ui.expand_to_include_rect(ui.max_rect());
     }
 
-    /// Key-cap legend under the timeline.
-    fn show_shortcut_footer(&self, ui: &mut egui::Ui, height: f32) {
+    /// Key-cap legend under the timeline, plus the zoom readout. Returns
+    /// true when "Fit" was clicked.
+    fn show_shortcut_footer(&self, ui: &mut egui::Ui, height: f32, zoom: f32) -> bool {
         let (footer, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
@@ -1625,6 +1752,7 @@ impl ClipperApp {
             ("D", "Detach"),
             ("Shift D", "Attach"),
             ("Ctrl Z", "Undo"),
+            ("Ctrl Scroll", "Zoom"),
         ] {
             let key_text =
                 painter.layout_no_wrap(key.into(), theme::mono(10.0), theme::TEXT_SECONDARY);
@@ -1663,6 +1791,50 @@ impl ClipperApp {
             );
             x = key_rect.right() + 6.0 + label_w + 18.0;
         }
+        if zoom <= 1.001 {
+            return false;
+        }
+        // Zoomed in: show the factor and a one-click way back to Fit.
+        let fit = egui::Rect::from_min_size(
+            egui::pos2(footer.right() - 46.0, footer.center().y - 10.0),
+            egui::vec2(46.0, 20.0),
+        );
+        let response = ui
+            .interact(
+                fit,
+                ui.id().with("timeline_fit"),
+                egui::Sense {
+                    click: true,
+                    drag: false,
+                    focusable: false,
+                },
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Show the whole timeline");
+        painter.rect_filled(
+            fit,
+            5.0,
+            if response.hovered() {
+                theme::BG_BUTTON_HOVER
+            } else {
+                theme::BG_BUTTON
+            },
+        );
+        painter.text(
+            fit.center(),
+            Align2::CENTER_CENTER,
+            "Fit",
+            theme::medium(11.5),
+            theme::TEXT_PRIMARY,
+        );
+        painter.text(
+            fit.left_center() - egui::vec2(10.0, 0.0),
+            Align2::RIGHT_CENTER,
+            format!("{:.1}×", zoom),
+            theme::mono(10.5),
+            theme::TEXT_MUTED,
+        );
+        response.clicked()
     }
 }
 
@@ -1739,6 +1911,38 @@ mod interaction_tests {
         .unwrap();
         assert_eq!((above.slot, above.target), (0, None));
         assert_eq!((below.slot, below.target), (1, None));
+    }
+    #[test]
+    fn zoom_keeps_the_time_under_the_pointer_and_stays_in_bounds() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1138.0, 100.0));
+        let duration = 20_000;
+        let mut view = TimelineZoom::default();
+        let fit = Lanes::window(rect, view.start, view.span(duration));
+        let pointer = fit.left + fit.width * 0.25;
+        let before = fit.time_at(pointer);
+        view.zoom_at(4.0, before, 0.25, duration);
+        let zoomed = Lanes::window(rect, view.start, view.span(duration));
+        assert_eq!(view.span(duration), 5_000);
+        assert!((zoomed.time_at(pointer) - before).abs() <= 5);
+        // Zooming out past Fit snaps back to the whole timeline.
+        view.zoom_at(0.01, 0, 0.0, duration);
+        assert_eq!((view.zoom, view.start), (1.0, 0));
+        // Panning never leaves the timeline.
+        view.zoom_at(10.0, 19_000, 1.0, duration);
+        view.pan(60_000, duration);
+        assert_eq!(view.start + view.span(duration), duration);
+        view.pan(-60_000, duration);
+        assert_eq!(view.start, 0);
+    }
+    #[test]
+    fn playback_pages_a_zoomed_view_to_keep_the_playhead_visible() {
+        let duration = 60_000;
+        let mut view = TimelineZoom {
+            zoom: 6.0,
+            start: 0,
+        };
+        view.follow(15_000, duration);
+        assert!(view.start <= 15_000 && 15_000 <= view.start + view.span(duration));
     }
     #[test]
     fn ruler_ticks_never_repeat_whole_second_labels() {

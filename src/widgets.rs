@@ -11,6 +11,15 @@ use egui::{
 };
 use std::f32::consts::FRAC_PI_4;
 
+/// Click sense that never takes keyboard focus. Painted controls use it so
+/// pressing one (play, split, a menu row) leaves Space/S/arrow shortcuts
+/// working instead of routing keys to the button.
+pub const CLICK: Sense = Sense {
+    click: true,
+    drag: false,
+    focusable: false,
+};
+
 /// Vector icons. Each is drawn inside a square and scales with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
@@ -19,6 +28,8 @@ pub enum Icon {
     SkipStart,
     Speaker,
     SpeakerMuted,
+    ChevronDown,
+    Check,
 }
 
 /// Points along a circular arc, for the speaker's sound waves.
@@ -107,13 +118,34 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 painter.line_segment([x + vec2(-r, r), x + vec2(r, -r)], stroke);
             }
         }
+        Icon::ChevronDown => {
+            let r = s * 0.22;
+            painter.add(Shape::line(
+                vec![
+                    pos2(c.x - r, c.y - r * 0.45),
+                    pos2(c.x, c.y + r * 0.55),
+                    pos2(c.x + r, c.y - r * 0.45),
+                ],
+                PathStroke::new(stroke.width, color),
+            ));
+        }
+        Icon::Check => {
+            painter.add(Shape::line(
+                vec![
+                    pos2(c.x - s * 0.28, c.y + s * 0.02),
+                    pos2(c.x - s * 0.08, c.y + s * 0.22),
+                    pos2(c.x + s * 0.3, c.y - s * 0.2),
+                ],
+                PathStroke::new(stroke.width, color),
+            ));
+        }
     }
 }
 
 /// Square icon button: transparent at rest, soft fill on hover. `on`
 /// tints the icon with `on_color` (e.g. a muted track).
 pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, on: bool, on_color: Color32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), CLICK);
     paint_icon_button(ui, rect, &response, icon, on, on_color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -151,7 +183,7 @@ pub fn paint_icon_button(
 
 /// The circular transport button: filled, the one strong shape in the bar.
 pub fn play_button(ui: &mut Ui, playing: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), CLICK);
     let fill = if response.is_pointer_button_down_on() {
         Color32::from_rgb(205, 210, 220)
     } else if response.hovered() {
@@ -169,7 +201,7 @@ pub fn play_button(ui: &mut Ui, playing: bool) -> Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-// ── Top-bar drop-down menus ─────────────────────────────────────────────
+// ── Drop-down panels ────────────────────────────────────────────────────
 
 /// Which top-bar menu is open, shared so hovering a neighbour while one is
 /// open slides straight across like a native menu bar.
@@ -182,9 +214,111 @@ fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
-/// A menu-bar button whose popup grows down out of the button itself: the
-/// open button and the panel share one fill, and the panel unrolls from
-/// the button's lower edge instead of appearing as a detached box.
+/// Open/close progress of the panel owned by `id`, eased (0 closed, 1 open).
+pub fn reveal(ctx: &egui::Context, id: Id, open: bool) -> f32 {
+    ease_out(ctx.animate_bool_with_time(id.with("reveal"), open, 0.16))
+}
+
+/// Fill and rounding for a button that owns a drop panel. While the panel
+/// is out, the button takes the panel's colour and loses its lower
+/// corners, so button and panel read as one surface.
+pub fn trigger_style(reveal: f32, hovered: bool, rest: Color32) -> (Color32, Rounding) {
+    let rounding = Rounding {
+        nw: 6.0,
+        ne: 6.0,
+        sw: 6.0 * (1.0 - reveal),
+        se: 6.0 * (1.0 - reveal),
+    };
+    let fill = if reveal > 0.0 {
+        lerp_color(theme::BG_BUTTON_HOVER, theme::BG_MODAL, reveal)
+    } else if hovered {
+        theme::BG_BUTTON_HOVER
+    } else {
+        rest
+    };
+    (fill, rounding)
+}
+
+/// Shows the panel that unrolls from under `trigger` while `reveal > 0`.
+/// The panel aligns to the trigger's left edge, or to its right edge when
+/// it would run off-screen; the corner touching the trigger stays square.
+///
+/// `add_contents` returns `true` when a choice was made. The function
+/// returns `true` when the panel should close: a choice, a click outside
+/// both panel and trigger, or Escape.
+pub fn drop_panel(
+    ctx: &egui::Context,
+    id: Id,
+    trigger: Rect,
+    open: bool,
+    reveal: f32,
+    width: f32,
+    add_contents: impl FnOnce(&mut Ui) -> bool,
+) -> bool {
+    if reveal <= 0.0 {
+        return false;
+    }
+    let width = width.max(trigger.width());
+    let height_id = id.with("height");
+    let full_height = ctx.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(120.0);
+    let flip = trigger.left() + width > ctx.screen_rect().right() - 8.0;
+    let top = if flip {
+        pos2(trigger.right() - width, trigger.bottom())
+    } else {
+        trigger.left_bottom()
+    };
+    let mut chosen = false;
+    let area = egui::Area::new(id.with("panel"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(top)
+        .constrain(false)
+        .interactable(open)
+        .show(ctx, |ui| {
+            // Unroll from the trigger edge: the clip grows downward while
+            // the content fades in.
+            ui.set_clip_rect(Rect::from_min_max(
+                top - vec2(40.0, 0.0),
+                pos2(
+                    top.x + width + 40.0,
+                    top.y + full_height * reveal + 40.0 * reveal,
+                ),
+            ));
+            ui.multiply_opacity(0.35 + 0.65 * reveal);
+            let corner = |square: bool| if square { 0.0 } else { 8.0 };
+            let frame = egui::Frame::none()
+                .fill(theme::BG_MODAL)
+                .rounding(Rounding {
+                    nw: corner(!flip),
+                    ne: corner(flip),
+                    sw: 8.0,
+                    se: 8.0,
+                })
+                .shadow(ui.visuals().popup_shadow)
+                .inner_margin(egui::Margin::same(6.0));
+            let inner = frame.show(ui, |ui| {
+                ui.set_width(width - 12.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                add_contents(ui)
+            });
+            chosen = inner.inner;
+            inner.response.rect
+        });
+    let panel = area.inner;
+    if (panel.height() - full_height).abs() > 0.5 {
+        ctx.data_mut(|d| d.insert_temp(height_id, panel.height()));
+        ctx.request_repaint();
+    }
+    let clicked_elsewhere = ctx.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| !panel.contains(p) && !trigger.contains(p))
+    });
+    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    open && (chosen || clicked_elsewhere || escape)
+}
+
+/// A menu-bar button whose panel unrolls out of the button itself.
 ///
 /// `add_contents` returns `true` when an item was chosen (closes the menu).
 pub fn menu_bar_button(
@@ -195,12 +329,11 @@ pub fn menu_bar_button(
 ) {
     let id = ui.id().with(("menu_bar", label));
     let ctx = ui.ctx().clone();
-    let font = theme::medium(12.5);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font, theme::TEXT_PRIMARY);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::medium(12.5), theme::TEXT_PRIMARY);
     let size = vec2(galley.size().x + 22.0, 28.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, response) = ui.allocate_exact_size(size, CLICK);
     let open_now = ctx.data(|d| d.get_temp::<Id>(open_menu_id())) == Some(id);
 
     let mut open = open_now;
@@ -209,9 +342,7 @@ pub fn menu_bar_button(
     } else if response.hovered() && !open_now {
         // Menu-bar convention: once any menu is open, hovering a sibling
         // switches to it.
-        if ctx.data(|d| d.get_temp::<Id>(open_menu_id())).is_some() {
-            open = true;
-        }
+        open = ctx.data(|d| d.get_temp::<Id>(open_menu_id())).is_some();
     }
     if open != open_now {
         ctx.data_mut(|d| {
@@ -223,22 +354,9 @@ pub fn menu_bar_button(
         });
     }
 
-    let t = ctx.animate_bool_with_time(id.with("reveal"), open, 0.16);
-    let eased = ease_out(t);
-    let joined = Rounding {
-        nw: 6.0,
-        ne: 6.0,
-        sw: 6.0 * (1.0 - eased),
-        se: 6.0 * (1.0 - eased),
-    };
-    let fill = if t > 0.0 {
-        lerp_color(theme::BG_BUTTON_HOVER, theme::BG_MODAL, eased)
-    } else if response.hovered() {
-        theme::BG_BUTTON_HOVER
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, joined, fill);
+    let t = reveal(&ctx, id, open);
+    let (fill, rounding) = trigger_style(t, response.hovered(), Color32::TRANSPARENT);
+    ui.painter().rect_filled(rect, rounding, fill);
     ui.painter().galley(
         rect.center() - galley.size() * 0.5,
         galley,
@@ -248,64 +366,63 @@ pub fn menu_bar_button(
             theme::TEXT_SECONDARY
         },
     );
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-    if t <= 0.0 {
-        return;
-    }
-    let height_id = id.with("height");
-    let full_height = ctx.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(120.0);
-    let top = rect.left_bottom();
-    let mut chosen = false;
-    let area = egui::Area::new(id.with("popup"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(top)
-        .constrain(false)
-        .interactable(open)
-        .show(&ctx, |ui| {
-            // Unroll from the button edge: the clip grows downward while
-            // the content fades in, so the panel reads as one surface
-            // sliding out of the button.
-            let reveal = full_height * eased;
-            ui.set_clip_rect(Rect::from_min_max(
-                top - vec2(40.0, 0.0),
-                pos2(top.x + 600.0, top.y + reveal + 40.0 * eased),
-            ));
-            ui.multiply_opacity(0.35 + 0.65 * eased);
-            let frame = egui::Frame::none()
-                .fill(theme::BG_MODAL)
-                .rounding(Rounding {
-                    nw: 0.0,
-                    ne: 8.0,
-                    sw: 8.0,
-                    se: 8.0,
-                })
-                .shadow(ui.visuals().popup_shadow)
-                .inner_margin(egui::Margin::same(5.0));
-            let inner = frame.show(ui, |ui| {
-                ui.set_width(min_popup_width.max(rect.width()));
-                ui.spacing_mut().item_spacing.y = 1.0;
-                add_contents(ui)
-            });
-            chosen = inner.inner;
-            inner.response.rect
-        });
-    let popup_rect = area.inner;
-    if (popup_rect.height() - full_height).abs() > 0.5 {
-        ctx.data_mut(|d| d.insert_temp(height_id, popup_rect.height()));
-        ctx.request_repaint();
-    }
-    let clicked_elsewhere = ctx.input(|i| {
-        i.pointer.any_pressed()
-            && i.pointer
-                .interact_pos()
-                .is_some_and(|p| !popup_rect.contains(p) && !response.rect.contains(p))
-    });
-    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-    if open && (chosen || clicked_elsewhere || escape) {
+    if drop_panel(&ctx, id, rect, open, t, min_popup_width, add_contents) {
         ctx.data_mut(|d| d.remove::<Id>(open_menu_id()));
         ctx.request_repaint();
     }
+}
+
+/// Toolbar button that owns a drop panel. `paint_face` draws the button's
+/// content (label, swatch…) into the given rect in the given text colour.
+/// Returns the trigger response; `open` is toggled on click and cleared
+/// when the panel closes.
+#[allow(clippy::too_many_arguments)]
+pub fn dropdown_button(
+    ui: &mut Ui,
+    id_salt: &str,
+    open: &mut bool,
+    size: egui::Vec2,
+    panel_width: f32,
+    paint_face: impl FnOnce(&egui::Painter, Rect, Color32),
+    add_contents: impl FnOnce(&mut Ui) -> bool,
+) -> Response {
+    let id = ui.id().with(("dropdown", id_salt));
+    let (rect, response) = ui.allocate_exact_size(size, CLICK);
+    if response.clicked() {
+        *open = !*open;
+    }
+    let t = reveal(ui.ctx(), id, *open);
+    let (fill, rounding) = trigger_style(t, response.hovered(), theme::BG_BUTTON);
+    ui.painter().rect_filled(rect, rounding, fill);
+    if t <= 0.0 {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            rounding,
+            Stroke::new(1.0_f32, Color32::from_rgb(46, 50, 59)),
+        );
+    }
+    let text = if *open || response.hovered() {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::TEXT_SECONDARY
+    };
+    let chevron = Rect::from_center_size(rect.right_center() - vec2(14.0, 0.0), vec2(14.0, 14.0));
+    paint_icon(ui.painter(), chevron, Icon::ChevronDown, theme::TEXT_MUTED);
+    paint_face(
+        ui.painter(),
+        Rect::from_min_max(
+            rect.min + vec2(10.0, 0.0),
+            pos2(chevron.left() - 4.0, rect.bottom()),
+        ),
+        text,
+    );
+    if drop_panel(ui.ctx(), id, rect, *open, t, panel_width, add_contents) {
+        *open = false;
+        ui.ctx().request_repaint();
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -322,7 +439,7 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 /// right, full-width hover highlight.
 pub fn menu_item(ui: &mut Ui, label: &str, shortcut: Option<&str>) -> Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), CLICK);
     if response.hovered() {
         ui.painter().rect_filled(rect, 5.0, theme::BG_BUTTON_HOVER);
     }
@@ -342,6 +459,36 @@ pub fn menu_item(ui: &mut Ui, label: &str, shortcut: Option<&str>) -> Response {
             theme::TEXT_MUTED,
         );
     }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A drop-down row for picking one of several values; the current one
+/// carries a check mark.
+pub fn menu_choice(ui: &mut Ui, label: &str, selected: bool) -> Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), CLICK);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 5.0, theme::BG_BUTTON_HOVER);
+    }
+    if selected {
+        paint_icon(
+            ui.painter(),
+            Rect::from_center_size(rect.left_center() + vec2(15.0, 0.0), vec2(14.0, 14.0)),
+            Icon::Check,
+            theme::ACCENT,
+        );
+    }
+    ui.painter().text(
+        rect.left_center() + vec2(30.0, 0.0),
+        Align2::LEFT_CENTER,
+        label,
+        theme::medium(12.5),
+        if selected {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_SECONDARY
+        },
+    );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -423,9 +570,13 @@ pub fn segmented(
             vec2(*width, outer.height() - pad * 2.0),
         );
         let response = ui
-            .interact(rect, anim_id.with(i), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(*tip);
+            .interact(rect, anim_id.with(i), CLICK)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let response = if tip.is_empty() {
+            response
+        } else {
+            response.on_hover_text(*tip)
+        };
         let color = if i == target {
             theme::TEXT_PRIMARY
         } else if response.hovered() {

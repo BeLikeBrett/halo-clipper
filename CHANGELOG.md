@@ -10,6 +10,15 @@
 - Canvas: magnetic snapping to canvas and layer edges with guides (Alt to
   bypass); Reset frame fits with bars when the canvas shape differs (9:16).
 - Transport: go-to-start button, Home/End shortcuts.
+- Advanced timeline: Ctrl+scroll zooms around the pointer (fit-to-width stays
+  the default); footer shows the zoom factor and a Fit button.
+- Canvas toolbar: aspect and Background are drop-downs; a compact color
+  picker (square, hue strip, presets, hex) replaces the floating window.
+- Palette: soft-white playhead, teal audio clips, blue snap guides.
+- Keyboard shortcuts keep working after clicking Play, Split or any button.
+- Windows: multi-size icon and version info embedded in the exe (crisp in
+  the title bar, taskbar, Start menu and Apps list); installer and
+  uninstaller use the app icon.
 
 ## 0.8.0
 

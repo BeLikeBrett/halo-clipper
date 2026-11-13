@@ -1122,24 +1122,37 @@ impl ClipperApp {
                 // V/A pairs in sync — otherwise the unsplit partners
                 // still share the old LinkId and a later Delete would
                 // cascade across all of them.
-                let target_ids: Vec<ClipId> = if p.selected_clips.is_empty() {
+                //
+                // Only selected pieces that actually span the playhead are
+                // cut; when none do (the selection is the left half of the
+                // previous cut), fall back to whatever sits under the
+                // playhead. Afterwards the selection moves to the right-hand
+                // pieces, so play → S → S → S keeps cutting from the keyboard.
+                let under_playhead = |c: &Clip| c.contains_cut(p.playhead_ms);
+                let selected: Vec<ClipId> = p
+                    .selected_clips
+                    .iter()
+                    .flat_map(|id| p.edit_ids(*id))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .filter(|id| track::clip_by_id(&p.clips, *id).is_some_and(under_playhead))
+                    .collect();
+                let target_ids: Vec<ClipId> = if selected.is_empty() {
                     p.clips
                         .iter()
-                        .filter(|c| c.contains_cut(p.playhead_ms))
+                        .filter(|c| under_playhead(c))
                         .map(|c| c.id)
                         .collect()
                 } else {
-                    p.selected_clips
-                        .iter()
-                        .flat_map(|id| p.edit_ids(*id))
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect()
+                    selected
                 };
+                let had_selection = !p.selected_clips.is_empty();
                 let groups_before = p.groups.len();
                 let new_ids = p.split_segments(&target_ids, p.playhead_ms);
                 if new_ids.is_empty() && p.groups.len() == groups_before {
                     self.undo_stack.pop();
+                } else if had_selection && !new_ids.is_empty() {
+                    p.selected_clips = new_ids.into_iter().collect();
                 }
             }
             ClipAction::DeleteSelected => {
@@ -1962,6 +1975,7 @@ impl eframe::App for ClipperApp {
         }
 
         self.was_dragging_seek = self.user_dragging_seek;
+        release_mouse_focus(ctx);
     }
 
     /// Final shutdown hook. eframe calls this once the user has closed
@@ -4858,6 +4872,22 @@ fn stat_grid_row(ui: &mut egui::Ui, k1: &str, v1: &str, k2: &str, v2: &str) {
             .color(theme::TEXT_PRIMARY),
     );
     ui.end_row();
+}
+
+/// Buttons clicked with the mouse must not keep keyboard focus: a focused
+/// egui button eats Space/Enter and arrow keys, so pressing Split and then
+/// `S` (or Play and then Space) would stop working until the user clicked
+/// empty space. Text fields keep their focus; Tab navigation still works
+/// because it moves focus without a pointer press.
+fn release_mouse_focus(ctx: &egui::Context) {
+    if !ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released()) {
+        return;
+    }
+    if let Some(id) = ctx.memory(|m| m.focused()) {
+        if egui::TextEdit::load_state(ctx, id).is_none() {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -93,7 +93,7 @@ isolated configuration/cache directories.
 - Abutting clips (splits) are separated by a 2 px gap with splice notches at
   the seam. Selection outlines are drawn inside the clip so they never
   overlap a neighbour.
-- V+A compounds show their attached audio as a green strip along the bottom
+- V+A compounds show their attached audio as a teal strip along the bottom
   of the bar instead of a "· V+A" suffix.
 - Track headers have a monitor (speaker) toggle on audio tracks and on video
   rows that carry attached audio. It mutes the preview only:
@@ -108,6 +108,28 @@ isolated configuration/cache directories.
 - The timeline panel's content claims the full panel height. egui stores a
   resizable panel's height from its content, so any shortfall in the height
   budget made the panel shrink a few pixels every frame.
+- Palette: one blue accent (selection, snap guides, primary buttons), video
+  clips blue, audio clips teal, playhead soft white. No warm hues outside
+  the In/Out marks and errors. The app pins egui to its dark theme so a
+  light-mode OS can't restyle the stock widgets.
+- Advanced timeline zoom: fit-to-width is the default. Ctrl+scroll (or a
+  trackpad pinch) zooms around the pointer down to a 400 ms window;
+  Shift+scroll or a horizontal trackpad swipe pans while zoomed (plain
+  scroll still scrolls the track list). The footer shows the zoom factor
+  and a Fit button. Zoom is view state only (egui temp memory), not project
+  data.
+- Keyboard flow: painted controls use a non-focusable click sense, and any
+  focus a mouse click leaves on a stock egui button is released at the end
+  of the frame (text fields keep theirs). Clicking Play or Split and then
+  pressing S / Space keeps working without clicking empty space first.
+- Split targets the selected clips under the playhead (or every clip under
+  it when nothing selected there) and moves the selection to the right-hand
+  pieces, so repeated S presses during playback keep cutting the same clip.
+- Canvas toolbar: the aspect and Background controls are drop-downs that
+  unroll from their button like the top-bar menus. Background holds a
+  Black / Blur video / Color switch and, for Color, the compact picker in
+  `picker.rs` (saturation/brightness square, hue strip, presets, hex field).
+  One drag in the picker is one undo step.
 
 ## Native rendering
 

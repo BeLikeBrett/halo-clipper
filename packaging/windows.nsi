@@ -16,6 +16,8 @@ InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloC
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 !define MUI_ABORTWARNING
+!define MUI_ICON "..\assets\icon.ico"
+!define MUI_UNICON "..\assets\icon.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -34,11 +36,13 @@ Section "Halo Clipper"
     SetErrorLevel 1
     Abort "Unable to update files. Close Halo Clipper and try again."
   CreateDirectory "$SMPROGRAMS\Halo Clipper"
-  CreateShortcut "$SMPROGRAMS\Halo Clipper\Halo Clipper.lnk" "$INSTDIR\halo-clipper.exe"
-  CreateShortcut "$DESKTOP\Halo Clipper.lnk" "$INSTDIR\halo-clipper.exe"
+  CreateShortcut "$SMPROGRAMS\Halo Clipper\Halo Clipper.lnk" "$INSTDIR\halo-clipper.exe" "" "$INSTDIR\halo-clipper.exe" 0
+  CreateShortcut "$DESKTOP\Halo Clipper.lnk" "$INSTDIR\halo-clipper.exe" "" "$INSTDIR\halo-clipper.exe" 0
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "DisplayName" "Halo Clipper"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "DisplayIcon" "$INSTDIR\halo-clipper.exe,0"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "Publisher" "Halo Clipper"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "NoModify" 1

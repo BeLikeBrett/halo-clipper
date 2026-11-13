@@ -5,6 +5,69 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-13 — Shortcuts stopped after clicking Play or Split
+
+### Symptom
+
+After clicking Play (or Split) with the mouse, pressing S or Space did
+nothing until the user clicked an empty part of the window.
+
+### Root cause
+
+egui buttons take keyboard focus when clicked, and a focused button claims
+Space/Enter/arrow keys. Split also kept the original (left) clip selected,
+so the next S press looked for a selected clip under the playhead and found
+none.
+
+### Fix
+
+Painted controls use a non-focusable click sense (`widgets::CLICK`), and
+`release_mouse_focus` drops focus left on non-text widgets by a mouse press
+at the end of each frame. Split now selects the right-hand pieces.
+
+---
+
+## 2026-11-13 — Windows light mode turned stock widgets light
+
+### Symptom
+
+Under Windows (seen in Wine) labels, the Import button and separators
+rendered in egui's light style on the dark panels: near-black "Media" title,
+white buttons.
+
+### Root cause
+
+egui 0.29 follows the OS theme by default. `set_visuals` only styled the
+active theme, so when the OS reported light mode egui switched to its
+default light style for every stock widget.
+
+### Fix
+
+`theme::apply` pins `Theme::Dark` and sets the dark visuals/style
+explicitly with `set_visuals_of` / `set_style_of`.
+
+---
+
+## 2026-11-13 — Duplicate "Halo Clipper" launcher entry with a gear icon
+
+### Symptom
+
+The app menu listed Halo Clipper twice, one entry with a generic icon.
+
+### Root cause
+
+Testing the Windows installer under Wine let winemenubuilder mirror the
+Start-menu shortcut into ~/.local/share/applications/wine/. Separately, the
+long-running launcher daemon had cached a failed icon lookup.
+
+### Fix
+
+Removed the Wine-generated entries, refreshed the icon cache and restarted
+the launcher daemon. winemenubuilder is disabled in the build prefix
+(`HKCU\Software\Wine\DllOverrides`, `winemenubuilder.exe` = "").
+
+---
+
 ## 2026-11-13 — Advanced: dragged clip stayed visible in its old lane
 
 ### Symptom

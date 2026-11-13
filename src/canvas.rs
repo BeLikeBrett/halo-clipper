@@ -1,5 +1,7 @@
 use super::*;
+use crate::framing::Background;
 use crate::track::Transform;
+use crate::{picker, widgets};
 
 pub(super) fn layer_rect(canvas: egui::Rect, width: u32, height: u32, t: Transform) -> egui::Rect {
     let ratios = (
@@ -21,7 +23,8 @@ pub(super) fn layer_rect(canvas: egui::Rect, width: u32, height: u32, t: Transfo
 }
 pub(super) struct CanvasUi {
     pub(super) background_open: bool,
-    color: egui::ecolor::Hsva,
+    aspect_open: bool,
+    picker: picker::PickerState,
     color_editing: bool,
     wheel_clip: Option<ClipId>,
     wheel_time: f64,
@@ -35,7 +38,8 @@ impl Default for CanvasUi {
     fn default() -> Self {
         Self {
             background_open: false,
-            color: Color32::from_rgb(32, 32, 32).into(),
+            aspect_open: false,
+            picker: picker::PickerState::new([24, 26, 31]),
             color_editing: false,
             wheel_clip: None,
             wheel_time: -1.0,
@@ -187,28 +191,107 @@ impl ClipperApp {
         let previous = settings;
         let focused = p.selected_clips.iter().copied().find(|id| p.is_video(*id));
         let mut reset: Option<ClipId> = None;
-        let mut background_anchor = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Preview").small().color(theme::TEXT_MUTED));
-            egui::ComboBox::from_id_salt("canvas_format")
-                .selected_text(settings.aspect.label())
-                .width(174.0)
-                .show_ui(ui, |ui| {
-                    for aspect in crate::framing::Aspect::ALL {
-                        ui.selectable_value(&mut settings.aspect, aspect, aspect.label());
-                    }
-                });
-            let background =
-                ui.add(egui::Button::new("Background").selected(self.canvas_ui.background_open));
-            if background.clicked() {
-                self.canvas_ui.background_open = !self.canvas_ui.background_open;
-                if self.canvas_ui.background_open {
-                    background_anchor = Some(background.rect.left_bottom() + egui::vec2(0.0, 6.0));
-                }
-                if let crate::framing::Background::Color(rgb) = settings.background {
-                    self.canvas_ui.color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]).into();
-                }
+        if let Background::Color(rgb) = settings.background {
+            // Follow undo/redo and project loads without disturbing a hue
+            // the picker is holding for a grey.
+            if self.canvas_ui.picker.rgb() != rgb {
+                self.canvas_ui.picker.set_rgb(rgb);
             }
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let aspect_label = settings.aspect.label();
+            let picked_aspect = &mut settings.aspect;
+            widgets::dropdown_button(
+                ui,
+                "canvas_aspect",
+                &mut self.canvas_ui.aspect_open,
+                egui::vec2(196.0, 28.0),
+                220.0,
+                |painter, rect, color| {
+                    painter.text(
+                        rect.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        aspect_label,
+                        theme::medium(12.5),
+                        color,
+                    );
+                },
+                |ui| {
+                    let mut chosen = false;
+                    for aspect in crate::framing::Aspect::ALL {
+                        if widgets::menu_choice(ui, aspect.label(), *picked_aspect == aspect)
+                            .clicked()
+                        {
+                            *picked_aspect = aspect;
+                            chosen = true;
+                        }
+                    }
+                    chosen
+                },
+            )
+            .on_hover_text("Output shape");
+
+            let shown_background = settings.background;
+            let background = &mut settings.background;
+            let picker = &mut self.canvas_ui.picker;
+            widgets::dropdown_button(
+                ui,
+                "canvas_background",
+                &mut self.canvas_ui.background_open,
+                egui::vec2(150.0, 28.0),
+                256.0,
+                |painter, rect, color| {
+                    let swatch = egui::Rect::from_center_size(
+                        rect.left_center() + egui::vec2(7.0, 0.0),
+                        egui::vec2(14.0, 14.0),
+                    );
+                    paint_background_swatch(painter, swatch, shown_background);
+                    painter.text(
+                        swatch.right_center() + egui::vec2(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "Background",
+                        theme::medium(12.5),
+                        color,
+                    );
+                },
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.add_space(4.0);
+                    let selected = match background {
+                        Background::Black => 0,
+                        Background::Blur => 1,
+                        Background::Color(_) => 2,
+                    };
+                    ui.vertical_centered(|ui| {
+                        let options = [
+                            ("Black", ""),
+                            ("Blur video", "A blurred, zoomed copy of the video fills the bars"),
+                            ("Color", ""),
+                        ];
+                        match widgets::segmented(ui, "canvas_background_mode", &options, selected)
+                        {
+                            Some(0) => *background = Background::Black,
+                            Some(1) => *background = Background::Blur,
+                            Some(_) => *background = Background::Color(picker.rgb()),
+                            None => {}
+                        }
+                    });
+                    if let Background::Color(_) = background {
+                        ui.add_space(10.0);
+                        egui::Frame::none()
+                            .inner_margin(egui::Margin::symmetric(4.0, 0.0))
+                            .show(ui, |ui| {
+                                if picker::show(ui, picker) {
+                                    *background = Background::Color(picker.rgb());
+                                }
+                            });
+                    }
+                    ui.add_space(4.0);
+                    false
+                },
+            );
+
             if ui
                 .add_enabled(focused.is_some(), egui::Button::new("Reset frame"))
                 .on_hover_text("Center the selected video. Fills the canvas when the shapes match; fits whole with bars when they don't (e.g. gameplay in 9:16). Ctrl+Z to undo.")
@@ -216,69 +299,15 @@ impl ClipperApp {
             {
                 reset = focused;
             }
-            ui.label(
-                RichText::new(format!("{} × {}", media.width, media.height))
-                    .small()
-                    .color(theme::TEXT_MUTED),
-            )
-            .on_hover_text("Uses the highest resolution video placed on the timeline");
-        });
-        if self.canvas_ui.background_open {
-            let mut open = true;
-            let mut done = false;
-            let mut editor = egui::Window::new("Background")
-                .id(egui::Id::new("canvas_background_editor"))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .order(egui::Order::Foreground)
-                .vscroll(true)
-                .max_height((ui.ctx().screen_rect().height() - 100.0).max(240.0));
-            if let Some(anchor) = background_anchor {
-                editor = editor.current_pos(anchor);
-            }
-            editor.show(ui.ctx(), |ui| {
-                ui.spacing_mut().slider_width =
-                    (ui.ctx().screen_rect().height() - 300.0).clamp(140.0, 240.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut settings.background,
-                        crate::framing::Background::Black,
-                        "Black",
-                    );
-                    ui.selectable_value(
-                        &mut settings.background,
-                        crate::framing::Background::Blur,
-                        "Blur video",
-                    );
-                    if ui
-                        .selectable_label(
-                            matches!(settings.background, crate::framing::Background::Color(_)),
-                            "Color",
-                        )
-                        .clicked()
-                    {
-                        let color: Color32 = self.canvas_ui.color.into();
-                        settings.background =
-                            crate::framing::Background::Color([color.r(), color.g(), color.b()]);
-                    }
-                });
-                ui.separator();
-                if egui::color_picker::color_picker_hsva_2d(
-                    ui,
-                    &mut self.canvas_ui.color,
-                    egui::color_picker::Alpha::Opaque,
-                ) {
-                    let color: Color32 = self.canvas_ui.color.into();
-                    settings.background =
-                        crate::framing::Background::Color([color.r(), color.g(), color.b()]);
-                }
-                done = ui.button("Done").clicked();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{} × {}", media.width, media.height))
+                        .font(theme::mono(11.5))
+                        .color(theme::TEXT_MUTED),
+                )
+                .on_hover_text("Uses the highest resolution video placed on the timeline");
             });
-            if !open || done || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.canvas_ui.background_open = false;
-            }
-        }
+        });
         let editing = ui.input(|i| i.pointer.any_down()) || ui.ctx().wants_keyboard_input();
         if settings != previous {
             ui.ctx().request_repaint();
@@ -593,7 +622,7 @@ impl ClipperApp {
         }
         if !self.canvas_ui.guides.is_empty() {
             let painter = ui.painter().with_clip_rect(canvas.expand(1.0));
-            let stroke = Stroke::new(1.0_f32, theme::PLAYHEAD);
+            let stroke = Stroke::new(1.0_f32, theme::ACCENT);
             for guide in &self.canvas_ui.guides {
                 let points = match *guide {
                     Guide::X(x) => [egui::pos2(x, canvas.top()), egui::pos2(x, canvas.bottom())],
@@ -614,6 +643,45 @@ impl ClipperApp {
         ui.allocate_rect(available, egui::Sense::hover());
     }
 }
+/// The Background button's swatch: the solid color, or a soft two-tone
+/// tile standing in for the blurred video.
+fn paint_background_swatch(painter: &egui::Painter, rect: egui::Rect, background: Background) {
+    match background {
+        Background::Blur => {
+            let (top, bottom) = rect.split_top_bottom_at_fraction(0.5);
+            painter.rect_filled(
+                top,
+                egui::Rounding {
+                    nw: 3.0,
+                    ne: 3.0,
+                    sw: 0.0,
+                    se: 0.0,
+                },
+                Color32::from_rgb(92, 118, 150),
+            );
+            painter.rect_filled(
+                bottom,
+                egui::Rounding {
+                    nw: 0.0,
+                    ne: 0.0,
+                    sw: 3.0,
+                    se: 3.0,
+                },
+                Color32::from_rgb(52, 70, 64),
+            );
+        }
+        other => {
+            let [r, g, b] = other.rgb();
+            painter.rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
+        }
+    }
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

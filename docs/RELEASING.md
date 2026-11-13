@@ -60,9 +60,32 @@ FFmpeg, or mpv installed separately. No admin rights are requested. Installation
 logs / panic logs remain in the user's data folder after uninstallation.
 
 A MinGW cross-build is also supported from Linux: install the
-`x86_64-pc-windows-gnu` Rust target and MinGW tools, make `libmpv.a` point to the
-runtime's `libmpv.dll.a`, and pass its directory through RUSTFLAGS. Native
-Windows CI is still required before publishing a normal release.
+`x86_64-pc-windows-gnu` Rust target and MinGW tools (including
+`x86_64-w64-mingw32-windres`, used by `build.rs` for the icon resource), and
+pass the runtime's `mpv-dev` directory (it holds `libmpv.dll.a`) through
+RUSTFLAGS:
+
+```sh
+RUSTFLAGS="-C target-feature=+crt-static -L native=<runtime>/mpv-dev" \
+  cargo build --release --locked --target x86_64-pc-windows-gnu
+python scripts/package-windows.py <runtime> target/x86_64-pc-windows-gnu/release/halo-clipper.exe
+cd packaging && wine <nsis>/makensis.exe /DVERSION=<version> windows.nsi
+```
+
+Disable winemenubuilder in that Wine prefix
+(`wine reg add 'HKCU\Software\Wine\DllOverrides' /v winemenubuilder.exe /t REG_SZ /d '' /f`)
+before test-installing, or Wine mirrors the Start-menu shortcut into the Linux
+app menu. Native Windows CI is still required before publishing a normal
+release.
+
+## App icon
+
+`assets/icon.svg` is the master; `assets/icon-small.svg` is the simplified
+cut for 16–32 px. `python scripts/make-windows-icon.py` regenerates
+`assets/icon.ico` (PNG entries, 16–256 px). `build.rs` embeds it with version
+info into the Windows exe, the app loads it from that resource for the
+title bar and taskbar, and the NSIS installer uses it for setup, uninstall
+and the Apps list (`DisplayIcon`).
 
 ## Runtime refreshes
 
