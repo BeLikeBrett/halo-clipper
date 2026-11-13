@@ -15,6 +15,7 @@ struct Slot {
     speed: f32,
     volume: f64,
     muted: Option<bool>,
+    corrected: Instant,
 }
 #[derive(Clone)]
 pub(super) struct FrameLayer {
@@ -113,6 +114,7 @@ impl LivePreview {
                             speed: 0.0,
                             volume: -1.0,
                             muted: None,
+                            corrected: Instant::now(),
                         });
                     }
                     Err(e) => {
@@ -132,6 +134,7 @@ impl LivePreview {
                 slot.path = path.to_path_buf();
                 slot.clip = c.id;
                 slot.seek = source_time;
+                slot.corrected = Instant::now();
                 if !slot.caption.is_empty() {
                     let _ = slot.player.set_video_filter("");
                 }
@@ -150,9 +153,15 @@ impl LivePreview {
                     let _ = slot.player.seek(source_time);
                     slot.seek = source_time;
                 }
-            } else if (slot.player.state().position_ms - source_time).abs() > 180 && !changed {
-                let _ = slot.player.seek_fast(source_time);
+            } else if (slot.player.state().position_ms - source_time).abs() > 180
+                && !changed
+                && slot.corrected.elapsed() > Duration::from_millis(750)
+            {
+                // Give accurate seeks time to decode. Re-seeking to a keyframe
+                // each UI frame prevents a long-GOP decoder from catching up.
+                let _ = slot.player.seek(source_time);
                 slot.seek = source_time;
+                slot.corrected = Instant::now();
             }
             if changed || slot.playing != self.playing || slot.player.state().paused == self.playing
             {
@@ -256,7 +265,7 @@ impl CompositeGpu {
     unsafe fn new(gl: &glow::Context) -> anyhow::Result<Self> {
         let program = gl.create_program().map_err(anyhow::Error::msg)?;
         let mut shaders = Vec::new();
-        for (kind,source) in [(glow::VERTEX_SHADER,"#version 330 core\nout vec2 uv;void main(){vec2 p=vec2((gl_VertexID==1||gl_VertexID==3)?1.0:-1.0,gl_VertexID>=2?1.0:-1.0);uv=(p+1.0)*0.5;gl_Position=vec4(p,0,1);}"),(glow::FRAGMENT_SHADER,"#version 330 core\nin vec2 uv;out vec4 color;uniform sampler2D video;uniform float opacity;void main(){vec4 c=texture(video,uv);color=vec4(c.rgb,c.a*opacity);}")]{
+        for (kind,source) in [(glow::VERTEX_SHADER,"#version 330 core\nout vec2 uv;void main(){vec2 p=vec2((gl_VertexID==1||gl_VertexID==3)?1.0:-1.0,gl_VertexID>=2?1.0:-1.0);uv=(p+1.0)*0.5;gl_Position=vec4(p,0,1);}"),(glow::FRAGMENT_SHADER,"#version 330 core\nin vec2 uv;out vec4 color;uniform sampler2D video;uniform float opacity;void main(){vec4 c=texture(video,uv);color=vec4(c.rgb,opacity);}")]{
             let shader=gl.create_shader(kind).map_err(anyhow::Error::msg)?;gl.shader_source(shader,source);gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader){let e=gl.get_shader_info_log(shader);gl.delete_shader(shader);gl.delete_program(program);anyhow::bail!("{e}");}
             gl.attach_shader(program,shader);shaders.push(shader);

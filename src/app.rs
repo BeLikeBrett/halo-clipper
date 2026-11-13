@@ -697,6 +697,7 @@ impl ClipperApp {
     }
 
     fn undo(&mut self) {
+        log::info!("Undo requested");
         let Some(snap) = self.undo_stack.pop() else {
             return;
         };
@@ -1454,21 +1455,21 @@ impl ClipperApp {
         // queue intents here and apply them after.
         let mut deferred_action: Option<ClipAction> = None;
 
-        ctx.input(|i| {
+        ctx.input_mut(|i| {
             let step = if i.modifiers.shift { 5000 } else { 1000 };
             let max_playhead = match project.mode {
                 EditMode::SimpleClip => project.media.duration_ms,
                 EditMode::MultiTrack => project.canvas_length_ms(),
             };
             // Ctrl+Z = undo, Ctrl+Shift+Z = redo (Ctrl+Y also redo).
-            if i.modifiers.command && i.key_pressed(egui::Key::Z) {
+            if (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Z) {
                 if i.modifiers.shift {
                     actions.redo = true;
                 } else {
                     actions.undo = true;
                 }
             }
-            if i.modifiers.command && i.key_pressed(egui::Key::Y) {
+            if (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Y) {
                 actions.redo = true;
             }
             match project.mode {
@@ -1505,7 +1506,7 @@ impl ClipperApp {
             if i.key_pressed(egui::Key::L) || i.key_pressed(egui::Key::ArrowRight) {
                 project.playhead_ms = (project.playhead_ms + step).min(max_playhead);
             }
-            if i.key_pressed(egui::Key::Space) {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 actions.toggle_play = true;
             }
             if i.key_pressed(egui::Key::M) {
