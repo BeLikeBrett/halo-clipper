@@ -18,7 +18,8 @@ impl Project {
             tracks: Vec::new(),
             clips: Vec::new(),
             selected_clips: HashSet::new(),
-            text_overlays: HashMap::new(),
+            texts: Vec::new(),
+            selected_text: None,
             id_gen: IdGen::default(),
             mode: EditMode::MultiTrack,
         }
@@ -87,7 +88,11 @@ impl Project {
             self.source = source.path.clone();
             self.media = source.media.clone();
         }
-        self.assets.push(MediaAsset { id, source });
+        self.assets.push(MediaAsset {
+            id,
+            import_number: self.id_gen.next_import_number(),
+            source,
+        });
         id
     }
     pub(super) fn remove_asset(&mut self, id: TrackId) {
@@ -122,7 +127,6 @@ impl Project {
         }
         self.prune_tracks();
         self.selected_clips.retain(|id| !removed.contains(id));
-        self.text_overlays.retain(|id, _| !removed.contains(id));
         if self.source == asset.source.path {
             self.proxy = None;
             if let Some(a) = self.assets.first() {
@@ -227,6 +231,7 @@ impl Project {
                 gain: 1.0,
                 speed: 1.0,
                 transform: Transform::default(),
+                animation: Default::default(),
                 asset_id: Some(id),
                 audio_stream: None,
             };
@@ -252,6 +257,7 @@ impl Project {
                 gain: 1.0,
                 speed: 1.0,
                 transform: Transform::default(),
+                animation: Default::default(),
                 asset_id: Some(id),
                 audio_stream: Some(stream),
             };
@@ -357,6 +363,76 @@ impl Project {
     }
 }
 impl ClipperApp {
+    /// OS file-manager drops stage assets in Media in either editing mode.
+    /// Keep the current Simple Clip source/marks and the Advanced timeline.
+    pub(super) fn import_dropped_media(&mut self, paths: Vec<PathBuf>) {
+        let mut imported = 0;
+        let mut already_present = 0;
+        let mut errors = Vec::new();
+        let mut saved_undo = false;
+        for path in paths {
+            if self
+                .project
+                .as_ref()
+                .is_some_and(|p| p.assets.iter().any(|a| a.source.path == path))
+            {
+                already_present += 1;
+                continue;
+            }
+            crate::diagnostics::register_media(&path);
+            let info = match media::probe_layer(&path) {
+                Ok(info) if path.is_file() => info,
+                Ok(_) => {
+                    errors.push("Drop video or audio files, rather than folders.".to_string());
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("Could not import: {e:#}"));
+                    continue;
+                }
+            };
+            // A first video opens a Simple Clip workspace. Later files only
+            // enter Media, so dropping a batch never cycles the active source.
+            let needs_source = self
+                .project
+                .as_ref()
+                .is_none_or(|p| p.mode == EditMode::SimpleClip && p.simple.focus.is_none());
+            if needs_source && info.width > 0 {
+                self.open_path(path);
+            } else {
+                if self.project.is_none() {
+                    self.project = Some(Project::empty());
+                }
+                let advanced = self
+                    .project
+                    .as_ref()
+                    .is_some_and(|p| p.mode == EditMode::MultiTrack);
+                if advanced && !saved_undo {
+                    self.push_undo();
+                    saved_undo = true;
+                }
+                self.project
+                    .as_mut()
+                    .unwrap()
+                    .import_asset(LayerSource { path, media: info });
+            }
+            imported += 1;
+        }
+        self.status = if errors.is_empty() {
+            if imported == 0 {
+                format!("{already_present} already in Media.")
+            } else {
+                format!("Imported {imported} into Media.")
+            }
+        } else {
+            format!(
+                "Imported {imported}. {} file(s) skipped. {}",
+                errors.len(),
+                errors[0]
+            )
+        };
+    }
+
     pub(super) fn import_layer(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter(
@@ -441,6 +517,24 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn import_numbers_are_stable_across_duplicate_paths_tracks_and_removal() {
+        let mut p = Project::empty();
+        let first = p.import_asset(asset("first.mp4", 640, 360, 1000, 0));
+        p.id_gen.next_track();
+        let second = p.import_asset(asset("second.mp4", 640, 360, 1000, 0));
+        assert_eq!(p.assets[0].import_number, 1);
+        assert_eq!(p.assets[1].import_number, 2);
+        assert_eq!(p.import_asset(asset("first.mp4", 640, 360, 1000, 0)), first);
+        p.remove_asset(first);
+        p.import_asset(asset("third.mp4", 640, 360, 1000, 0));
+        assert_eq!(
+            p.assets.iter().find(|a| a.id == second).unwrap().label(),
+            "2 · second.mp4"
+        );
+        assert_eq!(p.assets.last().unwrap().import_number, 3);
+    }
+
     #[test]
     fn import_is_bin_only_and_last_removal_leaves_blank() {
         let mut p = Project::empty();

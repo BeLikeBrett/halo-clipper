@@ -47,6 +47,10 @@ pub const CLIP_VIDEO_EDGE: Color32 = Color32::from_rgb(78, 116, 166);
 pub const CLIP_AUDIO: Color32 = Color32::from_rgb(30, 80, 88);
 pub const CLIP_AUDIO_EDGE: Color32 = Color32::from_rgb(58, 132, 140);
 
+/// Text layer bars on the timeline.
+pub const CLIP_TEXT: Color32 = Color32::from_rgb(70, 58, 128);
+pub const CLIP_TEXT_EDGE: Color32 = Color32::from_rgb(118, 100, 200);
+
 /// Primary action buttons (Export, Begin Export). Same hue family as
 /// ACCENT, lower saturation, so the call to action doesn't glare.
 pub const BTN_PRIMARY: Color32 = Color32::from_rgb(58, 108, 176);

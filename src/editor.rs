@@ -19,12 +19,12 @@ const CLIP_INSET: f32 = 4.0;
 /// window `[start, start + span)` spread across the lane width, plus the
 /// top of the first lane for row hit-testing.
 #[derive(Clone, Copy, Debug)]
-struct Lanes {
-    left: f32,
-    width: f32,
+pub(super) struct Lanes {
+    pub(super) left: f32,
+    pub(super) width: f32,
     top: f32,
     start: i64,
-    span: i64,
+    pub(super) span: i64,
 }
 impl Lanes {
     /// Whole timeline fitted to the width.
@@ -32,7 +32,7 @@ impl Lanes {
     fn new(rect: egui::Rect, duration: i64) -> Self {
         Self::window(rect, 0, duration)
     }
-    fn window(rect: egui::Rect, start: i64, span: i64) -> Self {
+    pub(super) fn window(rect: egui::Rect, start: i64, span: i64) -> Self {
         Self {
             left: rect.left() + HEADER_W,
             width: (rect.width() - HEADER_W - RIGHT_PAD).max(1.0),
@@ -41,13 +41,13 @@ impl Lanes {
             span: span.max(1),
         }
     }
-    fn right(&self) -> f32 {
+    pub(super) fn right(&self) -> f32 {
         self.left + self.width
     }
-    fn x_of(&self, time: i64) -> f32 {
+    pub(super) fn x_of(&self, time: i64) -> f32 {
         self.left + (time - self.start) as f32 / self.span as f32 * self.width
     }
-    fn time_at(&self, x: f32) -> i64 {
+    pub(super) fn time_at(&self, x: f32) -> i64 {
         (self.start as f32 + (x - self.left) / self.width * self.span as f32)
             .round()
             .max(0.0) as i64
@@ -174,12 +174,7 @@ fn placement(
                     TrackKind::Audio
                 },
                 None,
-                a.source
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
+                a.label(),
             )
         }
         EditorDrag::Clip { id, grab_ms } => {
@@ -582,9 +577,103 @@ impl ClipperApp {
             }
         }
         ui.add_space(8.0);
+        let mut animation = c.animation;
+        let mut preview = None;
+        egui::CollapsingHeader::new("Animation")
+            .id_salt(("clip_animation", c.id))
+            .default_open(animation.active())
+            .show(ui, |ui| {
+                for (label, effect, ms) in [
+                    ("In", &mut animation.intro, &mut animation.in_ms),
+                    ("Out", &mut animation.outro, &mut animation.out_ms),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        egui::ComboBox::from_id_salt(("clip_effect", label))
+                            .selected_text(effect.label())
+                            .width(120.0)
+                            .show_ui(ui, |ui| {
+                                for option in crate::animation::Effect::ALL {
+                                    ui.selectable_value(effect, option, option.label());
+                                }
+                            });
+                        if *effect != crate::animation::Effect::None
+                            && ui
+                                .small_button("▶")
+                                .on_hover_text(format!("Play {label} animation"))
+                                .clicked()
+                        {
+                            preview = Some(if label == "In" {
+                                c.cut_start_ms
+                            } else {
+                                c.cut_end_ms() - (*ms as i64).min(c.duration_ms() / 2) - 100
+                            });
+                        }
+                    });
+                    if *effect != crate::animation::Effect::None {
+                        textui::duration_control(ui, "Time", ms);
+                    }
+                }
+                if animation.active()
+                    && [animation.intro, animation.outro].iter().any(|e| {
+                        matches!(
+                            e,
+                            crate::animation::Effect::SnapZoom
+                                | crate::animation::Effect::PullBack
+                                | crate::animation::Effect::Whip
+                                | crate::animation::Effect::Flash
+                        )
+                    })
+                {
+                    ui.add(egui::Slider::new(&mut animation.amount, 0.0..=1.0).text("Amount"));
+                }
+            });
+        if animation != c.animation {
+            if !self.clip_animation_editing {
+                self.push_undo();
+            }
+            if let Some(clip) = self
+                .project
+                .as_mut()
+                .and_then(|p| p.clips.iter_mut().find(|clip| clip.id == c.id))
+            {
+                clip.animation = animation;
+            }
+            self.clip_animation_editing = ui.input(|i| i.pointer.any_down());
+        } else if !ui.input(|i| i.pointer.any_down()) {
+            self.clip_animation_editing = false;
+        }
+        if let Some(at) = preview {
+            let at = at.max(c.cut_start_ms);
+            self.seek_to(at);
+            if !self.live.playing {
+                self.live.toggle(at);
+            }
+        }
     }
 
     pub(super) fn show_media_bin(&mut self, ui: &mut egui::Ui) {
+        // Native file drags may not report a pointer position (Windows
+        // OLE / some Linux compositors). Make the Media destination visible
+        // for the whole drag and accept the drop anywhere in the window.
+        if ui.input(|i| !i.raw.hovered_files.is_empty()) {
+            let rect = ui.max_rect().shrink(2.0);
+            let painter = ui.painter().with_clip_rect(rect);
+            painter.rect_filled(rect, 6.0, theme::ACCENT.gamma_multiply(0.12));
+            painter.rect_stroke(rect, 6.0, Stroke::new(1.5_f32, theme::ACCENT));
+            let hint = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.bottom() - 24.0),
+                egui::vec2((rect.width() - 12.0).max(1.0), 32.0),
+            );
+            painter.rect_filled(hint, 5.0, theme::BG_BUTTON_ACTIVE);
+            painter.text(
+                hint.center(),
+                Align2::CENTER_CENTER,
+                "Drop to import",
+                theme::medium(12.0),
+                theme::TEXT_PRIMARY,
+            );
+        }
         let advanced = self
             .project
             .as_ref()
@@ -612,16 +701,12 @@ impl ClipperApp {
         let mut remove = None;
         let mut focus = None;
         let active_simple = self.project.as_ref().and_then(|p| p.simple.focus);
-        if assets.is_empty() {
+        if assets.is_empty() && advanced {
             ui.add_space(18.0);
             ui.label(
-                RichText::new(if advanced {
-                    "Import video or audio, then drag it onto the timeline."
-                } else {
-                    "Open a video to begin."
-                })
-                .color(theme::TEXT_MUTED)
-                .size(13.0),
+                RichText::new("Import video or audio, then drag it onto the timeline.")
+                    .color(theme::TEXT_MUTED)
+                    .size(13.0),
             );
         }
         egui::ScrollArea::vertical()
@@ -688,7 +773,28 @@ impl ClipperApp {
                         rect.max - egui::vec2(23.0, 8.0),
                     );
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(textrect));
-                    child.add(egui::Label::new(RichText::new(name.as_ref()).size(12.5)).truncate());
+                    let mut title = egui::text::LayoutJob::default();
+                    title.append(
+                        &format!("{} · ", asset.import_number),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: theme::mono(10.5),
+                            color: theme::TEXT_MUTED,
+                            ..Default::default()
+                        },
+                    );
+                    title.append(
+                        name.as_ref(),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: theme::regular(12.5),
+                            color: theme::TEXT_PRIMARY,
+                            ..Default::default()
+                        },
+                    );
+                    child
+                        .add(egui::Label::new(title).truncate())
+                        .on_hover_text(asset.label());
                     let metadata = if video {
                         format!(
                             "{} × {}  ·  {}",
@@ -784,14 +890,7 @@ impl ClipperApp {
                     .project
                     .as_ref()
                     .and_then(|p| p.assets.iter().find(|a| a.id == *id))
-                    .map(|a| {
-                        a.source
-                            .path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    }),
+                    .map(|a| a.label()),
                 _ => None,
             };
             if let (Some(name), Some(pointer)) = (
@@ -933,12 +1032,18 @@ impl ClipperApp {
         let duration = p.canvas_length_ms().max(1000);
         let playhead = p.playhead_ms;
         let file_name = |c: &Clip| {
-            p.clip_source(c)
-                .0
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
+            let source = p.clip_source(c).0;
+            p.assets
+                .iter()
+                .find(|a| a.source.path == source)
+                .map(|a| a.label())
+                .unwrap_or_else(|| {
+                    source
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
         };
         // Compound bars show their audio as a strip, so the " · V+A"
         // suffix the view model adds is redundant on screen.
@@ -1000,6 +1105,15 @@ impl ClipperApp {
             egui::vec2(ui.available_width(), RULER_HEIGHT),
             egui::Sense::hover(),
         );
+        // Text layers get their own band, pinned under the ruler.
+        let band_rows = textui::band_rows(&p.texts).1;
+        let (band_rect, _) = ui.allocate_exact_size(
+            egui::vec2(
+                ui.available_width(),
+                band_rows as f32 * textui::BAND_ROW + 2.0,
+            ),
+            egui::Sense::hover(),
+        );
         let footer_h = 26.0;
         // Exact budget: scroll + spacing + footer must not exceed what the
         // panel offers, or the resizable panel grows a little every frame.
@@ -1043,6 +1157,20 @@ impl ClipperApp {
         let span = view.span(duration);
         let ruler_lanes = Lanes::window(ruler_rect, view.start, span);
         let step = ruler_step(span, ruler_lanes.width);
+        let band_snaps: Vec<i64> = [0, playhead]
+            .into_iter()
+            .chain(clips.iter().flat_map(|c| [c.cut_start_ms, c.cut_end_ms()]))
+            .collect();
+        let band_actions = textui::show_text_band(
+            ui,
+            band_rect,
+            Lanes::window(band_rect, view.start, span),
+            &p.texts,
+            p.selected_text,
+            playhead,
+            &band_snaps,
+            &mut self.text_ui.band_drag,
+        );
         let lane_bg = theme::BG_PANEL;
         let empty_bg = theme::BG_HEADER;
         let header_bg = Color32::from_rgb(23, 24, 29);
@@ -1517,7 +1645,7 @@ impl ClipperApp {
 
         // ── Ruler (pinned above the scrolling lanes) ──
         let lanes_view = scroll.inner;
-        let surface = ruler_rect.union(lanes_view);
+        let surface = ruler_rect.union(band_rect).union(lanes_view);
         ui.painter()
             .set(surface_bg, egui::Shape::rect_filled(surface, 6.0, empty_bg));
         let painter = ui.painter_at(ruler_rect);
@@ -1658,11 +1786,13 @@ impl ClipperApp {
         if clear {
             if let Some(p) = &mut self.project {
                 p.selected_clips.clear();
+                p.selected_text = None;
             }
         }
         if let Some(id) = select {
             ui.ctx().request_repaint();
             if let Some(p) = &mut self.project {
+                p.selected_text = None;
                 let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
                 if !additive {
                     p.selected_clips.clear();
@@ -1727,6 +1857,10 @@ impl ClipperApp {
                 p.prune_tracks();
             }
         }
+        if !band_actions.is_empty() {
+            ui.ctx().request_repaint();
+            self.apply_band_actions(band_actions);
+        }
         if self.show_shortcut_footer(ui, footer_h, view.zoom) {
             ui.data_mut(|d| d.insert_temp(view_id, TimelineZoom::default()));
             ui.ctx().request_repaint();
@@ -1748,6 +1882,7 @@ impl ClipperApp {
         for (key, action) in [
             ("Space", "Play"),
             ("S", "Split"),
+            ("T", "Text"),
             ("Del", "Delete"),
             ("D", "Detach"),
             ("Shift D", "Attach"),

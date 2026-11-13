@@ -1,10 +1,7 @@
 //! Shared compositor for layered exports and disposable, low-resolution previews.
 //! Tracks are stored top first. Each clip has its own input seek, so a late cut
 //! never decodes the entire recording and independently moved audio stays aligned.
-use crate::{
-    encode::EncodeSettings,
-    track::{TextOverlay, Transform},
-};
+use crate::{encode::EncodeSettings, text::TextItem, textrender::ExportLayer, track::Transform};
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
@@ -21,9 +18,7 @@ pub struct Segment {
     pub speed: f32,
     pub gain: f32,
     pub transform: Transform,
-    pub caption: Option<TextOverlay>,
-    pub source_width: u32,
-    pub source_height: u32,
+    pub animation: crate::animation::Animation,
 }
 #[derive(Clone, Debug)]
 pub struct Composition {
@@ -34,24 +29,35 @@ pub struct Composition {
     pub background: crate::framing::Background,
     /// Video in bottom-to-top paint order, then audio in any order.
     pub segments: Vec<Segment>,
+    /// Text layers, painted above all video in list order.
+    pub texts: Vec<TextItem>,
 }
 impl Composition {
-    pub fn command(
-        &self,
-        destination: &std::path::Path,
-        encode: &EncodeSettings,
-    ) -> anyhow::Result<Command> {
-        anyhow::ensure!(
-            self.duration_ms > 0,
-            "Nothing to export — the timeline is empty."
-        );
+    /// Output frame size and rate for `encode`.
+    pub fn output_format(&self, encode: &EncodeSettings) -> (u32, u32, f64) {
         let (w, h) = encode.resolution.unwrap_or((self.width, self.height));
-        let (w, h) = ((w / 2 * 2).max(2), (h / 2 * 2).max(2));
         let fps = encode
             .fps_limit
             .map(f64::from)
             .unwrap_or(self.fps)
             .clamp(1.0, 120.0);
+        ((w / 2 * 2).max(2), (h / 2 * 2).max(2), fps)
+    }
+
+    /// Builds the ffmpeg command. `texts` are this composition's text
+    /// layers already rendered at the output size
+    /// (`textrender::write_export_layers`).
+    pub fn command(
+        &self,
+        destination: &std::path::Path,
+        encode: &EncodeSettings,
+        texts: &[ExportLayer],
+    ) -> anyhow::Result<Command> {
+        anyhow::ensure!(
+            self.duration_ms > 0,
+            "Nothing to export — the timeline is empty."
+        );
+        let (w, h, fps) = self.output_format(encode);
         let duration = self.duration_ms as f64 / 1000.0;
         let mut cmd = crate::platform::command("ffmpeg");
         cmd.args([
@@ -89,6 +95,9 @@ impl Composition {
             ])
             .arg("-i")
             .arg(&s.source);
+        }
+        for t in texts {
+            cmd.args(["-f", "concat", "-safe", "0", "-i"]).arg(&t.list);
         }
         let mut graph =
             format!("color=c=0x{:02x}{:02x}{:02x}:s={w}x{h}:r={fps:.6}:d={duration:.6},format=yuv420p[base];", self.background.rgb()[0], self.background.rgb()[1], self.background.rgb()[2]);
@@ -141,24 +150,21 @@ impl Composition {
                     "decrease"
                 };
                 graph.push_str(&format!("{input}setpts=(PTS-STARTPTS)/{speed:.6},scale=w={sw}:h={sh}:force_original_aspect_ratio={fit}:force_divisible_by=2,setsar=1,fps={fps:.6},format=rgba"));
-                if let Some(c) = &s.caption {
-                    if !c.text.trim().is_empty() {
-                        graph.push(',');
-                        graph.push_str(&super::export::build_drawtext(
-                            c,
-                            if t.fit == crate::framing::Fit::Fill {
-                                (sw as f64 / s.source_width.max(1) as f64)
-                                    .max(sh as f64 / s.source_height.max(1) as f64)
-                            } else {
-                                (sw as f64 / s.source_width.max(1) as f64)
-                                    .min(sh as f64 / s.source_height.max(1) as f64)
-                            },
-                        ));
-                    }
-                }
-                graph.push_str(&format!(",colorchannelmixer=aa={:.6},setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='W*{:.6}-w/2':y='H*{:.6}-h/2':eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.opacity.clamp(0.0,1.0), t.x, t.y));
+                graph.push_str(&s.animation.filters(s.end_ms - s.start_ms));
+                let dx = s.animation.x_expression(s.start_ms, s.end_ms - s.start_ms);
+                graph.push_str(&format!(",colorchannelmixer=aa={:.6},setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='W*{:.6}-w/2+W*({dx})':y='H*{:.6}-h/2':eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.opacity.clamp(0.0,1.0), t.x, t.y));
                 current = format!("mix{i}");
             }
+        }
+        for (k, t) in texts.iter().enumerate() {
+            let input = segments.len() + k;
+            let start = t.start_ms as f64 / 1000.0;
+            let end = t.end_ms as f64 / 1000.0;
+            graph.push_str(&format!(
+                "[{input}:v]format=rgba,setpts=PTS-STARTPTS+{start:.6}/TB[text{k}];[{current}][text{k}]overlay=x={}:y={}:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[titled{k}];",
+                t.x, t.y,
+            ));
+            current = format!("titled{k}");
         }
         let bridge = if encode.video_codec.needs_vaapi_upload() {
             "format=nv12,hwupload"
@@ -251,9 +257,7 @@ mod tests {
             speed: 1.0,
             gain: 1.0,
             transform: Transform::default(),
-            caption: None,
-            source_width: 64,
-            source_height: 64,
+            animation: Default::default(),
         }
     }
     fn render(c: Composition, path: PathBuf) -> PathBuf {
@@ -294,6 +298,89 @@ mod tests {
         out.stdout[index..index + 3].try_into().unwrap()
     }
     #[test]
+    fn clip_animations_export_on_both_edges_of_a_delayed_segment() {
+        use crate::animation::{Animation, Effect};
+        let d = dir();
+        let red = video(&d, "effect-red.mp4", "red");
+        let blue = video(&d, "effect-blue.mp4", "blue");
+        for effect in Effect::ALL.into_iter().filter(|e| *e != Effect::None) {
+            let mut top = segment(red.clone(), 1000, 3000);
+            top.animation = Animation {
+                intro: effect,
+                outro: effect,
+                in_ms: 500.0,
+                out_ms: 300.0,
+                amount: 1.0,
+            };
+            let mut bottom = segment(blue.clone(), 0, 4000);
+            bottom.src_end_ms = 2000;
+            bottom.speed = 0.5;
+            let c = Composition {
+                width: 64,
+                height: 64,
+                fps: 30.0,
+                duration_ms: 4000,
+                background: Default::default(),
+                segments: vec![bottom, top],
+                texts: Vec::new(),
+            };
+            let path = render(c, d.join(format!("effect-{effect:?}.mp4")));
+            // Layer before/after, settled middle, and no lingering white wash.
+            assert!(pixel(&path, "0.5", 32, 32)[2] > 200, "{effect:?}");
+            assert!(pixel(&path, "2.0", 32, 32)[0] > 200, "{effect:?}");
+            assert!(pixel(&path, "3.5", 32, 32)[2] > 200, "{effect:?}");
+            let start = pixel(&path, "1.0", 32, 32);
+            let end = pixel(&path, "2.96", 32, 32);
+            match effect {
+                Effect::Flash => {
+                    assert!(start.iter().all(|v| *v > 220), "{start:?}");
+                    assert!(end[1] > 150, "{end:?}");
+                }
+                Effect::Fade | Effect::PullBack | Effect::Whip => {
+                    assert!(start[2] > 200 && start[0] < 30, "{effect:?}: {start:?}");
+                    assert!(end[2] > end[0], "{effect:?}: {end:?}");
+                }
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn text_layers_burn_in_at_their_position_and_time() {
+        use crate::text::{TextId, TextItem};
+        let d = dir();
+        let black = video(&d, "text_base.mp4", "black");
+        // A white box with white text: solid, so the probe pixel at the
+        // layer's center is unambiguous.
+        let mut title = TextItem::new(TextId(1), 1000, 2000);
+        title.text = "Hi".into();
+        title.size = 0.3;
+        title.x = 0.75;
+        title.y = 0.75;
+        title.style.color = [255, 255, 255];
+        title.style.background = Some(([255, 255, 255], 1.0));
+        title.style.shadow = crate::text::Shadow::None;
+        title.intro = crate::text::Intro::None;
+        title.outro = crate::text::Outro::None;
+        let c = Composition {
+            width: 64,
+            height: 64,
+            fps: 30.0,
+            duration_ms: 3000,
+            background: Default::default(),
+            segments: vec![segment(black, 0, 3000)],
+            texts: vec![title],
+        };
+        let path = render(c, d.join("text_out.mp4"));
+        let lit = |time, x, y| pixel(&path, time, x, y).iter().all(|v| *v > 200);
+        assert!(!lit("0.5", 48, 48), "text before its start");
+        assert!(lit("1.5", 48, 48), "boxed text missing at its center");
+        assert!(!lit("1.5", 16, 16), "text drawn away from its position");
+        assert!(!lit("2.5", 48, 48), "text after its end");
+    }
+
+    #[test]
     fn layers_blend_in_order_and_reveal_base_after_end() {
         let d = dir();
         let red = video(&d, "red.mp4", "red");
@@ -309,6 +396,7 @@ mod tests {
             duration_ms: 3000,
             background: Default::default(),
             segments: vec![base, top],
+            texts: Vec::new(),
         };
         let path = render(c.clone(), d.join("out.mp4"));
         let before = pixel(&path, "0.5", 32, 32);
@@ -355,6 +443,7 @@ mod tests {
             duration_ms: 2000,
             background: Default::default(),
             segments: vec![segment(source, 0, 1000)],
+            texts: Vec::new(),
         };
         let fit = render(c.clone(), d.join("fit.mp4"));
         assert!(pixel(&fit, "0.5", 5, 5).iter().all(|v| *v < 20));
@@ -395,6 +484,7 @@ mod tests {
             duration_ms: 3000,
             background: crate::framing::Background::Blur,
             segments: vec![base, top],
+            texts: Vec::new(),
         };
         let path = render(c, d.join("fallback.mp4"));
         assert!(pixel(&path, "0.5", 4, 4)[0] > 200); // behind the blue foreground, base remains the canvas
@@ -432,6 +522,7 @@ mod tests {
             duration_ms: 3000,
             background: Default::default(),
             segments: vec![s],
+            texts: Vec::new(),
         };
         let path = render(c, d.join("audio.mp4"));
         let out = crate::platform::command("ffmpeg")
@@ -480,6 +571,7 @@ mod window_placement_tests {
                 src_end_ms: 1000,
                 speed: 1.0,
                 gain: 1.0,
+                animation: Default::default(),
                 transform: Transform {
                     fit: Default::default(),
                     scale: 0.5,
@@ -487,14 +579,12 @@ mod window_placement_tests {
                     y: -0.1,
                     opacity: 1.0,
                 },
-                caption: None,
-                source_width: 1920,
-                source_height: 1080,
             }],
+            texts: Vec::new(),
         };
         let settings = EncodeSettings::default_for_source(1920, 1080);
         let command = c
-            .command(std::path::Path::new("out.mp4"), &settings)
+            .command(std::path::Path::new("out.mp4"), &settings, &[])
             .unwrap();
         let args: Vec<_> = command
             .get_args()

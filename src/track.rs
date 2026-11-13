@@ -40,7 +40,23 @@ pub struct LayerSource {
 #[derive(Clone, Debug)]
 pub struct MediaAsset {
     pub id: TrackId,
+    /// Stable, one-based import order, independent of timeline track IDs.
+    pub import_number: u32,
     pub source: LayerSource,
+}
+
+impl MediaAsset {
+    pub fn label(&self) -> String {
+        format!(
+            "{} · {}",
+            self.import_number,
+            self.source
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +117,7 @@ pub struct Clip {
     /// the timeline.
     pub speed: f32,
     pub transform: Transform,
+    pub animation: crate::animation::Animation,
     pub asset_id: Option<TrackId>,
     pub audio_stream: Option<usize>,
 }
@@ -128,104 +145,6 @@ impl Clip {
     }
 }
 
-/// Per-segment text overlay (drawn into the video by ffmpeg's drawtext).
-/// Position is normalized 0..=1 of the source frame so the same overlay
-/// reads identically at any resolution; rendered centered on (x, y).
-#[derive(Clone, Debug, PartialEq)]
-pub struct TextOverlay {
-    pub text: String,
-    pub x: f32,
-    pub y: f32,
-    pub font_size_px: u32,
-    pub color: [u8; 3],
-    /// Fontconfig font name. Values like "Sans", "Sans Bold", "Serif",
-    /// "Mono" are resolved through libfontconfig at render time.
-    pub font: String,
-    /// Black outline thickness in source pixels. 0 = off. Maps to
-    /// drawtext's `borderw`; the preview approximates it with offset
-    /// passes of the same glyphs.
-    pub outline_px: u32,
-    /// Soft drop shadow (fixed 2px offset at export scale). Maps to
-    /// drawtext's `shadowx/shadowy/shadowcolor`.
-    pub shadow: bool,
-    /// Text opacity, 0.1..=1.0. Applied to fill, outline, and shadow.
-    pub opacity: f32,
-}
-
-impl Default for TextOverlay {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            x: 0.5,
-            y: 0.1,
-            font_size_px: 36,
-            color: [255, 255, 255],
-            font: "Sans".into(),
-            outline_px: 0,
-            shadow: false,
-            opacity: 1.0,
-        }
-    }
-}
-
-/// A font option exposed in the Edit panel.
-///
-/// Why three fields:
-/// - `display` is the label the user picks from the dropdown and is what
-///   we store in `TextOverlay::font` (stable, human-readable).
-/// - `egui_family` is the font-family egui paints the preview overlay
-///   with — preview rendering happens in our UI, not in mpv, so smooth
-///   drag/resize is just a matter of egui repainting.
-/// - `fontconfig` is the pattern ffmpeg's drawtext receives at export
-///   time. "Sans Bold" isn't a fontconfig family on its own; the proper
-///   form is the family plus a `:style=` qualifier.
-pub struct FontChoice {
-    pub display: &'static str,
-    pub egui_family: &'static str,
-    #[cfg_attr(windows, allow(dead_code))]
-    pub fontconfig: &'static str,
-}
-
-pub const FONT_CHOICES: &[FontChoice] = &[
-    FontChoice {
-        display: "Sans",
-        egui_family: "DejaVu Sans",
-        fontconfig: "Sans",
-    },
-    FontChoice {
-        display: "Sans Bold",
-        egui_family: "DejaVu Sans Bold",
-        fontconfig: "Sans:style=Bold",
-    },
-    FontChoice {
-        display: "Sans Italic",
-        egui_family: "DejaVu Sans Oblique",
-        fontconfig: "Sans:style=Italic",
-    },
-    FontChoice {
-        display: "Serif",
-        egui_family: "DejaVu Serif",
-        fontconfig: "Serif",
-    },
-    FontChoice {
-        display: "Serif Bold",
-        egui_family: "DejaVu Serif Bold",
-        fontconfig: "Serif:style=Bold",
-    },
-    FontChoice {
-        display: "Mono",
-        egui_family: "DejaVu Sans Mono",
-        fontconfig: "Monospace",
-    },
-];
-
-pub fn font_choice(display: &str) -> &'static FontChoice {
-    FONT_CHOICES
-        .iter()
-        .find(|c| c.display == display)
-        .unwrap_or(&FONT_CHOICES[0])
-}
-
 /// Monotonic ID generator. Atomic so helpers can borrow `&IdGen` while
 /// the caller holds `&mut` on the clip list (disjoint borrows).
 #[derive(Debug, Default)]
@@ -233,6 +152,8 @@ pub struct IdGen {
     clip: AtomicU32,
     link: AtomicU32,
     track: AtomicU32,
+    text: AtomicU32,
+    import: AtomicU32,
 }
 
 impl IdGen {
@@ -242,8 +163,14 @@ impl IdGen {
     pub fn next_link(&self) -> LinkId {
         LinkId(self.link.fetch_add(1, Ordering::Relaxed))
     }
+    pub fn next_import_number(&self) -> u32 {
+        self.import.fetch_add(1, Ordering::Relaxed) + 1
+    }
     pub fn next_track(&self) -> TrackId {
         TrackId(self.track.fetch_add(1, Ordering::Relaxed))
+    }
+    pub fn next_text(&self) -> crate::text::TextId {
+        crate::text::TextId(self.text.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -278,6 +205,7 @@ pub fn split_clip(
         return None;
     }
     clips[idx].src_end_ms = split_src;
+    clips[idx].animation.outro = crate::animation::Effect::None;
     let right = Clip {
         id: id_gen.next_clip(),
         track_id: c.track_id,
@@ -288,6 +216,10 @@ pub fn split_clip(
         gain: c.gain,
         speed: c.speed,
         transform: c.transform,
+        animation: crate::animation::Animation {
+            intro: crate::animation::Effect::None,
+            ..c.animation
+        },
         asset_id: c.asset_id,
         audio_stream: c.audio_stream,
     };
@@ -404,6 +336,7 @@ mod tests {
             gain: 1.0,
             speed: 1.0,
             transform: Transform::default(),
+            animation: Default::default(),
             asset_id: None,
             audio_stream: None,
         }
@@ -438,6 +371,27 @@ mod tests {
             mk_clip(2, 1, 0, 0, 250, None),
         ];
         assert_eq!(project_cut_duration(&clips), 250);
+    }
+
+    #[test]
+    fn split_preserves_only_the_original_outer_animations() {
+        use crate::animation::{Animation, Effect};
+        let mut c = mk_clip(10, 0, 0, 0, 2000, None);
+        c.animation = Animation {
+            intro: Effect::Whip,
+            outro: Effect::Flash,
+            in_ms: 450.0,
+            out_ms: 180.0,
+            amount: 0.8,
+        };
+        let mut clips = vec![c];
+        let right = split_clip(&mut clips, c.id, 1000, &IdGen::default()).unwrap();
+        assert_eq!(clips[0].animation.intro, Effect::Whip);
+        assert_eq!(clips[0].animation.outro, Effect::None);
+        let right = clip_by_id(&clips, right).unwrap();
+        assert_eq!(right.animation.intro, Effect::None);
+        assert_eq!(right.animation.outro, Effect::Flash);
+        assert_eq!(right.animation.out_ms, 180.0);
     }
 
     #[test]

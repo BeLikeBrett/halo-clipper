@@ -11,7 +11,6 @@ struct Slot {
     clip: ClipId,
     seek: i64,
     playing: bool,
-    caption: String,
     speed: f32,
     volume: f64,
     muted: Option<bool>,
@@ -25,6 +24,7 @@ pub(super) struct FrameLayer {
     pub width: u32,
     pub height: u32,
     pub transform: track::Transform,
+    pub flash: f32,
 }
 #[derive(Default)]
 pub(super) struct LivePreview {
@@ -113,7 +113,6 @@ impl LivePreview {
                             clip: c.id,
                             seek: -1,
                             playing: false,
-                            caption: String::new(),
                             speed: 0.0,
                             volume: -1.0,
                             muted: None,
@@ -138,10 +137,6 @@ impl LivePreview {
                 slot.clip = c.id;
                 slot.seek = source_time;
                 slot.corrected = Instant::now();
-                if !slot.caption.is_empty() {
-                    let _ = slot.player.set_video_filter("");
-                }
-                slot.caption = String::new();
                 if audio {
                     let index = c.audio_stream.or(t.source_audio_index).unwrap_or(0);
                     let _ = slot.player.set_audio_stream(index);
@@ -183,25 +178,19 @@ impl LivePreview {
                     slot.volume = volume;
                 }
             } else {
-                let caption = p
-                    .text_overlays
-                    .get(&c.id)
-                    .filter(|o| !o.text.trim().is_empty())
-                    .map(|o| format!("lavfi=[{}]", export::build_drawtext(o, 1.0)))
-                    .unwrap_or_default();
-                if caption != slot.caption {
-                    if let Err(e) = slot.player.set_video_filter(&caption) {
-                        log::warn!("Live caption: {e:#}");
-                    }
-                    slot.caption = caption;
-                }
+                let (transform, flash) = c.animation.sample(
+                    c.transform,
+                    p.playhead_ms - c.cut_start_ms,
+                    c.duration_ms(),
+                );
                 self.frames.push(FrameLayer {
                     id: c.id,
                     player: slot.player.clone(),
                     fbo: slot.fbo.clone(),
                     width: media.width,
                     height: media.height,
-                    transform: c.transform,
+                    transform,
+                    flash,
                 });
             }
         }
@@ -277,7 +266,8 @@ const FOREGROUND: &str = r#"#version 330 core
 in vec2 uv; out vec4 color;
 uniform sampler2D video;
 uniform float opacity;
-void main() { color=vec4(texture(video,uv).rgb,opacity); }
+uniform float flash;
+void main() { color=vec4(mix(texture(video,uv).rgb,vec3(1.0),flash),opacity); }
 "#;
 const BLUR: &str = r#"#version 330 core
 in vec2 uv; out vec4 color;
@@ -480,6 +470,10 @@ unsafe fn paint_layers(
         gl.uniform_1_f32(
             gl.get_uniform_location(program, "opacity").as_ref(),
             transform.opacity,
+        );
+        gl.uniform_1_f32(
+            gl.get_uniform_location(program, "flash").as_ref(),
+            if blur { 0.0 } else { layer.flash },
         );
         let sigma = if blur {
             canvas.width().min(canvas.height()) / 50.0

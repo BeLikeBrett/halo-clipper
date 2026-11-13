@@ -55,13 +55,6 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
     painter.rect_filled(band_rect, 0.0, theme::BG_HEADER);
 
     if state.duration_ms <= 0 {
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Open a video to begin",
-            FontId::proportional(13.0),
-            theme::TEXT_MUTED,
-        );
         painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, theme::BORDER));
         return (response, out);
     }

@@ -21,6 +21,8 @@ mod live;
 mod simple;
 #[path = "support.rs"]
 mod support;
+#[path = "textui.rs"]
+mod textui;
 #[path = "thumbnails.rs"]
 mod thumbnails;
 
@@ -32,11 +34,10 @@ use crate::media::{self, MediaInfo};
 use crate::player::Player;
 use crate::proxy;
 use crate::settings::{ProxyQuality, Settings};
+use crate::text::{TextId, TextItem};
 use crate::theme;
 use crate::timeline::{self, TimelineState};
-use crate::track::{
-    self, Clip, ClipId, IdGen, LinkId, MediaAsset, TextOverlay, Track, TrackId, TrackKind,
-};
+use crate::track::{self, Clip, ClipId, IdGen, LinkId, MediaAsset, Track, TrackId, TrackKind};
 use crate::video_fbo::{self, VideoFbo};
 
 use egui::{Align2, Color32, Frame, Margin, RichText, Rounding, Stroke};
@@ -79,9 +80,11 @@ struct Project {
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
-    /// Optional caption per video segment. Splitting copies the caption
-    /// to both halves; each half can then be edited independently.
-    text_overlays: HashMap<ClipId, TextOverlay>,
+    /// Text layers (titles, captions), canvas-positioned and timed
+    /// independently of the clips. Painted above all video.
+    texts: Vec<TextItem>,
+    /// The text layer being edited; mutually exclusive with clip selection.
+    selected_text: Option<TextId>,
     id_gen: IdGen,
     mode: EditMode,
 }
@@ -116,6 +119,7 @@ impl Project {
             gain: 1.0,
             speed: 1.0,
             transform: track::Transform::default(),
+            animation: Default::default(),
             asset_id: None,
             audio_stream: None,
         });
@@ -144,6 +148,7 @@ impl Project {
                 gain: 1.0,
                 speed: 1.0,
                 transform: track::Transform::default(),
+                animation: Default::default(),
                 asset_id: None,
                 audio_stream: None,
             });
@@ -172,7 +177,7 @@ impl Project {
             || self
                 .clips
                 .iter()
-                .any(|c| c.transform != track::Transform::default())
+                .any(|c| c.transform != track::Transform::default() || c.animation.active())
     }
 
     fn composition(&self, preview: bool) -> crate::composition::Composition {
@@ -203,9 +208,7 @@ impl Project {
                     speed: c.speed,
                     gain: c.gain * t.gain,
                     transform: c.transform,
-                    caption: self.text_overlays.get(&c.id).cloned(),
-                    source_width: info.width,
-                    source_height: info.height,
+                    animation: c.animation,
                 });
             }
         }
@@ -216,48 +219,76 @@ impl Project {
             duration_ms: self.content_end_ms(),
             background: self.canvas.background,
             segments,
+            texts: self.texts.clone(),
         }
     }
 
-    /// Preserve the caption on both independently editable split halves.
+    /// Adds an empty text layer at the playhead and selects it.
+    fn add_text(&mut self) -> TextId {
+        let id = self.id_gen.next_text();
+        let start = self.playhead_ms.max(0);
+        let mut item = TextItem::new(id, start, start + 3_000);
+        // Inherit the look of the previous layer so a run of captions
+        // stays consistent without re-styling each one.
+        if let Some(last) = self.texts.last() {
+            item.style = last.style;
+            item.size = last.size;
+            item.x = last.x;
+            item.y = last.y;
+            item.intro = last.intro;
+            item.outro = last.outro;
+            item.intro_ms = last.intro_ms;
+            item.outro_ms = last.outro_ms;
+        }
+        self.texts.push(item);
+        self.select_text(Some(id));
+        id
+    }
+
+    fn select_text(&mut self, id: Option<TextId>) {
+        self.selected_text = id;
+        if id.is_some() {
+            self.selected_clips.clear();
+        }
+    }
+
+    fn text(&self, id: TextId) -> Option<&TextItem> {
+        self.texts.iter().find(|t| t.id == id)
+    }
+
+    fn text_mut(&mut self, id: TextId) -> Option<&mut TextItem> {
+        self.texts.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Splits text layer `id` at the playhead into two layers with the
+    /// same content; the right half becomes the selection. False when the
+    /// playhead isn't strictly inside the layer.
+    fn split_text(&mut self, id: TextId) -> bool {
+        let at = self.playhead_ms;
+        let Some(index) = self.texts.iter().position(|t| t.id == id) else {
+            return false;
+        };
+        let item = &self.texts[index];
+        if at - item.start_ms < crate::text::MIN_DURATION_MS
+            || item.end_ms - at < crate::text::MIN_DURATION_MS
+        {
+            return false;
+        }
+        let mut right = item.clone();
+        right.id = self.id_gen.next_text();
+        right.start_ms = at;
+        self.texts[index].end_ms = at;
+        let right_id = right.id;
+        self.texts.insert(index + 1, right);
+        self.select_text(Some(right_id));
+        true
+    }
+
     fn split_segments(&mut self, target_ids: &[ClipId], cut_ms: i64) -> Vec<ClipId> {
-        let captions_to_copy: Vec<(ClipId, TextOverlay)> = target_ids
-            .iter()
-            .filter_map(|id| self.text_overlays.get(id).cloned().map(|o| (*id, o)))
-            .collect();
         let before = self.clips.clone();
         let new_ids = track::split_clips(&mut self.clips, target_ids, cut_ms, &self.id_gen);
         self.remember_split_groups(&before, &new_ids, target_ids, cut_ms);
-        for (left_id, overlay) in captions_to_copy {
-            // split_clip inserts the right half immediately after its
-            // original. Failed/boundary splits copy nothing.
-            if let Some(left_index) = self.clips.iter().position(|c| c.id == left_id) {
-                if let Some(right) = self.clips.get(left_index + 1) {
-                    if new_ids.contains(&right.id) {
-                        self.text_overlays.insert(right.id, overlay);
-                    }
-                }
-            }
-        }
         new_ids
-    }
-
-    fn active_caption(&self) -> Option<(ClipId, &TextOverlay)> {
-        if self.mode != EditMode::MultiTrack {
-            return None;
-        }
-        let v = self.first_video_track()?;
-        let clip = track::clip_on_track_at(&self.clips, v, self.playhead_ms)?;
-        let overlay = self.text_overlays.get(&clip.id)?;
-        (!overlay.text.trim().is_empty()).then_some((clip.id, overlay))
-    }
-
-    #[cfg(test)]
-    fn video_captions(&self, track_id: TrackId) -> Vec<Option<TextOverlay>> {
-        sorted_track_clips(&self.clips, track_id)
-            .into_iter()
-            .map(|c| self.text_overlays.get(&c.id).cloned())
-            .collect()
     }
 
     /// Stable canvas length for the Advanced timeline. Never shrinks
@@ -280,7 +311,8 @@ impl Project {
     /// number tracks edits in real time, even though the canvas itself
     /// (above) stays put.
     fn content_end_ms(&self) -> i64 {
-        track::project_cut_duration(&self.clips)
+        let texts = self.texts.iter().map(|t| t.end_ms).max().unwrap_or(0);
+        track::project_cut_duration(&self.clips).max(texts)
     }
 
     fn first_video_track(&self) -> Option<TrackId> {
@@ -308,7 +340,8 @@ struct UndoSnapshot {
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
-    text_overlays: HashMap<ClipId, TextOverlay>,
+    texts: Vec<TextItem>,
+    selected_text: Option<TextId>,
 }
 
 impl UndoSnapshot {
@@ -347,11 +380,12 @@ impl UndoSnapshot {
             } else {
                 p.selected_clips.clone()
             },
-            text_overlays: if p.mode == EditMode::SimpleClip {
+            texts: if p.mode == EditMode::SimpleClip {
                 Default::default()
             } else {
-                p.text_overlays.clone()
+                p.texts.clone()
             },
+            selected_text: p.selected_text,
         }
     }
 
@@ -375,7 +409,8 @@ impl UndoSnapshot {
         p.tracks = self.tracks;
         p.clips = self.clips;
         p.selected_clips = self.selected_clips;
-        p.text_overlays = self.text_overlays;
+        p.texts = self.texts;
+        p.selected_text = self.selected_text;
     }
 }
 
@@ -514,6 +549,8 @@ pub struct ClipperApp {
     thumbnails: thumbnails::Thumbnails,
     canvas_drag: Option<canvas::CanvasDrag>,
     canvas_ui: canvas::CanvasUi,
+    clip_animation_editing: bool,
+    text_ui: textui::TextUi,
     status: String,
     export_mode: ExportMode,
     /// Custom-encode settings persist between modal sessions so the user
@@ -627,7 +664,9 @@ impl ClipperApp {
             thumbnails: thumbnails::Thumbnails::default(),
             canvas_drag: None,
             canvas_ui: Default::default(),
-            status: "Open a video to begin.".into(),
+            clip_animation_editing: false,
+            text_ui: Default::default(),
+            status: String::new(),
             export_mode: ExportMode::Auto,
             custom_encode: CustomEncode::default_for(recommended),
             available_codecs,
@@ -960,13 +999,15 @@ impl ClipperApp {
                     tracks: Vec::new(),
                     clips: Vec::new(),
                     selected_clips: HashSet::new(),
-                    text_overlays: HashMap::new(),
+                    texts: Vec::new(),
+                    selected_text: None,
                     id_gen: IdGen::default(),
                     mode: EditMode::SimpleClip,
                 });
                 if let Some(p) = &mut self.project {
                     p.assets.push(MediaAsset {
                         id: p.id_gen.next_track(),
+                        import_number: p.id_gen.next_import_number(),
                         source: track::LayerSource {
                             path: path.clone(),
                             media: info,
@@ -1101,6 +1142,23 @@ impl ClipperApp {
     fn apply_clip_action(&mut self, action: ClipAction) {
         self.push_undo();
         let Some(p) = &mut self.project else { return };
+        // A selected text layer takes Split / Delete for itself.
+        if let Some(id) = p.selected_text {
+            match action {
+                ClipAction::Split => {
+                    if !p.split_text(id) {
+                        self.undo_stack.pop();
+                    }
+                    return;
+                }
+                ClipAction::DeleteSelected => {
+                    p.texts.retain(|t| t.id != id);
+                    p.selected_text = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
         match action {
             ClipAction::SetIn => p.in_ms = Some(p.playhead_ms),
             ClipAction::SetOut => p.out_ms = Some(p.playhead_ms),
@@ -1178,8 +1236,6 @@ impl ClipperApp {
                 // shares a single LinkId. Trust Ctrl+Z instead.
                 let ids: HashSet<_> = targets.into_iter().flat_map(|id| p.edit_ids(id)).collect();
                 p.clips.retain(|c| !ids.contains(&c.id));
-                p.text_overlays
-                    .retain(|id, _| p.clips.iter().any(|c| c.id == *id));
                 p.selected_clips.clear();
                 // Playhead stays where it was. Canvas length is preserved
                 // via Project::canvas_length_ms, so deleted clips leave a
@@ -1540,6 +1596,7 @@ impl ClipperApp {
         // inside the input closure (already borrowing self.project), so
         // queue intents here and apply them after.
         let mut deferred_action: Option<ClipAction> = None;
+        let mut add_text = false;
 
         ctx.input_mut(|i| {
             let step = if i.modifiers.shift { 5000 } else { 1000 };
@@ -1578,6 +1635,9 @@ impl ClipperApp {
                 EditMode::MultiTrack => {
                     if i.key_pressed(egui::Key::S) {
                         deferred_action = Some(ClipAction::Split);
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::T) {
+                        add_text = true;
                     }
                     if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
                         deferred_action = Some(ClipAction::DeleteSelected);
@@ -1624,6 +1684,10 @@ impl ClipperApp {
             ctx.request_repaint();
             self.apply_clip_action(action);
         }
+        if add_text {
+            ctx.request_repaint();
+            self.add_text_layer();
+        }
         actions
     }
 }
@@ -1637,16 +1701,8 @@ impl eframe::App for ClipperApp {
                 .filter_map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         });
-        for path in dropped {
-            if self
-                .project
-                .as_ref()
-                .is_some_and(|p| p.mode == EditMode::MultiTrack)
-            {
-                self.add_layer_path(path);
-            } else {
-                self.open_path(path);
-            }
+        if !dropped.is_empty() {
+            self.import_dropped_media(dropped);
         }
         self.updater.poll();
         if self.proxy_handle.is_some()
@@ -1853,7 +1909,7 @@ impl eframe::App for ClipperApp {
         }
         panel.show(ctx, |ui| {
             self.show_controls(ui);
-            if !advanced {
+            if !advanced && !self.status.is_empty() {
                 ui.add_space(6.0);
                 self.show_status_bar(ui);
             }
@@ -1876,11 +1932,10 @@ impl eframe::App for ClipperApp {
         // Right: Edit panel. Shows whenever a clip is selected in
         // Advanced mode — click a clip to edit it, click empty lane (or
         // switch modes) and it goes away. No open/close ceremony.
-        if self
-            .project
-            .as_ref()
-            .is_some_and(|p| p.mode == EditMode::MultiTrack && !p.selected_clips.is_empty())
-        {
+        if self.project.as_ref().is_some_and(|p| {
+            p.mode == EditMode::MultiTrack
+                && (!p.selected_clips.is_empty() || p.selected_text.is_some())
+        }) {
             egui::SidePanel::right("edit_panel")
                 .resizable(true)
                 .default_width(280.0)
@@ -1898,7 +1953,15 @@ impl eframe::App for ClipperApp {
                             egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                         )
                         .show(ui, |ui| {
-                            self.show_edit_panel(ui);
+                            if self
+                                .project
+                                .as_ref()
+                                .is_some_and(|p| p.selected_text.is_some())
+                            {
+                                self.show_text_inspector(ui);
+                            } else {
+                                self.show_edit_panel(ui);
+                            }
                             ui.add_space(12.0);
                         });
                 });
@@ -2046,8 +2109,6 @@ impl ClipperApp {
         // The intermediate block scopes the borrow so the writes later
         // (push_undo, track / clip mutation) don't conflict.
         struct Snapshot {
-            clip_id: ClipId,
-            track_kind: Option<TrackKind>,
             /// Which audio CLIPS this Edit affects. Gain is per-clip so
             /// one loud segment can be pulled down without touching the
             /// rest of the track. For an audio clip: just itself. For a
@@ -2093,8 +2154,6 @@ impl ClipperApp {
             let speed_target_clip_ids: Vec<ClipId> =
                 project.edit_ids(clip_id).into_iter().collect();
             Some(Snapshot {
-                clip_id,
-                track_kind: kind,
                 audio_clip_ids,
                 initial_gain,
                 speed_target_clip_ids,
@@ -2199,283 +2258,9 @@ impl ClipperApp {
             }
         }
 
-        // ─────────── Text overlay (per-segment, V tracks only) ───────────
-        if snap.track_kind == Some(TrackKind::Video) {
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("Text overlay")
-                    .color(theme::TEXT_MUTED)
-                    .small(),
-            );
-
-            // Caption settings belong only to the video segment being edited.
-            let clip_id_for_text = snap.clip_id;
-            let mut overlay_state = self
-                .project
-                .as_ref()
-                .and_then(|p| p.text_overlays.get(&clip_id_for_text).cloned());
-            let mut enabled = overlay_state.is_some();
-            let prev_enabled = enabled;
-
-            ui.checkbox(&mut enabled, "Burn caption into this segment");
-            if enabled != prev_enabled {
-                self.push_undo();
-                if let Some(p) = self.project.as_mut() {
-                    if enabled {
-                        p.text_overlays
-                            .insert(clip_id_for_text, TextOverlay::default());
-                    } else {
-                        p.text_overlays.remove(&clip_id_for_text);
-                    }
-                }
-                overlay_state = self
-                    .project
-                    .as_ref()
-                    .and_then(|p| p.text_overlays.get(&clip_id_for_text).cloned());
-            }
-
-            if let Some(mut overlay) = overlay_state {
-                let original = overlay.clone();
-                ui.add_space(4.0);
-                let text_resp = ui.add(
-                    egui::TextEdit::singleline(&mut overlay.text)
-                        .hint_text("Caption…")
-                        .desired_width(f32::INFINITY),
-                );
-                if text_resp.gained_focus() {
-                    self.push_undo();
-                }
-
-                let x_resp = ui.add(
-                    egui::Slider::new(&mut overlay.x, 0.0..=1.0)
-                        .step_by(0.01)
-                        .text("Horiz"),
-                );
-                if x_resp.drag_started() {
-                    self.push_undo();
-                }
-                let y_resp = ui.add(
-                    egui::Slider::new(&mut overlay.y, 0.0..=1.0)
-                        .step_by(0.01)
-                        .text("Vert"),
-                );
-                if y_resp.drag_started() {
-                    self.push_undo();
-                }
-                let size_resp =
-                    ui.add(egui::Slider::new(&mut overlay.font_size_px, 12..=500).text("Size"));
-                if size_resp.drag_started() {
-                    self.push_undo();
-                }
-
-                // Font family/style dropdown.
-                let mut font_choice = overlay.font.clone();
-                let prev_font = font_choice.clone();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Font").color(theme::TEXT_MUTED).small());
-                    egui::ComboBox::from_id_salt("text_overlay_font")
-                        .selected_text(&font_choice)
-                        .show_ui(ui, |ui| {
-                            for option in track::FONT_CHOICES {
-                                ui.selectable_value(
-                                    &mut font_choice,
-                                    option.display.into(),
-                                    option.display,
-                                );
-                            }
-                        });
-                });
-                if font_choice != prev_font {
-                    self.push_undo();
-                    overlay.font = font_choice;
-                }
-
-                let mut color = overlay.color;
-                let color_resp = ui
-                    .horizontal(|ui| {
-                        ui.label(RichText::new("Color").color(theme::TEXT_MUTED).small());
-                        ui.color_edit_button_srgb(&mut color)
-                    })
-                    .inner;
-                if color_resp.changed() {
-                    self.push_undo();
-                    overlay.color = color;
-                }
-
-                // Typography extras — outline, shadow, opacity. All baked
-                // into the export via drawtext; the preview approximates
-                // them (see show_text_overlay_handle).
-                let outline_resp =
-                    ui.add(egui::Slider::new(&mut overlay.outline_px, 0..=12).text("Outline"));
-                if outline_resp.drag_started() {
-                    self.push_undo();
-                }
-                let opacity_resp = ui.add(
-                    egui::Slider::new(&mut overlay.opacity, 0.1..=1.0)
-                        .step_by(0.05)
-                        .text("Opacity"),
-                );
-                if opacity_resp.drag_started() {
-                    self.push_undo();
-                }
-                let mut shadow = overlay.shadow;
-                if ui.checkbox(&mut shadow, "Drop shadow").changed() {
-                    self.push_undo();
-                    overlay.shadow = shadow;
-                }
-
-                ui.label(
-                    RichText::new("Applies to this video segment in preview and export.")
-                        .small()
-                        .color(theme::TEXT_MUTED.linear_multiply(0.7)),
-                );
-
-                // Write back if anything actually changed.
-                if overlay != original {
-                    if let Some(p) = self.project.as_mut() {
-                        p.text_overlays.insert(clip_id_for_text, overlay);
-                    }
-                }
-            }
-        }
-
         if want_close {
             if let Some(p) = self.project.as_mut() {
                 p.selected_clips.clear();
-            }
-        }
-    }
-
-    /// Live caption overlay on top of the preview. We paint the text in
-    /// egui (matching the user's font/size/color choices) and keep a
-    /// draggable hit area around it. Because there's no ffmpeg filter
-    /// involved here, drag is just per-frame repaint — fast and smooth
-    /// regardless of how big the font gets. The same overlay struct is
-    /// then baked into the export by ffmpeg's drawtext at render time.
-    fn show_text_overlay_handle(
-        &mut self,
-        ui: &mut egui::Ui,
-        preview_rect: &egui::Rect,
-        clip_id: ClipId,
-        overlay: &TextOverlay,
-    ) {
-        // font_size_px is in SOURCE pixels; scale by preview height / source
-        // height so the on-screen size matches what export will produce.
-        let source_h = self
-            .project
-            .as_ref()
-            .map(|p| p.media.height.max(1) as f32)
-            .unwrap_or(720.0);
-        let font_screen = (overlay.font_size_px as f32 * preview_rect.height() / source_h).max(6.0);
-
-        // Pick the egui family that matches the user's font choice. We
-        // try the loaded DejaVu variant first; if it wasn't found at
-        // startup, egui falls back to its built-in Proportional family.
-        let choice = track::font_choice(&overlay.font);
-        let family = if choice.display == "Mono" {
-            egui::FontFamily::Monospace
-        } else {
-            egui::FontFamily::Name(choice.egui_family.into())
-        };
-        let font_id = egui::FontId::new(font_screen, family);
-
-        let cx = preview_rect.left() + overlay.x.clamp(0.0, 1.0) * preview_rect.width();
-        let cy = preview_rect.top() + overlay.y.clamp(0.0, 1.0) * preview_rect.height();
-        let opacity = overlay.opacity.clamp(0.1, 1.0);
-        let alpha = (opacity * 255.0) as u8;
-        let color = Color32::from_rgba_unmultiplied(
-            overlay.color[0],
-            overlay.color[1],
-            overlay.color[2],
-            alpha,
-        );
-        // Preview approximations of the export-side drawtext layers. The
-        // pixel scale matches the font scaling above so proportions hold.
-        let px = preview_rect.height() / source_h;
-
-        let galley = ui
-            .painter()
-            .layout_no_wrap(overlay.text.clone(), font_id.clone(), color);
-        let text_size = galley.size();
-        let text_pos = egui::pos2(cx - text_size.x * 0.5, cy - text_size.y * 0.5);
-
-        // Drop shadow: one offset black pass under everything.
-        if overlay.shadow {
-            let off = (2.0 * px).max(1.0);
-            let shadow_color =
-                Color32::from_rgba_unmultiplied(0, 0, 0, (0.6 * opacity * 255.0) as u8);
-            let g =
-                ui.painter()
-                    .layout_no_wrap(overlay.text.clone(), font_id.clone(), shadow_color);
-            ui.painter()
-                .galley(text_pos + egui::vec2(off, off), g, shadow_color);
-        }
-        // Outline: eight offset black passes ringing the fill. Cruder
-        // than drawtext's real border but reads the same at preview size.
-        if overlay.outline_px > 0 {
-            let r = (overlay.outline_px as f32 * px).max(1.0);
-            let outline_color = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
-            for (dx, dy) in [
-                (-r, 0.0),
-                (r, 0.0),
-                (0.0, -r),
-                (0.0, r),
-                (-r, -r),
-                (r, -r),
-                (-r, r),
-                (r, r),
-            ] {
-                let g = ui.painter().layout_no_wrap(
-                    overlay.text.clone(),
-                    font_id.clone(),
-                    outline_color,
-                );
-                ui.painter()
-                    .galley(text_pos + egui::vec2(dx, dy), g, outline_color);
-            }
-        }
-        ui.painter().galley(text_pos, galley, color);
-
-        // Drag-hit area: a touch larger than the rendered text so it's
-        // easy to grab even with tiny captions.
-        let handle = egui::Rect::from_center_size(
-            egui::pos2(cx, cy),
-            egui::vec2(
-                (text_size.x + 16.0).max(40.0),
-                (text_size.y + 8.0).max(20.0),
-            ),
-        );
-        let resp = ui.interact(
-            handle,
-            egui::Id::new(("text_handle", clip_id)),
-            egui::Sense::click_and_drag(),
-        );
-        if resp.hovered() || resp.dragged() {
-            let stroke = if resp.dragged() {
-                egui::Stroke::new(2.0_f32, theme::ACCENT)
-            } else {
-                egui::Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(150, 200, 255, 180))
-            };
-            ui.painter().rect_stroke(handle, 4.0, stroke);
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-        }
-
-        if resp.drag_started() {
-            self.push_undo();
-        }
-        if resp.dragged() {
-            let delta = resp.drag_delta();
-            if delta != egui::Vec2::ZERO {
-                let dx = delta.x / preview_rect.width().max(1.0);
-                let dy = delta.y / preview_rect.height().max(1.0);
-                if let Some(p) = self.project.as_mut() {
-                    if let Some(o) = p.text_overlays.get_mut(&clip_id) {
-                        o.x = (o.x + dx).clamp(0.0, 1.0);
-                        o.y = (o.y + dy).clamp(0.0, 1.0);
-                    }
-                }
             }
         }
     }
@@ -2579,18 +2364,6 @@ impl ClipperApp {
                     ui.painter().add(callback);
                 }
             });
-
-        // Draw only the caption on the video segment under the playhead.
-        let active_caption = self
-            .project
-            .as_ref()
-            .and_then(Project::active_caption)
-            .map(|(id, overlay)| (id, overlay.clone()));
-        if let Some((clip_id, overlay)) =
-            active_caption.filter(|_| !self.project.as_ref().is_some_and(|p| p.needs_composition()))
-        {
-            self.show_text_overlay_handle(ui, &preview_rect, clip_id, &overlay);
-        }
 
         // Preview-local controls row directly under the preview frame:
         // pop out + volume. These only affect playback, not editing, so
@@ -4482,14 +4255,6 @@ fn find_snap_target(
     best.map(|(t, _)| t)
 }
 
-/// Shared ordering for exported ranges and their segment captions.
-#[cfg(test)]
-fn sorted_track_clips(clips: &[Clip], track_id: TrackId) -> Vec<&Clip> {
-    let mut out: Vec<&Clip> = clips.iter().filter(|c| c.track_id == track_id).collect();
-    out.sort_by_key(|c| c.cut_start_ms);
-    out
-}
-
 fn format_bytes(b: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -4891,7 +4656,7 @@ fn release_mouse_focus(ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-mod caption_tests {
+mod text_layer_tests {
     use super::*;
 
     fn project() -> Project {
@@ -4918,7 +4683,8 @@ mod caption_tests {
             tracks: Vec::new(),
             clips: Vec::new(),
             selected_clips: HashSet::new(),
-            text_overlays: HashMap::new(),
+            texts: Vec::new(),
+            selected_text: None,
             id_gen: IdGen::default(),
             mode: EditMode::MultiTrack,
         };
@@ -4927,70 +4693,76 @@ mod caption_tests {
     }
 
     #[test]
-    fn split_captions_edit_independently_and_undo_restores_them() {
+    fn new_text_starts_at_the_playhead_selected_and_inherits_the_last_look() {
         let mut p = project();
-        let left = p.clips[0].id;
-        p.text_overlays.insert(
-            left,
-            TextOverlay {
-                text: "Before".into(),
-                ..Default::default()
-            },
+        p.selected_clips.insert(p.clips[0].id);
+        p.playhead_ms = 1_500;
+        let first = p.add_text();
+        assert_eq!(p.selected_text, Some(first));
+        assert!(
+            p.selected_clips.is_empty(),
+            "text and clip selection are exclusive"
         );
-        let before = UndoSnapshot::capture(&p);
-        let right = p.split_segments(&[left], 2_000)[0];
-        assert_eq!(p.text_overlays[&right].text, "Before");
-        p.text_overlays.get_mut(&right).unwrap().text = "After".into();
-        assert_eq!(p.text_overlays[&left].text, "Before");
-        p.playhead_ms = 1_999;
-        assert_eq!(p.active_caption().unwrap().1.text, "Before");
-        p.playhead_ms = 2_000;
-        assert_eq!(p.active_caption().unwrap().1.text, "After");
-        let after = UndoSnapshot::capture(&p);
-        before.apply(&mut p);
-        assert!(!p.text_overlays.contains_key(&right));
-        assert_eq!(p.clips[0].src_end_ms, 6_000);
-        after.apply(&mut p);
-        assert_eq!(p.active_caption().unwrap().1.text, "After");
+        let t = p.text(first).unwrap();
+        assert_eq!((t.start_ms, t.end_ms), (1_500, 4_500));
+
+        let moved = p.text_mut(first).unwrap();
+        moved.x = 0.2;
+        moved.style.font = crate::text::TextFont::Bangers;
+        let second = p.add_text();
+        assert_ne!(first, second);
+        let t = p.text(second).unwrap();
+        assert_eq!(t.x, 0.2);
+        assert_eq!(t.style.font, crate::text::TextFont::Bangers);
+        assert!(t.text.is_empty());
     }
 
     #[test]
-    fn captions_follow_moved_segments_and_disappear_in_gaps() {
+    fn split_text_cuts_at_the_playhead_and_selects_the_right_half() {
         let mut p = project();
-        let left = p.clips[0].id;
-        let right = p.split_segments(&[left], 2_000)[0];
-        p.text_overlays.insert(
-            left,
-            TextOverlay {
-                text: "First".into(),
-                ..Default::default()
-            },
+        let id = p.add_text();
+        p.text_mut(id).unwrap().text = "Hello".into();
+        p.playhead_ms = 100;
+        assert!(!p.split_text(id), "too close to the start");
+        p.playhead_ms = 1_000;
+        assert!(p.split_text(id));
+        let right = p.selected_text.unwrap();
+        assert_ne!(right, id);
+        assert_eq!(
+            (p.text(id).unwrap().start_ms, p.text(id).unwrap().end_ms),
+            (0, 1_000)
         );
-        p.text_overlays.insert(
-            right,
-            TextOverlay {
-                text: "Second".into(),
-                ..Default::default()
-            },
+        let r = p.text(right).unwrap();
+        assert_eq!(
+            (r.start_ms, r.end_ms, r.text.as_str()),
+            (1_000, 3_000, "Hello")
         );
-        p.clips
-            .iter_mut()
-            .find(|c| c.id == left)
-            .unwrap()
-            .cut_start_ms = 7_000;
-        p.clips
-            .iter_mut()
-            .find(|c| c.id == right)
-            .unwrap()
-            .cut_start_ms = 0;
-        let captions = p.video_captions(p.first_video_track().unwrap());
-        assert_eq!(captions[0].as_ref().unwrap().text, "Second");
-        assert_eq!(captions[1].as_ref().unwrap().text, "First");
+    }
+
+    #[test]
+    fn undo_restores_text_layers_and_selection() {
+        let mut p = project();
+        let before = UndoSnapshot::capture(&p);
+        let id = p.add_text();
+        p.text_mut(id).unwrap().text = "Hi".into();
+        let after = UndoSnapshot::capture(&p);
+        before.apply(&mut p);
+        assert!(p.texts.is_empty());
+        assert_eq!(p.selected_text, None);
+        after.apply(&mut p);
+        assert_eq!(p.text(id).unwrap().text, "Hi");
+        assert_eq!(p.selected_text, Some(id));
+    }
+
+    #[test]
+    fn text_past_the_last_clip_extends_the_export() {
+        let mut p = project();
         p.playhead_ms = 5_000;
-        assert!(p.active_caption().is_none());
-        p.playhead_ms = 7_000;
-        assert_eq!(p.active_caption().unwrap().1.text, "First");
-        p.text_overlays.remove(&left);
-        assert!(p.active_caption().is_none());
+        let id = p.add_text();
+        assert_eq!(p.content_end_ms(), 8_000);
+        let composition = p.composition(false);
+        assert_eq!(composition.texts.len(), 1);
+        assert_eq!(composition.texts[0].id, id);
+        assert_eq!(composition.duration_ms, 8_000);
     }
 }

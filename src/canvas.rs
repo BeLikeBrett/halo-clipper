@@ -32,7 +32,7 @@ pub(super) struct CanvasUi {
     outline_clip: Option<ClipId>,
     outline_until: f64,
     /// Snap guides for the drag in progress (empty when not snapped).
-    guides: Vec<Guide>,
+    pub(super) guides: Vec<Guide>,
 }
 impl Default for CanvasUi {
     fn default() -> Self {
@@ -80,12 +80,12 @@ const SNAP_PX: f32 = 10.0;
 /// Lines a moving layer can lock to: the canvas edges and center, plus
 /// the edges and centers of the other visible layers.
 #[derive(Debug, Default)]
-struct SnapTargets {
+pub(super) struct SnapTargets {
     xs: Vec<f32>,
     ys: Vec<f32>,
 }
 impl SnapTargets {
-    fn new(canvas: egui::Rect, others: impl IntoIterator<Item = egui::Rect>) -> Self {
+    pub(super) fn new(canvas: egui::Rect, others: impl IntoIterator<Item = egui::Rect>) -> Self {
         let mut t = Self {
             xs: vec![canvas.left(), canvas.center().x, canvas.right()],
             ys: vec![canvas.top(), canvas.center().y, canvas.bottom()],
@@ -117,7 +117,7 @@ fn nearest(edges: &[f32], targets: &[f32]) -> Option<(f32, f32)> {
 
 /// Snaps a moved layer: each axis independently aligns its nearest edge
 /// or center. Returns the corrected rect plus the guides to draw.
-fn snap_move(rect: egui::Rect, targets: &SnapTargets) -> (egui::Rect, Vec<Guide>) {
+pub(super) fn snap_move(rect: egui::Rect, targets: &SnapTargets) -> (egui::Rect, Vec<Guide>) {
     let mut guides = Vec::new();
     let mut offset = egui::Vec2::ZERO;
     if let Some((dx, x)) = nearest(&[rect.left(), rect.center().x, rect.right()], &targets.xs) {
@@ -191,6 +191,7 @@ impl ClipperApp {
         let previous = settings;
         let focused = p.selected_clips.iter().copied().find(|id| p.is_video(*id));
         let mut reset: Option<ClipId> = None;
+        let mut add_text = false;
         if let Background::Color(rgb) = settings.background {
             // Follow undo/redo and project loads without disturbing a hue
             // the picker is holding for a grey.
@@ -299,6 +300,13 @@ impl ClipperApp {
             {
                 reset = focused;
             }
+            if ui
+                .button("Add text")
+                .on_hover_text("New text layer at the playhead (T). Drag it anywhere on the preview.")
+                .clicked()
+            {
+                add_text = true;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(format!("{} × {}", media.width, media.height))
@@ -321,6 +329,9 @@ impl ClipperApp {
         }
         if !editing {
             self.canvas_ui.color_editing = false;
+        }
+        if add_text {
+            self.add_text_layer();
         }
         ui.add_space(8.0);
         let available = ui.available_rect_before_wrap();
@@ -427,12 +438,26 @@ impl ClipperApp {
                 stopped |= response.drag_stopped();
             }
         }
-        if bg.clicked() && !clicked {
+        // Text layers sit above the video, so they register last and win
+        // overlapping hits.
+        let video_rects: Vec<egui::Rect> = frames
+            .iter()
+            .map(|f| layer_rect(canvas, f.width, f.height, f.transform))
+            .collect();
+        let text_took = self.interact_canvas_texts(ui, canvas, &video_rects);
+        if text_took {
             selected = None;
-        }
-        if clicked || bg.clicked() || start_drag.is_some() {
-            if let Some(p) = &mut self.project {
-                p.selected_clips = selected.into_iter().collect();
+            start_drag = None;
+            drag_pointer = None;
+        } else {
+            if bg.clicked() && !clicked {
+                selected = None;
+            }
+            if clicked || bg.clicked() || start_drag.is_some() {
+                if let Some(p) = &mut self.project {
+                    p.selected_clips = selected.into_iter().collect();
+                    p.selected_text = None;
+                }
             }
         }
         if let Some(drag) = start_drag {
@@ -441,7 +466,7 @@ impl ClipperApp {
             self.live.pause();
             self.canvas_drag = Some(drag);
         }
-        if self.canvas_drag.is_none() {
+        if self.canvas_drag.is_none() && !self.text_dragging() {
             self.canvas_ui.guides.clear();
         }
         if let (Some(drag), Some(pointer)) = (&self.canvas_drag, drag_pointer) {
@@ -576,10 +601,14 @@ impl ClipperApp {
                 .as_ref()
                 .and_then(|p| track::clip_by_id(&p.clips, frame.id))
             {
-                frame.transform = c.transform;
+                let at = self.project.as_ref().map_or(0, |p| p.playhead_ms);
+                (frame.transform, frame.flash) =
+                    c.animation
+                        .sample(c.transform, at - c.cut_start_ms, c.duration_ms());
             }
         }
         self.live.paint(ui, canvas, settings.background);
+        self.paint_canvas_texts(ui, canvas);
         let visible = now < self.canvas_ui.outline_until || self.canvas_drag.is_some();
         if visible {
             ui.ctx().request_repaint_after(Duration::from_secs_f64(

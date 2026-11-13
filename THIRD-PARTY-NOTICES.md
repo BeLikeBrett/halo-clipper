@@ -23,6 +23,14 @@ packages also contain third-party software under its respective licenses.
   assets/fonts/Inter-LICENSE.txt and assets/fonts/JetBrainsMono-LICENSE.txt
   (licenses/ in Windows packages).
 
+- Caption fonts: Montserrat ExtraBold, Poppins Bold, Bebas Neue, Anton,
+  Bangers, Pacifico, Courier Prime Bold, and Playfair Display Bold are Latin
+  subsets licensed under SIL OFL 1.1. Their notices are retained in
+  assets/fonts/caption/*-OFL.txt. Luckiest Guy and Permanent Marker are
+  licensed under Apache 2.0 (assets/fonts/caption/Apache-2.0.txt).
+  Source families: https://github.com/google/fonts. Windows packages include
+  every caption license under licenses/caption-*.
+
 Runtime binaries are redistributed without modifying their contents. They are
 not covered by the Halo Clipper source license. Retain runtime notices when
 redistributing a package. Linux uses system media libraries and programs.

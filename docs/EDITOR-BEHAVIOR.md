@@ -65,11 +65,11 @@ isolated configuration/cache directories.
 - The shortcut footer has an explicit height. Its earlier implicit minimum
   caused the parent panel to grow a few pixels on each redraw.
 - The Edit panel has a bounded scroll viewport; read-only clip details are removed.
-- Background color editing uses an inline HSV picker in a persistent floating
-  window, avoiding nested popup dismissal. A pointer drag is one undo action.
+- Background color editing uses the toolbar drop-down and an inline HSV picker.
+  A pointer drag is one undo action.
 - Wheel zoom is anchored at the pointer and grouped into undo gestures. Undo and
   reset stop lingering wheel inertia. Idle selection decoration fades after
-  1.8 seconds; the clip remains selected. Reset frame fills and centers the clip.
+  1.8 seconds; the clip remains selected. Reset frame uses the aspect-aware rule below.
 - Simple Clip shares imports but keeps per-source marks, positions, and undo/redo
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
@@ -78,7 +78,7 @@ isolated configuration/cache directories.
 
 - Typography: Inter (Regular/Medium/SemiBold) for the interface and
   JetBrains Mono for timecodes, embedded as small Latin subsets. DejaVu stays
-  as fallback and for caption previews. Weights are separate font families
+  as a fallback. Weights are separate font families
   because egui has no synthetic bold; use `theme::medium/semibold/mono`.
 - Icons are painted (`widgets.rs`), never emoji glyphs, so weight and
   alignment don't depend on the fallback font.
@@ -131,6 +131,41 @@ isolated configuration/cache directories.
   `picker.rs` (saturation/brightness square, hue strip, presets, hex field).
   One drag in the picker is one undo step.
 
+## Independent text layers (2026-11-13)
+
+- Advanced text is stored in `Project::texts`, independently of media clips.
+  Its position is normalized to the output canvas, so titles can sit in the
+  bars around a fitted video. Text paints above video in list order.
+- T, Add text, or the Text band’s + adds a three-second layer at the playhead,
+  pauses playback, selects it, and focuses the text field. A new layer inherits
+  the previous look. Empty layers show a preview placeholder and never export it.
+- Drag the preview text to position it. Canvas and video edges/centers snap;
+  Alt bypasses snapping. Drag a corner or scroll over selected text to resize.
+  Position changes reuse the texture; rasterization happens only for a change
+  in text, style, size, canvas size, or animation state. No mpv filter rebuilds.
+- The inspector has eleven bundled font choices, six style presets, swatches
+  and custom color, alignment, outline, shadow, and box controls. Position has
+  no numeric sliders. Presets preserve the chosen font and alignment.
+- Intros: None, Fade, Pop, Rise, Type, Words. Outros: None, Fade, Pop, Drop.
+  Separate In/Out time sliders control duration (50 ms–5 seconds), including
+  the complete Type/Words reveal. Short layers cap each transition at half
+  their length. Paused selection shows settled text for editing;
+  selected text outside its range is ghosted only while paused.
+- Text bars are pinned under the ruler. Drag the body to move or an end to trim,
+  with snapping to playhead and neighboring edit points (Alt bypasses it).
+  S splits selected text and selects the right half; Del removes it. The bar
+  context menu offers Duplicate and Delete. Overlaps stack in up to four rows.
+- Text editing is included in Advanced undo history; text and clip selection
+  are mutually exclusive. A text-entry gesture or pointer drag is one undo step.
+- `text.rs` holds the model/animation curves; `textrender.rs` draws with bundled
+  fonts using ab_glyph and tiny-skia; `textui.rs` owns the inspector and interaction.
+  Preview and export use that same rasterizer at their respective resolution.
+  Export caches held frames in PNG concat inputs and uses the output frame rate
+  for timestamps. Preparation checks cancellation between frames and scratch
+  assets are deleted on success, failure, or cancellation.
+- Removed the initial status and empty-preview “Open a video to begin” messages.
+  Actual operation/error status messages remain available.
+
 ## Native rendering
 
 The render adapter passes the generated native `mpv_opengl_fbo`, including its
@@ -156,3 +191,46 @@ Simple Clip keeps its decoded framebuffer at a stable source-aspect size, up
 to 1920 × 1080, and scales it into the viewport. Framebuffer allocation is
 included in the GL state guard. This avoids reallocating on divider/window
 resize and avoids fractional-size upscaler artifacts on software graphics.
+
+## Color mixing and clip motion (0.10.0)
+
+- Text, outline, and box each support solid custom colors or two-color gradients
+  in the collapsed Color mix section. Gradient direction, three palette shortcuts,
+  and box opacity appear only when relevant. The shared rasterizer keeps preview,
+  animation frames, and exports identical. Gradient edits invalidate texture caches.
+- Removed the text inspector's Preview animation button, instructions, and Delete
+  button. Transport, timeline context menu, and Delete shortcut remain available.
+- Each video segment has an Animation section in Edit: independent In/Out effect
+  selectors and durations, one Amount control when applicable, and edge playback.
+  None is the default. Effects are Fade, Snap zoom, Pull back, Whip, and Flash.
+  Zoom/whip curves use cubic ease-out on entry and cubic acceleration on exit.
+  Flash is a single linear white blend; Fade changes the segment's alpha.
+- Animation lives on the segment, participates in undo/redo and duplication,
+  follows speed-adjusted timeline duration, and leaves attached audio untouched.
+  Splitting keeps the intro on the left and outro on the right without adding
+  effects at the new internal cut. Short segments cap each edge at half duration.
+- Live GPU transforms/white blending and FFmpeg export use shared timing and
+  amplitudes from animation.rs. Export zoom dimensions round to even pixels.
+
+References used to select a focused set of short-form effects:
+
+- [Adobe: modern transitions](https://helpx.adobe.com/premiere/desktop/add-video-effects/types-of-effects/transitions.html)
+  includes cross zoom, pull motion, and whip.
+- [CapCut: transition trends](https://www.capcut.com/help/capcut-transitions)
+  covers fade/zoom and swipe/motion styles.
+- [CapCut: flash templates](https://www.capcut.com/explore/camera-flash-transition-effect)
+  provides examples of flash and zoom edits.
+
+Halo's effects operate on individual segment edges; they do not overlap or shorten
+neighboring clips. This release does not add speed ramps or automatic beat syncing.
+
+## Native media drops
+
+Windows OLE drops are explicitly enabled on the viewport; Linux uses winit's
+X11/Wayland file-drop events. External drags briefly highlight Media and show
+Drop to import. Single or multiple files are probed and staged in the bin,
+without placing timeline clips or switching the current Simple Clip source.
+The first video initializes an empty Simple workspace; an empty Advanced
+workspace keeps its mode. Duplicate paths are skipped, invalid files report
+an error while valid files in the same batch still import. An Advanced batch
+uses one undo step. The Import button remains available.

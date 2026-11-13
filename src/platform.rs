@@ -41,43 +41,6 @@ pub fn init() {
     }
 }
 
-#[cfg(windows)]
-pub fn caption_font(display: &str) -> PathBuf {
-    let (name, bytes): (&str, &[u8]) = match display {
-        "Sans Bold" => (
-            "DejaVuSans-Bold.ttf",
-            include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf"),
-        ),
-        "Sans Italic" => (
-            "DejaVuSans-Oblique.ttf",
-            include_bytes!("../assets/fonts/DejaVuSans-Oblique.ttf"),
-        ),
-        "Serif" => (
-            "DejaVuSerif.ttf",
-            include_bytes!("../assets/fonts/DejaVuSerif.ttf"),
-        ),
-        "Serif Bold" => (
-            "DejaVuSerif-Bold.ttf",
-            include_bytes!("../assets/fonts/DejaVuSerif-Bold.ttf"),
-        ),
-        "Mono" => (
-            "DejaVuSansMono.ttf",
-            include_bytes!("../assets/fonts/DejaVuSansMono.ttf"),
-        ),
-        _ => (
-            "DejaVuSans.ttf",
-            include_bytes!("../assets/fonts/DejaVuSans.ttf"),
-        ),
-    };
-    let folder = data_dir().join("fonts");
-    let path = folder.join(name);
-    if !path.exists() {
-        let _ = std::fs::create_dir_all(folder);
-        let _ = std::fs::write(&path, bytes);
-    }
-    path
-}
-
 /// Swaps the window's icons for the multi-size icon embedded in the
 /// executable (resource 1, see `build.rs`). winit only accepts a single
 /// RGBA image and lets Windows scale it, which smears the 16 px title-bar

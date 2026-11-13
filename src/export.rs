@@ -14,7 +14,7 @@
 //!
 //! Both paths share the same progress reporting / cancellation contract.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -110,9 +110,6 @@ pub enum ExportPlan {
         src_fps: f64,
         /// Ordered by cut_start_ms, non-overlapping.
         video_clips: Vec<ClipRange>,
-        /// Optional caption for each video segment, in video_clips order.
-        /// Each caption is visible only during its segment (never gaps).
-        video_text_overlays: Vec<Option<crate::track::TextOverlay>>,
         /// One entry per audio track. Non-muted tracks are mixed together
         /// in the output via `amix`. If all are muted/empty, the output
         /// has no audio stream.
@@ -282,9 +279,14 @@ fn run_plan(
             composition,
             destination,
             encode,
-        } => composition
-            .command(destination, encode)
-            .and_then(|cmd| run_ffmpeg_with_progress(cmd, &progress, &cancel_flag, &child_slot)),
+        } => run_layered(
+            composition,
+            destination,
+            encode,
+            &progress,
+            &cancel_flag,
+            &child_slot,
+        ),
         ExportPlan::Simple {
             source,
             destination,
@@ -313,7 +315,6 @@ fn run_plan(
             src_height,
             src_fps,
             video_clips,
-            video_text_overlays,
             audio_tracks,
             encode,
         } => run_multitrack(
@@ -323,7 +324,6 @@ fn run_plan(
             (*src_width, *src_height),
             *src_fps,
             video_clips,
-            video_text_overlays,
             audio_tracks,
             encode,
             &progress,
@@ -571,6 +571,58 @@ pub fn output_duration_ms(clips: &[ClipRange], timeline_end_ms: i64) -> i64 {
     out.round() as i64
 }
 
+/// Renders the text layers to frames in a scratch folder, runs the
+/// composition, then removes the folder whatever the outcome.
+fn run_layered(
+    composition: &crate::composition::Composition,
+    destination: &Path,
+    encode: &EncodeSettings,
+    progress: &Arc<Mutex<ExportProgress>>,
+    cancel_flag: &Arc<AtomicBool>,
+    child_slot: &Arc<Mutex<Option<Child>>>,
+) -> Result<()> {
+    let scratch = ScratchDir::new("text")?;
+    let (w, h, fps) = composition.output_format(encode);
+    let texts = crate::textrender::write_export_layers(
+        &composition.texts,
+        w,
+        h,
+        fps,
+        scratch.path(),
+        || cancel_flag.load(Ordering::SeqCst),
+    )
+    .context("rendering text layers")?;
+    let cmd = composition.command(destination, encode, &texts)?;
+    run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot)
+}
+
+/// Temporary directory removed on drop.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(label: &str) -> Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "halo-clipper-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_multitrack(
     source: &Path,
@@ -579,7 +631,6 @@ fn run_multitrack(
     src_dims: (u32, u32),
     src_fps: f64,
     video_clips: &[ClipRange],
-    video_text_overlays: &[Option<crate::track::TextOverlay>],
     audio_tracks: &[AudioTrackPlan],
     encode: &EncodeSettings,
     progress: &Arc<Mutex<ExportProgress>>,
@@ -612,11 +663,6 @@ fn run_multitrack(
     // it — everything after the first gap plays desynced.
     let (src_w, src_h) = src_dims;
     let (out_w, out_h) = encode.resolution.unwrap_or((src_w, src_h));
-    let px_scale = if src_h > 0 {
-        out_h as f64 / src_h as f64
-    } else {
-        1.0
-    };
     let on_gpu_after_post = encode.video_codec.needs_vaapi_upload();
     let black_gap = |filter: &mut String, idx: usize, dur_ms: i64| -> String {
         // Every segment has already been scaled and handed to the
@@ -659,20 +705,7 @@ fn run_multitrack(
             // halves the timestamps, doubling effective playback rate.
             format!("setpts=(PTS-STARTPTS)/{speed:.4}")
         };
-        // Burn the caption into this segment before joining segments.
-        // Scope follows the actual frames, including speed changes and
-        // concat's frame rounding, rather than an approximate time gate.
-        let drawtext = video_text_overlays
-            .get(i)
-            .and_then(Option::as_ref)
-            .filter(|o| !o.text.trim().is_empty())
-            .map(|overlay| build_drawtext(overlay, px_scale));
-        let post = build_video_post_chain(
-            hw_decode,
-            encode.resolution,
-            drawtext.as_deref(),
-            on_gpu_after_post,
-        );
+        let post = build_video_post_chain(hw_decode, encode.resolution, None, on_gpu_after_post);
         let post_suffix = if post.is_empty() {
             String::new()
         } else {
@@ -865,62 +898,6 @@ pub(crate) fn audio_container_args(encode: &EncodeSettings, destination: &Path) 
     }
 }
 
-/// Render a TextOverlay into a drawtext filter expression. `px_scale`
-/// converts source-pixel values (font size, outline width, shadow
-/// offset) into output pixels — drawtext runs after the scale step, so
-/// a 4K-source caption exported at 1080p must halve its pixel sizes to
-/// keep the same on-screen proportion the preview showed.
-pub(crate) fn build_drawtext(overlay: &crate::track::TextOverlay, px_scale: f64) -> String {
-    let safe = drawtext_escape(&overlay.text);
-    let color_hex = ((overlay.color[0] as u32) << 16)
-        | ((overlay.color[1] as u32) << 8)
-        | (overlay.color[2] as u32);
-    #[cfg(not(windows))]
-    let font_spec = format!(
-        "font='{}'",
-        crate::track::font_choice(&overlay.font).fontconfig
-    );
-    #[cfg(windows)]
-    let font_spec = format!(
-        "fontfile='{}'",
-        drawtext_escape(
-            &crate::platform::caption_font(&overlay.font)
-                .to_string_lossy()
-                .replace('\\', "/")
-        )
-    );
-
-    let opacity = overlay.opacity.clamp(0.1, 1.0);
-    let scale_px = |px: u32| ((px as f64 * px_scale).round() as u32).max(1);
-
-    let mut expr = format!(
-        "drawtext=expansion=none:text='{}':{}:x='w*{:.3}-text_w/2':\
-         y='h*{:.3}-text_h/2':fontsize={}:fontcolor=#{:06X}@{:.2}",
-        safe,
-        font_spec,
-        overlay.x.clamp(0.0, 1.0),
-        overlay.y.clamp(0.0, 1.0),
-        scale_px(overlay.font_size_px.clamp(8, 1000)),
-        color_hex,
-        opacity,
-    );
-    if overlay.outline_px > 0 {
-        expr.push_str(&format!(
-            ":borderw={}:bordercolor=black@{:.2}",
-            scale_px(overlay.outline_px.min(20)),
-            opacity,
-        ));
-    }
-    if overlay.shadow {
-        let off = scale_px(2);
-        expr.push_str(&format!(
-            ":shadowx={off}:shadowy={off}:shadowcolor=black@{:.2}",
-            0.6 * opacity,
-        ));
-    }
-    expr
-}
-
 // ------------------------------------------------------------------
 // Shared: drive an ffmpeg child + parse -progress key=value stream.
 // ------------------------------------------------------------------
@@ -1071,24 +1048,6 @@ fn build_video_post_chain(
     }
 
     parts
-}
-
-/// Escape user text for ffmpeg's `drawtext=text='...'` value. The text is
-/// already wrapped in single quotes by the caller; inside quotes we need
-/// to escape the quote character and a couple of others ffmpeg parses.
-pub(crate) fn drawtext_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str(r"\\"),
-            '\'' => out.push_str(r"\'"),
-            ':' => out.push_str(r"\:"),
-            // Drop control chars to avoid breaking the filter graph.
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Build an `atempo` filter expression that handles speeds outside
@@ -1344,48 +1303,6 @@ mod tests {
         assert_eq!(output_duration_ms(&clips, 11_000), 11_000);
     }
 
-    // ---- drawtext rendering --------------------------------------------
-
-    #[test]
-    fn drawtext_scales_pixel_values_to_output_height() {
-        let overlay = crate::track::TextOverlay {
-            text: "hi".into(),
-            font_size_px: 48,
-            outline_px: 4,
-            shadow: true,
-            ..Default::default()
-        };
-        // 4K source exported at 1080p → everything halves.
-        let expr = build_drawtext(&overlay, 0.5);
-        assert!(expr.contains("fontsize=24"), "got {expr}");
-        assert!(expr.contains("borderw=2"), "got {expr}");
-        assert!(expr.contains("shadowx=1"), "got {expr}");
-    }
-
-    #[test]
-    fn drawtext_opacity_reaches_all_layers() {
-        let overlay = crate::track::TextOverlay {
-            text: "hi".into(),
-            outline_px: 2,
-            opacity: 0.5,
-            ..Default::default()
-        };
-        let expr = build_drawtext(&overlay, 1.0);
-        assert!(expr.contains("fontcolor=#FFFFFF@0.50"), "got {expr}");
-        assert!(expr.contains("bordercolor=black@0.50"), "got {expr}");
-    }
-
-    #[test]
-    fn drawtext_omits_optional_layers_when_off() {
-        let overlay = crate::track::TextOverlay {
-            text: "hi".into(),
-            ..Default::default()
-        };
-        let expr = build_drawtext(&overlay, 1.0);
-        assert!(!expr.contains("borderw"), "got {expr}");
-        assert!(!expr.contains("shadowx"), "got {expr}");
-    }
-
     // ---- container gating ------------------------------------------------
 
     #[test]
@@ -1574,97 +1491,6 @@ mod tests {
     }
 
     #[test]
-    fn e2e_segment_captions_stay_on_their_own_segments() {
-        let source = test_dir().join("caption_black.mp4");
-        let status = crate::platform::command("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=black:size=320x180:rate=30:duration=7",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-            ])
-            .arg(&source)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let dest = test_dir().join("caption_segments.mp4");
-        let caption = |text: &str, x| {
-            Some(crate::track::TextOverlay {
-                text: text.into(),
-                x,
-                y: 0.5,
-                font_size_px: 32,
-                ..Default::default()
-            })
-        };
-        let plan = ExportPlan::MultiTrack {
-            source,
-            destination: dest.clone(),
-            source_codec: "h264".into(),
-            src_width: 320,
-            src_height: 180,
-            src_fps: 30.0,
-            video_clips: vec![
-                placed_clip(0, 1_000, 3_000, 2.0),     // 0..1 output
-                placed_clip(2_000, 3_000, 4_000, 1.0), // 1..2 output, adjacent
-                placed_clip(4_000, 4_000, 5_000, 1.0), // gap 2..3, uncaptioned 3..4
-            ],
-            video_text_overlays: vec![caption("LEFT", 0.25), caption("RIGHT", 0.75), None],
-            audio_tracks: Vec::new(),
-            encode: base_encode(VideoCodec::X264),
-        };
-        let progress = run_to_completion(plan);
-        assert!(
-            matches!(progress.phase, ExportPhase::Done),
-            "{:?}",
-            progress.phase
-        );
-        let (duration, _) = probe_stream(&dest, "v:0").unwrap();
-        assert!((duration - 4.0).abs() < 0.1, "duration {duration}");
-        for (time, left_expected, right_expected) in [
-            (0.5, true, false),
-            (0.967, true, false),
-            (1.034, false, true),
-            (1.5, false, true),
-            (2.5, false, false),
-            (3.5, false, false),
-        ] {
-            let out = crate::platform::command("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-ss",
-                    &format!("{time:.3}"),
-                    "-i",
-                ])
-                .arg(&dest)
-                .args(["-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-"])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-            assert_eq!(out.stdout.len(), 320 * 180);
-            let whites = |left: bool| {
-                out.stdout
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, px)| (**px > 180) && ((*i % 320 < 160) == left))
-                    .count()
-            };
-            assert_eq!(whites(true) > 100, left_expected, "left at {time}");
-            assert_eq!(whites(false) > 100, right_expected, "right at {time}");
-        }
-    }
-
-    #[test]
     fn e2e_gap_exports_black_and_keeps_av_sync() {
         // Two clips with a 2s gap between them ([0..3s], gap, [5s..8s]).
         // The output must be 8s on BOTH streams — before the gap fix,
@@ -1675,13 +1501,6 @@ mod tests {
             placed_clip(0, 1_000, 4_000, 1.0),
             placed_clip(5_000, 6_000, 9_000, 1.0),
         ];
-        let overlay = crate::track::TextOverlay {
-            text: "hi".into(),
-            outline_px: 2,
-            shadow: true,
-            opacity: 0.9,
-            ..Default::default()
-        };
         let mut encode = base_encode(VideoCodec::X264);
         encode.resolution = Some((640, 360));
         encode.fps_limit = Some(30);
@@ -1693,7 +1512,6 @@ mod tests {
             src_height: 720,
             src_fps: 30.0,
             video_clips: clips.clone(),
-            video_text_overlays: vec![Some(overlay); clips.len()],
             audio_tracks: vec![AudioTrackPlan {
                 source_audio_index: 0,
                 muted: false,
@@ -1764,7 +1582,6 @@ mod tests {
             src_height: 720,
             src_fps: 30.0,
             video_clips: clips.clone(),
-            video_text_overlays: Vec::new(),
             audio_tracks: vec![AudioTrackPlan {
                 source_audio_index: 0,
                 muted: false,
@@ -1809,7 +1626,6 @@ mod tests {
             src_height: 720,
             src_fps: 30.0,
             video_clips: vec![placed_clip(0, 0, 3_000, 1.0)],
-            video_text_overlays: Vec::new(),
             audio_tracks: Vec::new(),
             encode: base_encode(VideoCodec::X264),
         };
@@ -1886,7 +1702,6 @@ mod tests {
             src_height: 720,
             src_fps: 30.0,
             video_clips: clips.clone(),
-            video_text_overlays: Vec::new(),
             audio_tracks: vec![AudioTrackPlan {
                 source_audio_index: 0,
                 muted: false,
@@ -1933,11 +1748,6 @@ mod tests {
             placed_clip(0, 1_000, 3_000, 1.0),
             placed_clip(4_000, 6_000, 8_000, 1.0),
         ];
-        let overlay = crate::track::TextOverlay {
-            text: "vaapi".into(),
-            outline_px: 2,
-            ..Default::default()
-        };
         let mut encode = base_encode(VideoCodec::VaapiH264);
         encode.resolution = Some((640, 360));
         encode.fps_limit = Some(30);
@@ -1949,7 +1759,6 @@ mod tests {
             src_height: 720,
             src_fps: 30.0,
             video_clips: clips.clone(),
-            video_text_overlays: vec![Some(overlay); clips.len()],
             audio_tracks: vec![AudioTrackPlan {
                 source_audio_index: 0,
                 muted: false,

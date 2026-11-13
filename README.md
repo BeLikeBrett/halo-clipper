@@ -58,9 +58,23 @@ re-encodes when needed.
   Ctrl+click multiple video/audio pieces to attach them as one compound bar.
 - Split with **S**, delete with **Delete**, and undo / redo with **Ctrl+Z** /
   **Ctrl+Shift+Z**. Attached pieces edit together; detached pieces edit independently.
-- Click a clip to show its controls for framing, audio, speed, opacity, and
-  captions. Right-click a clip for edit actions, or a track name to mute / hide
+- Drop one or several clips from Windows Explorer or a Linux file manager into
+  **Media** to import. The bin highlights while dragging; existing edits and
+  the active Simple Clip source stay in place. Each imported clip gets a subtle
+  number in import order, also shown on the timeline.
+- Click a clip to show framing, audio, speed, opacity, and **Animation**.
+  Choose an In/Out effect per segment: Fade, Snap zoom, Pull back, Whip, or Flash.
+  Adjust each time and the Amount, then use the play icon to try it.
+  Right-click a clip for edit actions, or a track name to mute / hide
   that track. The Edit panel scrolls within its available height.
+- Press **T** or click **Add text** for a text layer. Type in its inspector,
+  drag it anywhere on the canvas (including the black bars in TikTok format),
+  and resize from a corner or with the wheel. Choose a font, style, color, and
+  optional intro/outro with separate time sliders (shorter is faster). Expand
+  **Color mix** for custom text, outline, and box colors, two-color gradients,
+  quick palettes, and direction. Use the timeline transport to preview. Drag or
+  trim its timeline bar to set timing; **S** splits the selected text and
+  **Delete** removes it. Right-click its bar to duplicate it.
 - Each active video and audio lane uses an independent live decoder. Timeline
   playback, scrubbing and transform edits do not rebuild a rendered timeline.
   Exports always read the original media through the shared composition model.
@@ -68,8 +82,8 @@ re-encodes when needed.
 Advanced automatically sizes the timeline for its visible layers and reserves
 an extra lane while dragging media. Its upper divider remains resizable. Taller
 clip bars include thumbnails, and shortcuts stay visible below the timeline.
-The Background editor stays open while choosing a color; close it with Done,
-the close button, or Escape.
+The Background menu stays open while choosing a color; click outside it or
+press Escape to close it.
 Simple Clip retains its focused mark-and-export workflow. Sessions are currently
 in memory: **export your edit before closing or updating**.
 

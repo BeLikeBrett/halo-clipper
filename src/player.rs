@@ -274,11 +274,6 @@ impl Player {
         Ok(())
     }
 
-    pub fn set_video_filter(&self, expr: &str) -> Result<()> {
-        self.mpv.set_property("vf", expr)?;
-        Ok(())
-    }
-
     pub fn set_lavfi_complex(&self, expr: &str) -> Result<()> {
         self.mpv.set_property("lavfi-complex", expr)?;
         Ok(())

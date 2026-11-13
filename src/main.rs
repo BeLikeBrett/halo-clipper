@@ -2,6 +2,7 @@
 // Halo Clipper — entry point.
 // Sets up logging, creates the eframe window, and hands off to ClipperApp.
 
+mod animation;
 mod app;
 mod composition;
 mod diagnostics;
@@ -17,6 +18,8 @@ mod platform;
 mod player;
 mod proxy;
 mod settings;
+mod text;
+mod textrender;
 mod theme;
 mod timeline;
 mod track;
@@ -57,6 +60,7 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([800.0, 500.0])
         .with_title("Halo Clipper")
+        .with_drag_and_drop(true)
         // Match what the .desktop file sets so X11/Wayland compositors
         // group the running window under our menu entry / icon.
         .with_app_id("halo-clipper");
@@ -116,34 +120,14 @@ fn load_window_icon() -> Option<egui::IconData> {
     })
 }
 
-/// Register DejaVu font variants with egui so the live caption preview
-/// can render in the same family the user picks from the dropdown.
-///
-/// We probe a handful of common system paths (Arch, Debian/Ubuntu) and
-/// silently skip any that aren't there — egui falls back to its built-in
-/// Proportional family for missing names, so the worst case is "preview
-/// shows base style but export still uses the right font."
+/// Registers the interface fonts, the DejaVu fallbacks, and every caption
+/// font as its own egui family (the text font menu shows each name in its
+/// own face).
 fn load_caption_fonts(ctx: &egui::Context) {
     let candidates: &[(&str, &[u8])] = &[
         (
             "DejaVu Sans",
             include_bytes!("../assets/fonts/DejaVuSans.ttf"),
-        ),
-        (
-            "DejaVu Sans Bold",
-            include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf"),
-        ),
-        (
-            "DejaVu Sans Oblique",
-            include_bytes!("../assets/fonts/DejaVuSans-Oblique.ttf"),
-        ),
-        (
-            "DejaVu Serif",
-            include_bytes!("../assets/fonts/DejaVuSerif.ttf"),
-        ),
-        (
-            "DejaVu Serif Bold",
-            include_bytes!("../assets/fonts/DejaVuSerif-Bold.ttf"),
         ),
         (
             "DejaVu Sans Mono",
@@ -219,5 +203,14 @@ fn load_caption_fonts(ctx: &egui::Context) {
         .or_default();
     mono.insert(0, theme::FONT_MONO.into());
     mono.insert(1, "DejaVu Sans Mono".into());
+    for font in text::TextFont::ALL {
+        let family = font.egui_family();
+        fonts
+            .font_data
+            .insert(family.clone(), egui::FontData::from_static(font.data()));
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(family.clone().into()), vec![family]);
+    }
     ctx.set_fonts(fonts);
 }

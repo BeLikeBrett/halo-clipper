@@ -62,6 +62,8 @@ def main() -> None:
     shutil.copy2(fonts / "LICENSE", licenses / "DejaVu-LICENSE")
     for font in ("Inter", "JetBrainsMono"):
         shutil.copy2(fonts / f"{font}-LICENSE.txt", licenses / f"{font}-LICENSE")
+    for license_file in sorted((fonts / "caption").glob("*.txt")):
+        shutil.copy2(license_file, licenses / f"caption-{license_file.name}")
     for source in runtime.rglob("*"):
         if is_license(source):
             shutil.copy2(source, licenses / "-".join(source.relative_to(runtime).parts))

@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
+
+- Subtle, stable import-order numbers on Media names, drag labels, and
+  timeline clips (1 · filename, 2 · filename).
+
+- Media: native file drops on Windows and Linux, with a temporary drop cue,
+  multi-file import, duplicate handling, and preservation of the active edit.
+
+- Text: independent, precise In/Out timing, custom outline and box colors,
+  two-color gradients with direction and palette shortcuts, and box opacity.
+  Extra color controls expand on demand; removed the bottom preview/help/delete block.
+- Per-segment video intro/outro effects in Edit: Fade, Snap zoom, Pull back,
+  Whip, and Flash, with separate durations, Amount, and edge playback.
+  Preview and exports share timing; splits preserve effects on the outer edges.
+
+- Rebuilt burned-in text as independent canvas layers: drag anywhere, including
+  portrait canvas bars; resize with corner handles or the scroll wheel.
+- Added eleven bundled fonts, six style presets, color and outline controls,
+  intro/outro animations, typewriter and word reveals.
+- Text has independent timeline bars for moving, trimming, splitting, duplicating,
+  and deleting; typing and drag gestures undo together.
+- Preview text renders locally without rebuilding mpv filters. Export uses the
+  same Rust renderer with frame-rate-correct animation and cancellable preparation.
+- Removed redundant empty-editor “Open a video to begin” messages.
 
 - Interface typography (Inter + JetBrains Mono), painted icons, refined
   graphite palette, segmented mode switch, menus that unroll from their button.
