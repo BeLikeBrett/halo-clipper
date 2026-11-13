@@ -37,6 +37,12 @@ pub struct LayerSource {
     pub media: MediaInfo,
 }
 
+#[derive(Clone, Debug)]
+pub struct MediaAsset {
+    pub id: TrackId,
+    pub source: LayerSource,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
     pub scale: f32,
@@ -93,6 +99,8 @@ pub struct Clip {
     /// the timeline.
     pub speed: f32,
     pub transform: Transform,
+    pub asset_id: Option<TrackId>,
+    pub audio_stream: Option<usize>,
 }
 
 impl Clip {
@@ -278,6 +286,8 @@ pub fn split_clip(
         gain: c.gain,
         speed: c.speed,
         transform: c.transform,
+        asset_id: c.asset_id,
+        audio_stream: c.audio_stream,
     };
     let right_id = right.id;
     clips.insert(idx + 1, right);
@@ -390,6 +400,8 @@ mod tests {
             gain: 1.0,
             speed: 1.0,
             transform: Transform::default(),
+            asset_id: None,
+            audio_stream: None,
         }
     }
 

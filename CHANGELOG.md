@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0
+
+- Replace the Layers button panel with a media bin and drag-focused timeline.
+- Import without automatic placement; remove media, including the final item,
+  along with its timeline instances.
+- Move and resize overlapping videos directly on the preview using corner handles.
+- Replace background timeline encoding with live video/audio decoders and GPU
+  composition. Transform edits update without preparing another preview.
+- Keep the inspector closed until requested, remove duplicate transport rows,
+  and make the compact timeline resizable.
+- Follow the largest video on the timeline for canvas and export dimensions,
+  with explicit manual overrides.
+- Preserve clip source identity when moving clips across tracks and restore
+  imported media state through undo / redo.
+
 ## 0.7.0
 
 - Advanced: import video and audio into independently ordered layers.

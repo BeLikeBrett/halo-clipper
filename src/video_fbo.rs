@@ -20,6 +20,10 @@ impl VideoFbo {
         self.fbo.0.get() as i32
     }
 
+    pub fn texture(&self) -> glow::NativeTexture {
+        self.tex
+    }
+
     pub fn fbo(&self) -> glow::NativeFramebuffer {
         self.fbo
     }

@@ -89,19 +89,35 @@ pub struct Player {
 
 impl Player {
     pub fn new(repaint_ctx: egui::Context) -> Result<Self> {
+        Self::create(repaint_ctx, false, false)
+    }
+    pub fn new_audio(repaint_ctx: egui::Context) -> Result<Self> {
+        Self::create(repaint_ctx, true, false)
+    }
+    pub fn new_layer(repaint_ctx: egui::Context) -> Result<Self> {
+        Self::create(repaint_ctx, false, true)
+    }
+    fn create(repaint_ctx: egui::Context, audio_only: bool, video_only: bool) -> Result<Self> {
         let mpv = Mpv::with_initializer(|init| {
             if log::log_enabled!(log::Level::Debug) {
                 init.set_property("terminal", "yes")?;
                 init.set_property("msg-level", "all=v")?;
             }
-            init.set_property("vo", "libmpv")?;
+            init.set_property("vo", if audio_only { "null" } else { "libmpv" })?;
             init.set_property("hwdec", "auto-safe")?;
             init.set_property("audio-display", "no")?;
+            if audio_only {
+                init.set_property("vid", "no")?;
+            }
+            if video_only {
+                init.set_property("aid", "no")?;
+            }
             init.set_property("input-default-bindings", "no")?;
             init.set_property("input-vo-keyboard", "no")?;
             init.set_property("video-timing-offset", 0i64)?;
             init.set_property("keep-open", "yes")?;
             init.set_property("pause", "yes")?;
+            init.set_property("volume-max", 1000i64)?;
 
             // ─────────── Editing-friendly tuning ───────────
             // mpv's defaults target one-pass playback ("press play and
@@ -135,6 +151,12 @@ impl Player {
             // Looser timing constraints — perceptible to nobody during
             // scrubbing, shaves a frame or two of latency on seeks.
             init.set_property("video-latency-hacks", "yes")?;
+            if audio_only || video_only {
+                init.set_property("cache-secs", 8i64)?;
+                init.set_property("demuxer-readahead-secs", 5i64)?;
+                init.set_property("demuxer-max-bytes", "128MiB")?;
+                init.set_property("demuxer-max-back-bytes", "64MiB")?;
+            }
             Ok(())
         })
         .context("mpv init failed (is libmpv installed?)")?;
@@ -247,6 +269,16 @@ impl Player {
     /// Set mpv's complex filter graph. Used by MultiTrack mode to mix
     /// multiple source audio streams (e.g. `[aid1][aid2]amix=inputs=2[ao]`).
     /// Pass an empty string to clear and fall back to default routing.
+    pub fn set_audio_stream(&self, index: usize) -> Result<()> {
+        self.mpv.set_property("aid", (index + 1) as i64)?;
+        Ok(())
+    }
+
+    pub fn set_video_filter(&self, expr: &str) -> Result<()> {
+        self.mpv.set_property("vf", expr)?;
+        Ok(())
+    }
+
     pub fn set_lavfi_complex(&self, expr: &str) -> Result<()> {
         self.mpv.set_property("lavfi-complex", expr)?;
         Ok(())

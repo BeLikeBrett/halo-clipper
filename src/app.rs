@@ -7,8 +7,14 @@
 // Long-running work (proxy generation, ffmpeg export) lives on background
 // threads. The UI never blocks on subprocess output.
 
+#[path = "canvas.rs"]
+mod canvas;
+#[path = "editor.rs"]
+mod editor;
 #[path = "layers.rs"]
 mod layers;
+#[path = "live.rs"]
+mod live;
 #[path = "support.rs"]
 mod support;
 
@@ -22,7 +28,9 @@ use crate::proxy;
 use crate::settings::{ProxyQuality, Settings};
 use crate::theme;
 use crate::timeline::{self, TimelineState};
-use crate::track::{self, Clip, ClipId, IdGen, LinkId, TextOverlay, Track, TrackId, TrackKind};
+use crate::track::{
+    self, Clip, ClipId, IdGen, LinkId, MediaAsset, TextOverlay, Track, TrackId, TrackKind,
+};
 use crate::video_fbo::{self, VideoFbo};
 
 use egui::{Align2, Color32, Frame, Margin, RichText, Rounding, Stroke};
@@ -58,6 +66,8 @@ struct Project {
     /// preview filter graph + adds `-an` on export.
     simple_audio_muted: bool,
     // MultiTrack state
+    assets: Vec<MediaAsset>,
+    canvas_override: Option<(u32, u32)>,
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
@@ -72,6 +82,7 @@ impl Project {
     /// Create V1 + one audio track per source audio stream (A1, A2, …).
     /// All linked by a single LinkId so edits propagate together until
     /// the user explicitly Detaches. No-op if tracks already exist.
+    #[cfg(test)]
     fn ensure_tracks_initialized(&mut self) {
         if !self.tracks.is_empty() {
             return;
@@ -97,6 +108,8 @@ impl Project {
             gain: 1.0,
             speed: 1.0,
             transform: track::Transform::default(),
+            asset_id: None,
+            audio_stream: None,
         });
         // One audio track per source audio stream. Guarantee at least
         // one so the data model has consistent shape even for silent
@@ -123,6 +136,8 @@ impl Project {
                 gain: 1.0,
                 speed: 1.0,
                 transform: track::Transform::default(),
+                asset_id: None,
+                audio_stream: None,
             });
         }
     }
@@ -156,25 +171,23 @@ impl Project {
         let mut segments = Vec::new();
         // Top lane is painted last. All audio streams remain independent.
         for t in self.tracks.iter().rev().filter(|t| !t.muted) {
-            let (source, info) = t
-                .source
-                .as_ref()
-                .map(|s| (&s.path, &s.media))
-                .unwrap_or((&self.source, &self.media));
-            if t.kind == TrackKind::Audio
-                && t.source_audio_index.unwrap_or(0) >= info.audio_stream_count
-            {
-                continue;
-            }
             for c in self.clips.iter().filter(|c| c.track_id == t.id) {
+                let (source, info) = self.clip_source(c);
+                let audio_index = c.audio_stream.or(t.source_audio_index).unwrap_or(0);
+                if t.kind == TrackKind::Audio && audio_index >= info.audio_stream_count {
+                    continue;
+                }
                 segments.push(crate::composition::Segment {
-                    source: if preview && t.source.is_none() && t.kind == TrackKind::Video {
-                        self.proxy.clone().unwrap_or_else(|| source.clone())
+                    source: if preview
+                        && c.asset_id.is_none()
+                        && t.source.is_none()
+                        && t.kind == TrackKind::Video
+                    {
+                        self.proxy.clone().unwrap_or_else(|| source.to_path_buf())
                     } else {
-                        source.clone()
+                        source.to_path_buf()
                     },
-                    audio_index: (t.kind == TrackKind::Audio)
-                        .then_some(t.source_audio_index.unwrap_or(0)),
+                    audio_index: (t.kind == TrackKind::Audio).then_some(audio_index),
                     start_ms: c.cut_start_ms,
                     end_ms: c.cut_end_ms(),
                     src_start_ms: c.src_start_ms,
@@ -188,9 +201,9 @@ impl Project {
             }
         }
         crate::composition::Composition {
-            width: self.media.width,
-            height: self.media.height,
-            fps: self.media.fps,
+            width: self.canvas_media().width,
+            height: self.canvas_media().height,
+            fps: self.canvas_media().fps,
             duration_ms: self.content_end_ms(),
             segments,
         }
@@ -243,9 +256,11 @@ impl Project {
     /// further (which the current UI doesn't permit, but kept for
     /// defense-in-depth).
     fn canvas_length_ms(&self) -> i64 {
-        self.media
-            .duration_ms
-            .max(track::project_cut_duration(&self.clips))
+        if self.mode == EditMode::MultiTrack {
+            (self.content_end_ms() + 2000).max(10000)
+        } else {
+            self.media.duration_ms
+        }
     }
 
     /// True end of the cut — the rightmost clip-end position. Used as
@@ -268,9 +283,14 @@ impl Project {
 /// are intentionally excluded — they're navigation/view state, not edits.
 #[derive(Clone)]
 struct UndoSnapshot {
+    source: PathBuf,
+    media: MediaInfo,
+    proxy: Option<PathBuf>,
     in_ms: Option<i64>,
     out_ms: Option<i64>,
     simple_audio_muted: bool,
+    assets: Vec<MediaAsset>,
+    canvas_override: Option<(u32, u32)>,
     tracks: Vec<Track>,
     clips: Vec<Clip>,
     selected_clips: HashSet<ClipId>,
@@ -280,9 +300,14 @@ struct UndoSnapshot {
 impl UndoSnapshot {
     fn capture(p: &Project) -> Self {
         Self {
+            source: p.source.clone(),
+            media: p.media.clone(),
+            proxy: p.proxy.clone(),
             in_ms: p.in_ms,
             out_ms: p.out_ms,
             simple_audio_muted: p.simple_audio_muted,
+            assets: p.assets.clone(),
+            canvas_override: p.canvas_override,
             tracks: p.tracks.clone(),
             clips: p.clips.clone(),
             selected_clips: p.selected_clips.clone(),
@@ -291,9 +316,14 @@ impl UndoSnapshot {
     }
 
     fn apply(self, p: &mut Project) {
+        p.source = self.source;
+        p.media = self.media;
+        p.proxy = self.proxy;
         p.in_ms = self.in_ms;
         p.out_ms = self.out_ms;
         p.simple_audio_muted = self.simple_audio_muted;
+        p.assets = self.assets;
+        p.canvas_override = self.canvas_override;
         p.tracks = self.tracks;
         p.clips = self.clips;
         p.selected_clips = self.selected_clips;
@@ -431,9 +461,9 @@ pub struct ClipperApp {
     project: Option<Project>,
     updater: crate::updater::Updater,
     support_open: bool,
-    layered_preview: crate::preview::Preview,
-    preview_is_composed: bool,
-    layer_edit_active: bool,
+    live: live::LivePreview,
+    inspector_open: bool,
+    canvas_drag: Option<canvas::CanvasDrag>,
     status: String,
     export_mode: ExportMode,
     /// Custom-encode settings persist between modal sessions so the user
@@ -542,9 +572,9 @@ impl ClipperApp {
             project: None,
             updater,
             support_open: false,
-            layered_preview: crate::preview::Preview::default(),
-            preview_is_composed: false,
-            layer_edit_active: false,
+            live: live::LivePreview::default(),
+            inspector_open: false,
+            canvas_drag: None,
             status: "Open a video to begin.".into(),
             export_mode: ExportMode::Auto,
             custom_encode: CustomEncode::default_for(recommended),
@@ -580,6 +610,13 @@ impl ClipperApp {
     ///
     /// Edge-triggered to avoid hammering mpv every frame.
     fn sync_clip_speed(&mut self) {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        {
+            return;
+        }
         let desired_speed: f32 = match self.project.as_ref() {
             Some(p) if p.mode == EditMode::MultiTrack && !p.needs_composition() => p
                 .first_video_track()
@@ -607,6 +644,13 @@ impl ClipperApp {
     /// MultiTrack: audio mix from unmuted tracks. Segment captions are
     /// composited in egui, independently of mpv's audio filter graph.
     fn sync_audio_mix(&mut self) {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        {
+            return;
+        }
         let (desired_filter, desired_mute) = self.build_lavfi_complex();
         if desired_filter != self.last_lavfi_complex {
             if let Err(e) = self.player.set_lavfi_complex(&desired_filter) {
@@ -761,11 +805,18 @@ impl ClipperApp {
     /// main() when a path arrives on the command line ("Open With" from
     /// a file manager).
     pub fn open_path(&mut self, path: PathBuf) {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        {
+            self.add_layer_path(path);
+            return;
+        }
         crate::diagnostics::register_media(&path);
         match media::probe(&path) {
             Ok(info) => {
-                self.layered_preview.reset();
-                self.preview_is_composed = false;
+                self.live.clear();
                 let size_str = std::fs::metadata(&path)
                     .ok()
                     .map(|m| format_bytes(m.len()))
@@ -824,13 +875,15 @@ impl ClipperApp {
                 }
 
                 self.project = Some(Project {
-                    source: path,
+                    source: path.clone(),
                     proxy: cached_proxy,
                     media: info.clone(),
                     playhead_ms: 0,
                     in_ms: None,
                     out_ms: None,
                     simple_audio_muted: false,
+                    assets: Vec::new(),
+                    canvas_override: None,
                     tracks: Vec::new(),
                     clips: Vec::new(),
                     selected_clips: HashSet::new(),
@@ -838,6 +891,15 @@ impl ClipperApp {
                     id_gen: IdGen::default(),
                     mode: EditMode::SimpleClip,
                 });
+                if let Some(p) = &mut self.project {
+                    p.assets.push(MediaAsset {
+                        id: p.id_gen.next_track(),
+                        source: track::LayerSource {
+                            path: path.clone(),
+                            media: info,
+                        },
+                    });
+                }
                 self.undo_stack.clear();
                 self.redo_stack.clear();
             }
@@ -852,100 +914,6 @@ impl ClipperApp {
     /// when it crosses the end of the current video clip we either jump
     /// to the next clip on V1 (if any) or pause + reset to the start of
     /// the cut.
-    fn tick_multitrack_playback(&mut self, mpv_src_ms: i64) {
-        let Some(project) = &self.project else { return };
-        if project.needs_composition() {
-            if self.layered_preview.ready {
-                if let Some(p) = &mut self.project {
-                    p.playhead_ms = mpv_src_ms.min(p.content_end_ms());
-                }
-            }
-            return;
-        }
-        let Some(video_track) = project.first_video_track() else {
-            return;
-        };
-
-        let cut_ms = project.playhead_ms;
-        let clip = match track::clip_on_track_at(&project.clips, video_track, cut_ms).copied() {
-            Some(c) => c,
-            None => {
-                // Playhead landed in a gap on V1 (split + delete leaves
-                // holes). Skip forward to the next clip and keep playing
-                // — pausing here would fight the user's Play press because
-                // the next frame's tick would re-pause immediately.
-                let next = project
-                    .clips
-                    .iter()
-                    .filter(|c| c.track_id == video_track && c.cut_start_ms > cut_ms)
-                    .min_by_key(|c| c.cut_start_ms)
-                    .copied();
-                match next {
-                    Some(n) => {
-                        if let Some(p) = &mut self.project {
-                            p.playhead_ms = n.cut_start_ms;
-                        }
-                        let _ = self.player.seek(n.src_start_ms);
-                    }
-                    None => {
-                        // Nothing ahead — pause at end of content, don't
-                        // snap to 0 (that would silently rewind the user).
-                        let _ = self.player.set_paused(true);
-                        if let Some(p) = &mut self.project {
-                            p.playhead_ms = p.content_end_ms();
-                        }
-                    }
-                }
-                return;
-            }
-        };
-
-        // mpv lags a couple frames behind seeks. Small epsilon prevents
-        // false boundary crossings immediately after a jump.
-        const BOUNDARY_EPS_MS: i64 = 15;
-
-        if mpv_src_ms + BOUNDARY_EPS_MS >= clip.src_end_ms {
-            let next = project
-                .clips
-                .iter()
-                .filter(|c| c.track_id == video_track && c.cut_start_ms >= clip.cut_end_ms())
-                .min_by_key(|c| c.cut_start_ms)
-                .copied();
-            match next {
-                Some(n) => {
-                    if let Some(p) = &mut self.project {
-                        p.playhead_ms = n.cut_start_ms;
-                    }
-                    let _ = self.player.seek(n.src_start_ms);
-                }
-                None => {
-                    let first_src = project
-                        .clips
-                        .iter()
-                        .filter(|c| c.track_id == video_track)
-                        .min_by_key(|c| c.cut_start_ms)
-                        .map(|c| c.src_start_ms)
-                        .unwrap_or(0);
-                    let _ = self.player.set_paused(true);
-                    if let Some(p) = &mut self.project {
-                        p.playhead_ms = 0;
-                    }
-                    let _ = self.player.seek(first_src);
-                }
-            }
-            return;
-        }
-
-        // Normal mirror: walk through the current clip's source range.
-        if mpv_src_ms >= clip.src_start_ms {
-            let offset =
-                ((mpv_src_ms - clip.src_start_ms).max(0) as f64 / clip.speed as f64).round() as i64;
-            if let Some(p) = &mut self.project {
-                p.playhead_ms = clip.cut_start_ms + offset;
-            }
-        }
-    }
-
     /// Translate the playhead (mode-dependent units) into a source-time
     /// suitable for handing to mpv. In MultiTrack mode this maps via the
     /// V1 clip at the playhead — returns None if no clip covers it (mpv
@@ -954,14 +922,7 @@ impl ClipperApp {
         let p = self.project.as_ref()?;
         match p.mode {
             EditMode::SimpleClip => Some(p.playhead_ms),
-            EditMode::MultiTrack => {
-                if p.needs_composition() {
-                    return self.layered_preview.ready.then_some(p.playhead_ms);
-                }
-                let v = p.first_video_track()?;
-                let clip = track::clip_on_track_at(&p.clips, v, p.playhead_ms)?;
-                clip.cut_to_src(p.playhead_ms)
-            }
+            EditMode::MultiTrack => None,
         }
     }
 
@@ -1180,165 +1141,57 @@ impl ClipperApp {
     }
 
     pub fn set_mode(&mut self, new_mode: EditMode) {
-        let Some(project) = &mut self.project else {
+        if self.project.is_none() && new_mode == EditMode::MultiTrack {
+            self.project = Some(Project::empty());
+        }
+        let Some(p) = &mut self.project else {
             return;
         };
-        if project.mode == new_mode {
+        if p.mode == new_mode {
             return;
         }
-        match (project.mode, new_mode) {
-            (EditMode::SimpleClip, EditMode::MultiTrack) => {
-                project.ensure_tracks_initialized();
-                // Source-time → cut-time via the V1 clip that contains the
-                // source point (initially the whole video, so they match).
-                let src = project.playhead_ms;
-                let cut = project
-                    .first_video_track()
-                    .and_then(|v| {
-                        project.clips.iter().find(|c| {
-                            c.track_id == v && c.src_start_ms <= src && src < c.src_end_ms
-                        })
-                    })
-                    .map(|c| c.cut_start_ms + (src - c.src_start_ms))
-                    .unwrap_or(0);
-                project.playhead_ms = cut;
-                project.selected_clips.clear();
-                let seek_src = project
-                    .first_video_track()
-                    .and_then(|v| track::clip_on_track_at(&project.clips, v, cut))
-                    .and_then(|c| c.cut_to_src(cut));
-                if let Some(s) = seek_src {
-                    let _ = self.player.seek(s);
-                }
-            }
-            (EditMode::MultiTrack, EditMode::SimpleClip) => {
-                // Cut-time → source-time via V1 so the user lands on the
-                // same picture in the source timeline.
-                let cut = project.playhead_ms;
-                let src = project
-                    .first_video_track()
-                    .and_then(|v| track::clip_on_track_at(&project.clips, v, cut))
-                    .and_then(|c| c.cut_to_src(cut))
-                    .unwrap_or(0);
-                project.playhead_ms = src.clamp(0, project.media.duration_ms);
-                project.selected_clips.clear();
-                let _ = self.player.seek(project.playhead_ms);
-            }
-            _ => {}
-        }
-        project.mode = new_mode;
-        if new_mode == EditMode::SimpleClip {
-            self.layered_preview.reset();
-            self.preview_is_composed = false;
-            let _ = self.player.set_lavfi_complex("");
-            self.last_lavfi_complex.clear();
-            let _ = self.player.set_file(
-                project.proxy.as_deref().unwrap_or(&project.source),
-                project.playhead_ms,
-            );
-        }
+        p.mode = new_mode;
+        p.playhead_ms = 0;
+        p.selected_clips.clear();
+        self.live.clear();
+        self.canvas_drag = None;
         let _ = self.player.set_paused(true);
+        let _ = self.player.set_lavfi_complex("");
+        self.last_lavfi_complex.clear();
+        if new_mode == EditMode::MultiTrack {
+            if let Some(h) = self.proxy_handle.take() {
+                h.cancel();
+            }
+        }
+        if new_mode == EditMode::SimpleClip && p.source.is_file() {
+            let _ = self
+                .player
+                .set_file(p.proxy.as_deref().unwrap_or(&p.source), 0);
+        }
     }
-
     fn toggle_play(&mut self) {
         if let Some(p) = &mut self.project {
-            if p.mode == EditMode::MultiTrack && p.needs_composition() {
-                if !self.layered_preview.ready {
-                    self.status =
-                        "Preparing layered preview. Editing and export remain available.".into();
+            if p.mode == EditMode::MultiTrack {
+                if p.clips.is_empty() {
                     return;
                 }
                 if p.playhead_ms >= p.content_end_ms() {
                     p.playhead_ms = 0;
-                    let _ = self.player.seek(0);
                 }
-                let _ = self.player.toggle_play();
+                self.live.toggle(p.playhead_ms);
                 return;
             }
-        }
-        if self.project.is_none() {
-            return;
-        }
-        // In Simple Clip mode with both marks set: if we're about to start
-        // playing and the playhead is outside [In, Out], snap it to In so
-        // playback starts at the clip's beginning.
-        let about_to_play = self.player.state().paused;
-        if about_to_play {
-            if let Some(project) = &mut self.project {
-                match project.mode {
-                    EditMode::SimpleClip => {
-                        if let (Some(in_ms), Some(out_ms)) = (project.in_ms, project.out_ms) {
-                            let lo = in_ms.min(out_ms);
-                            let hi = in_ms.max(out_ms);
-                            if project.playhead_ms < lo || project.playhead_ms >= hi {
-                                project.playhead_ms = lo;
-                                let _ = self.player.seek(lo);
-                            }
-                        }
-                    }
-                    EditMode::MultiTrack => {
-                        // If the playhead sits at (or past) the end of the
-                        // canvas, wrap back to the start so play actually
-                        // plays. Uses the static canvas length, not the
-                        // current content extent.
-                        let total = project.canvas_length_ms();
-                        let v = project.first_video_track();
-                        let in_clip = v.is_some_and(|t| {
-                            track::clip_on_track_at(&project.clips, t, project.playhead_ms)
-                                .is_some()
-                        });
-                        if project.playhead_ms >= total && total > 0 {
-                            project.playhead_ms = 0;
-                            let first_src = v.and_then(|t| {
-                                project
-                                    .clips
-                                    .iter()
-                                    .filter(|c| c.track_id == t)
-                                    .min_by_key(|c| c.cut_start_ms)
-                                    .map(|c| c.src_start_ms)
-                            });
-                            if let Some(s) = first_src {
-                                let _ = self.player.seek(s);
-                            }
-                        } else if !in_clip {
-                            // Pre-snap forward when the playhead is in a
-                            // gap on V1 (left over from split + delete), so
-                            // pressing Play actually plays from real content
-                            // instead of fighting tick_multitrack_playback's
-                            // gap handler.
-                            let snap = v.and_then(|t| {
-                                project
-                                    .clips
-                                    .iter()
-                                    .filter(|c| {
-                                        c.track_id == t && c.cut_start_ms > project.playhead_ms
-                                    })
-                                    .min_by_key(|c| c.cut_start_ms)
-                                    .copied()
-                                    .or_else(|| {
-                                        // Nothing after — wrap to the first
-                                        // clip so Play means "play from the
-                                        // beginning of the cut."
-                                        project
-                                            .clips
-                                            .iter()
-                                            .filter(|c| c.track_id == t)
-                                            .min_by_key(|c| c.cut_start_ms)
-                                            .copied()
-                                    })
-                            });
-                            if let Some(c) = snap {
-                                project.playhead_ms = c.cut_start_ms;
-                                let _ = self.player.seek(c.src_start_ms);
-                            }
-                        }
-                    }
+            if let (Some(a), Some(b)) = (p.in_ms, p.out_ms) {
+                if self.player.state().paused
+                    && (p.playhead_ms < a.min(b) || p.playhead_ms >= a.max(b))
+                {
+                    p.playhead_ms = a.min(b);
+                    let _ = self.player.seek(p.playhead_ms);
                 }
             }
         }
         if let Err(e) = self.player.toggle_play() {
-            self.status = format!("Player error: {e:#}");
-            log::error!("toggle_play failed: {e:#}");
+            self.status = format!("Playback failed: {e:#}");
         }
     }
 
@@ -1387,6 +1240,7 @@ impl ClipperApp {
                     .is_some_and(|(a, b)| a == b)
         };
         if same_file(&project.source)
+            || project.assets.iter().any(|a| same_file(&a.source.path))
             || project
                 .tracks
                 .iter()
@@ -1399,7 +1253,7 @@ impl ClipperApp {
         }
 
         // Source dimensions for resolution-preset math.
-        let (src_w, src_h) = (project.media.width, project.media.height);
+        let (src_w, src_h) = (project.canvas_media().width, project.canvas_media().height);
         let cut_duration_ms = self.cut_duration_ms_for_export(project);
         // One plan, shared by both export paths below and computed the
         // same way the Discord stats panel computes it, so what the user
@@ -1409,7 +1263,7 @@ impl ClipperApp {
             encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb),
             src_w,
             src_h,
-            project.media.fps,
+            project.canvas_media().fps,
             self.discord_codec_choice,
             self.detected_gpu,
             &self.available_codecs,
@@ -1470,7 +1324,7 @@ impl ClipperApp {
                 let (encode, note) = resolve_encode(false, aligned_copy_possible);
                 (
                     ExportPlan::Simple {
-                        source: project.source.clone(),
+                        source: project.source.to_path_buf(),
                         destination,
                         source_codec: project.media.video_codec.clone(),
                         src_start_ms: lo,
@@ -1583,7 +1437,10 @@ impl ClipperApp {
         // While a text input has focus, hand the keys to it — otherwise
         // Backspace/Delete would delete the selected clip while the user
         // is typing a caption, Space would toggle play, etc.
-        if ctx.wants_keyboard_input() {
+        if ctx
+            .memory(|m| m.focused())
+            .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+        {
             return actions;
         }
         let Some(project) = &mut self.project else {
@@ -1665,6 +1522,16 @@ impl ClipperApp {
 
 impl eframe::App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        });
+        for path in dropped {
+            self.open_path(path);
+        }
         self.updater.poll();
         if self.proxy_handle.is_some()
             || matches!(self.updater.state, crate::updater::State::Working(_))
@@ -1672,7 +1539,7 @@ impl eframe::App for ClipperApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         self.tick_proxy();
-        self.tick_layered_preview(ctx);
+        self.tick_live_preview(ctx);
         self.sync_audio_mix();
         self.sync_clip_speed();
 
@@ -1680,7 +1547,12 @@ impl eframe::App for ClipperApp {
         // mpv is playing. Local state owns the playhead otherwise.
         let player_state = self.player.state();
         let has_file = player_state.loaded_file.is_some();
-        let mpv_playing = has_file && !player_state.paused;
+        let mpv_playing = has_file
+            && !player_state.paused
+            && !self
+                .project
+                .as_ref()
+                .is_some_and(|p| p.mode == EditMode::MultiTrack);
 
         // While the user is dragging (or within ~300ms of a release) we
         // skip the mpv mirror — otherwise mpv's lagging time-pos events
@@ -1711,9 +1583,7 @@ impl eframe::App for ClipperApp {
                         }
                     }
                 }
-                Some(EditMode::MultiTrack) => {
-                    self.tick_multitrack_playback(player_state.position_ms);
-                }
+                Some(EditMode::MultiTrack) => {}
                 None => {}
             }
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -1794,7 +1664,7 @@ impl eframe::App for ClipperApp {
 
                     // Edit-mode toggle (pill tabs).
                     let mode = self.project.as_ref().map(|p| p.mode);
-                    let has_project = self.project.is_some();
+                    let has_project = true;
                     let mut want_mode: Option<EditMode> = None;
                     if pill_button(
                         ui,
@@ -1838,30 +1708,41 @@ impl eframe::App for ClipperApp {
                 });
             });
 
-        // Bottom controls + status
-        egui::TopBottomPanel::bottom("controls")
-            .frame(
-                Frame::none()
-                    .fill(theme::BG_PANEL)
-                    .inner_margin(Margin::symmetric(14.0, 10.0)),
-            )
-            .show(ctx, |ui| {
-                self.show_controls(ui);
+        let advanced = self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack);
+        let mut panel = egui::TopBottomPanel::bottom("controls").frame(
+            Frame::none()
+                .fill(theme::BG_PANEL)
+                .inner_margin(Margin::symmetric(12.0, 8.0)),
+        );
+        if advanced {
+            panel = panel
+                .resizable(true)
+                .default_height(230.0)
+                .height_range(140.0..=(ctx.screen_rect().height() * 0.55).max(160.0));
+        }
+        panel.show(ctx, |ui| {
+            self.show_controls(ui);
+            if !advanced {
                 ui.add_space(6.0);
                 self.show_status_bar(ui);
-            });
+            }
+        });
 
         // Left: media list
         egui::SidePanel::left("media_panel")
             .resizable(true)
-            .default_width(240.0)
+            .default_width(200.0)
+            .width_range(170.0..=300.0)
             .frame(
                 Frame::none()
                     .fill(theme::BG_PANEL)
                     .inner_margin(Margin::same(12.0)),
             )
             .show(ctx, |ui| {
-                self.show_media_list(ui);
+                self.show_media_bin(ui);
             });
 
         // Right: Edit panel. Shows whenever a clip is selected in
@@ -1871,6 +1752,7 @@ impl eframe::App for ClipperApp {
             .project
             .as_ref()
             .is_some_and(|p| p.mode == EditMode::MultiTrack && !p.selected_clips.is_empty())
+            && self.inspector_open
         {
             egui::SidePanel::right("edit_panel")
                 .resizable(true)
@@ -1964,7 +1846,11 @@ impl eframe::App for ClipperApp {
     /// cancel any in-flight transcode so the ffmpeg child doesn't keep
     /// running after our process exits.
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
-        self.layered_preview.reset();
+        if let Some(gl) = _gl {
+            self.live.destroy(gl);
+        } else {
+            self.live.clear();
+        }
         if let Some(h) = self.proxy_handle.take() {
             h.cancel();
         }
@@ -2015,8 +1901,6 @@ impl ClipperApp {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(10.0);
-
-        self.show_layer_properties(ui);
 
         // Snapshot all data we need before touching `self.project` mutably.
         // The intermediate block scopes the borrow so the writes later
@@ -2405,73 +2289,6 @@ impl ClipperApp {
         }
     }
 
-    fn show_media_list(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Media")
-                    .size(14.0)
-                    .strong()
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("+").on_hover_text("Add media…").clicked() {
-                    if self
-                        .project
-                        .as_ref()
-                        .is_some_and(|p| p.mode == EditMode::MultiTrack)
-                    {
-                        self.import_layer();
-                    } else {
-                        self.open_file();
-                    }
-                }
-            });
-        });
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        self.show_layers(ui);
-
-        if let Some(project) = &self.project {
-            let name = project
-                .source
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            // Single-item "active" list for now. When we support stacking,
-            // this becomes a Vec rendered as a list with drag handles.
-            Frame::none()
-                .fill(theme::BG_BUTTON_HOVER)
-                .rounding(Rounding::same(6.0))
-                .inner_margin(Margin::symmetric(10.0, 8.0))
-                .stroke(Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.6)))
-                .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(name).strong().color(theme::TEXT_PRIMARY));
-                        ui.label(
-                            RichText::new(format!(
-                                "{}×{}  ·  {:.0}fps  ·  {}",
-                                project.media.width,
-                                project.media.height,
-                                project.media.fps,
-                                media::format_timestamp(project.media.duration_ms),
-                            ))
-                            .small()
-                            .color(theme::TEXT_MUTED),
-                        );
-                    });
-                });
-        } else {
-            ui.label(RichText::new("No media yet.").color(theme::TEXT_MUTED));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Use File → Open Video, or the “+” above.")
-                    .small()
-                    .color(theme::TEXT_MUTED.linear_multiply(0.7)),
-            );
-        }
-    }
-
     /// Live caption overlay on top of the preview. We paint the text in
     /// egui (matching the user's font/size/color choices) and keep a
     /// draggable hit area around it. Because there's no ffmpeg filter
@@ -2605,6 +2422,14 @@ impl ClipperApp {
     }
 
     fn show_preview(&mut self, ui: &mut egui::Ui) {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        {
+            self.show_canvas(ui);
+            return;
+        }
         let avail = ui.available_rect_before_wrap();
         let aspect = match self.player.state().video_size {
             Some((w, h)) if w > 0 && h > 0 => w as f32 / h as f32,
@@ -2690,31 +2515,6 @@ impl ClipperApp {
                     ui.painter().add(callback);
                 }
             });
-
-        if self
-            .project
-            .as_ref()
-            .is_some_and(|p| p.mode == EditMode::MultiTrack && p.needs_composition())
-            && !self.layered_preview.ready
-        {
-            ui.painter()
-                .rect_filled(preview_rect, 8.0, Color32::from_black_alpha(220));
-            ui.painter().text(
-                preview_rect.center(),
-                Align2::CENTER_CENTER,
-                "Updating layered preview…",
-                egui::FontId::proportional(16.0),
-                theme::TEXT_PRIMARY,
-            );
-            ui.label(
-                RichText::new(&self.layered_preview.message)
-                    .small()
-                    .color(theme::TEXT_MUTED),
-            );
-            if ui.button("Retry preview").clicked() {
-                self.layered_preview.retry();
-            }
-        }
 
         // Draw only the caption on the video segment under the playhead.
         let active_caption = self
@@ -2839,6 +2639,14 @@ impl ClipperApp {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        {
+            self.show_editor_timeline(ui);
+            return;
+        }
         let mut want_open = false;
         let mut want_play = false;
         let mut want_export = false;
@@ -3634,9 +3442,9 @@ impl ClipperApp {
         let plan = encode::NitroPlan::compute(
             duration_ms,
             target_bytes,
-            project.media.width,
-            project.media.height,
-            project.media.fps,
+            project.canvas_media().width,
+            project.canvas_media().height,
+            project.canvas_media().fps,
             self.discord_codec_choice,
             self.detected_gpu,
             &self.available_codecs,
@@ -5016,6 +4824,8 @@ mod caption_tests {
             in_ms: None,
             out_ms: None,
             simple_audio_muted: false,
+            assets: Vec::new(),
+            canvas_override: None,
             tracks: Vec::new(),
             clips: Vec::new(),
             selected_clips: HashSet::new(),

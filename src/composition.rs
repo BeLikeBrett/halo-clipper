@@ -101,8 +101,8 @@ impl Composition {
                 audio.push(format!("[a{i}]"));
             } else {
                 let t = s.transform;
-                let sw = ((w as f32 * t.scale.clamp(0.1, 2.0)) as u32 / 2 * 2).max(2);
-                let sh = ((h as f32 * t.scale.clamp(0.1, 2.0)) as u32 / 2 * 2).max(2);
+                let sw = ((w as f32 * t.scale.clamp(0.03, 8.0)) as u32 / 2 * 2).max(2);
+                let sh = ((h as f32 * t.scale.clamp(0.03, 8.0)) as u32 / 2 * 2).max(2);
                 graph.push_str(&format!("[{i}:v:0]setpts=(PTS-STARTPTS)/{speed:.6},scale=w={sw}:h={sh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1,fps={fps:.6},format=rgba"));
                 if let Some(c) = &s.caption {
                     if !c.text.trim().is_empty() {
@@ -113,7 +113,7 @@ impl Composition {
                         ));
                     }
                 }
-                graph.push_str(&format!(",colorchannelmixer=aa={:.6},setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='(W-w)*{:.6}':y='(H-h)*{:.6}':eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.opacity.clamp(0.0,1.0), t.x.clamp(0.0,1.0), t.y.clamp(0.0,1.0)));
+                graph.push_str(&format!(",colorchannelmixer=aa={:.6},setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='W*{:.6}-w/2':y='H*{:.6}-h/2':eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.opacity.clamp(0.0,1.0), t.x, t.y));
                 current = format!("mix{i}");
             }
         }
@@ -334,5 +334,49 @@ mod tests {
         let info = crate::media::probe(&path).unwrap();
         assert!((info.duration_ms - 3000).abs() < 80, "{}", info.duration_ms);
         let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(test)]
+mod window_placement_tests {
+    use super::*;
+    #[test]
+    fn exported_window_coordinates_match_canvas_centers() {
+        let c = Composition {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            duration_ms: 1000,
+            segments: vec![Segment {
+                source: PathBuf::from("window.mp4"),
+                audio_index: None,
+                start_ms: 0,
+                end_ms: 1000,
+                src_start_ms: 0,
+                src_end_ms: 1000,
+                speed: 1.0,
+                gain: 1.0,
+                transform: Transform {
+                    scale: 0.5,
+                    x: 1.1,
+                    y: -0.1,
+                    opacity: 1.0,
+                },
+                caption: None,
+                source_height: 1080,
+            }],
+        };
+        let settings = EncodeSettings::default_for_source(1920, 1080);
+        let command = c
+            .command(std::path::Path::new("out.mp4"), &settings)
+            .unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let graph = &args[args.iter().position(|s| s == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains("W*1.100000-w/2"));
+        assert!(graph.contains("H*-0.100000-h/2"));
+        assert!(graph.contains("scale=w=960:h=540"));
     }
 }

@@ -11,7 +11,6 @@ mod gl_loader;
 mod media;
 mod platform;
 mod player;
-mod preview;
 mod proxy;
 mod settings;
 mod theme;

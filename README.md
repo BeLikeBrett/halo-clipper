@@ -25,35 +25,42 @@ keyframe-aligned clips when possible and re-encodes when needed.
 
 **Advanced:**
 
-- Add video or audio with **Add video / audio…** in the Layers panel. Imports
-  begin at the playhead and keep their own original source files.
-- Video lanes are ordered from front to back. **Up / Down** in Layers, or
-  **Above / Below** in Edit, changes that order. Audio lanes mix together.
-- Select a segment to set its start time and source In/Out. Drag horizontally
-  to move it, with snapping. Linked video and audio move and trim together;
-  **Detach Audio** makes them independent.
-- Set video size, horizontal / vertical placement, and opacity for picture in
-  picture, transparent overlays, and full-frame cuts. **Duplicate** copies the
-  selected segment and its linked audio into new layers above.
-- Toggle video visibility or audio mute by layer. Empty lanes can be removed.
-- Split, delete, change speed, adjust gain, and add per-segment captions.
-  Layer operations participate in undo / redo.
-- Timeline gaps remain black or silent. Layered previews are prepared in the
-  background at up to 640×360 / 30fps with a progress message. Changes are
-  debounced; playback is available after the current preview is ready. Exports
-  always use original media at the chosen output quality.
+- **Import** adds video and audio to the media bin. Nothing is placed on the
+  timeline automatically. Drag a media item to the time and lane you want; a
+  drop indicator shows where it will land. Drop between lanes to create a layer.
+- Drag clips horizontally to change timing or vertically to another lane.
+  Drag a track name up or down to change its layer order. Video at the top
+  appears in front; audio lanes mix together.
+- Click a video on the preview to select it. Drag the video to move it, and
+  drag its corner handles to resize it while keeping its aspect ratio. Videos
+  can extend outside the canvas. Transform edits update immediately on the GPU.
+- The canvas automatically follows the largest-resolution video **placed on
+  the timeline**. Importing alone does not change it. The preview's resolution
+  menu provides an explicit manual override; Custom export settings can override
+  the output size as well.
+- Hover a media item and click **×** to remove it and its timeline instances.
+  Removing the last item leaves a blank editor. Import again whenever you want.
+- Split with **S**, delete with **Delete**, and undo / redo with **Ctrl+Z** /
+  **Ctrl+Shift+Z**. Linked audio follows video until detached with **D**.
+- **Inspector** is optional. Open it for gain, speed, opacity and captions;
+  selecting a clip does not open a side panel automatically. Right-click a clip
+  for edit actions, or a track name to mute / hide that track.
+- Each active video and audio lane uses an independent live decoder. Timeline
+  playback, scrubbing and transform edits do not rebuild a rendered timeline.
+  Exports always read the original media through the shared composition model.
 
-The timeline scrolls vertically as you add lanes. The Edit panel also scrolls
-when its controls do not fit. Simple Clip stays focused on the quick-cut workflow.
-Sessions are currently in memory: **export your edit before closing or updating**.
+The preview keeps most of the window. The compact timeline can be resized by
+its upper divider and scrolls only when more lanes are present than fit.
+Simple Clip retains its focused mark-and-export workflow. Sessions are currently
+in memory: **export your edit before closing or updating**.
 
 ### Export
 
 **Auto** preserves source quality. **Discord** targets an upload size and chooses
 resolution / codec accordingly. **Custom** exposes resolution, frame rate, codec,
 quality or bitrate, and audio settings. Available hardware encoders are detected
-at startup; layered composition runs on the CPU, with an upload to the GPU when
-the selected encoder requires it. Proxy media never replaces export originals.
+at startup. Preview layers composite on the GPU; export composition runs through
+FFmpeg, with a GPU upload when the selected encoder requires it. Proxy media never replaces export originals.
 
 ### Shortcuts
 
@@ -69,6 +76,7 @@ the selected encoder requires it. Proxy media never replaces export originals.
 
 Command line: `halo-clipper video.mp4`, or
 `halo-clipper video.mp4 --advanced --layer overlay.mp4 --layer music.wav`.
+The Advanced command imports those files into the bin without placing them.
 
 ## Updates and support
 
