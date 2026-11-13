@@ -24,8 +24,10 @@ pub enum ProxyQuality {
     AllIntra,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default = "default_update_check")]
+    pub check_updates_on_startup: bool,
     /// When true, the proxy cache (~/.cache/halo-clipper/proxies/) is
     /// wiped on app exit. Default: off — leaving the cache populated
     /// makes second-opens of the same file instant. Users with tight
@@ -38,10 +40,27 @@ pub struct Settings {
     pub proxy_quality: ProxyQuality,
 }
 
+fn default_update_check() -> bool {
+    true
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            auto_clear_cache_on_close: false,
+            proxy_quality: ProxyQuality::default(),
+            check_updates_on_startup: true,
+        }
+    }
+}
+
 /// Resolve a config file path under the given app dir name. Honors
 /// `$XDG_CONFIG_HOME`, falls back to `$HOME/.config`, falls back to
 /// `/tmp` so we never panic.
 fn config_path_for(app_dir: &str) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(base) = std::env::var_os("APPDATA") {
+        return PathBuf::from(base).join(app_dir).join("config.json");
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

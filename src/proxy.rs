@@ -23,7 +23,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -33,6 +33,10 @@ use std::thread::{self, JoinHandle};
 /// previous identity (`brett-clipper`) is renamed over on first touch so
 /// existing proxies stay valid.
 fn cache_root() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(base).join("Halo Clipper/cache/proxies");
+    }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -231,8 +235,7 @@ pub fn spawn_transcode(
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&dest_tmp, &dest_final) {
                     let _ = std::fs::remove_file(&dest_tmp);
-                    progress_t.lock().unwrap().failed =
-                        Some(format!("rename failed: {e}"));
+                    progress_t.lock().unwrap().failed = Some(format!("rename failed: {e}"));
                     return;
                 }
                 let mut p = progress_t.lock().unwrap();
@@ -276,7 +279,7 @@ fn run_ffmpeg(
         crate::settings::ProxyQuality::AllIntra => "1",
     };
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::platform::command("ffmpeg");
     cmd.arg("-hide_banner")
         .args(["-loglevel", "error", "-y"])
         .args(["-progress", "pipe:1", "-nostats"]);
@@ -327,7 +330,7 @@ fn run_ffmpeg(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    log::info!("ffmpeg (proxy, vaapi={use_vaapi}): {cmd:?}");
+    log::info!("proxy started (vaapi={use_vaapi})");
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().expect("piped");
     *child_slot.lock().unwrap() = Some(child);

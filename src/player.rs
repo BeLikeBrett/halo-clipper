@@ -7,8 +7,8 @@
 //   * A background thread loops on `mpv.wait_event()` and pushes property
 //     changes (time-pos / pause / volume / mute / duration) into a shared
 //     `PlayerState` the UI polls each frame.
-//   * The `RenderContext` is created lazily on the first paint, when we
-//     finally have access to the eframe glow GL context. Because it borrows
+//   * The `RenderContext` is created while eframe initializes the app,
+//     before any media is loaded. Because it borrows
 //     from `Mpv`, we use a transmute to give it `'static` lifetime; drop
 //     order is enforced manually in `Player::drop`.
 //   * `Player` is shared with the egui paint callback as `Arc<Player>`,
@@ -84,11 +84,16 @@ pub struct Player {
     mpv: Arc<Mpv>,
     event_stop: Arc<AtomicBool>,
     _event_thread: Mutex<Option<JoinHandle<()>>>,
+    repaint_ctx: egui::Context,
 }
 
 impl Player {
-    pub fn new() -> Result<Self> {
+    pub fn new(repaint_ctx: egui::Context) -> Result<Self> {
         let mpv = Mpv::with_initializer(|init| {
+            if log::log_enabled!(log::Level::Debug) {
+                init.set_property("terminal", "yes")?;
+                init.set_property("msg-level", "all=v")?;
+            }
             init.set_property("vo", "libmpv")?;
             init.set_property("hwdec", "auto-safe")?;
             init.set_property("audio-display", "no")?;
@@ -131,7 +136,8 @@ impl Player {
             // scrubbing, shaves a frame or two of latency on seeks.
             init.set_property("video-latency-hacks", "yes")?;
             Ok(())
-        }).context("mpv init failed (is libmpv installed?)")?;
+        })
+        .context("mpv init failed (is libmpv installed?)")?;
 
         let mpv = Arc::new(mpv);
         let state = Arc::new(Mutex::new(PlayerState::fresh()));
@@ -149,7 +155,8 @@ impl Player {
             let mpv = mpv.clone();
             let state = state.clone();
             let stop = event_stop.clone();
-            thread::spawn(move || event_loop(mpv, state, stop))
+            let repaint_ctx = repaint_ctx.clone();
+            thread::spawn(move || event_loop(mpv, state, stop, repaint_ctx))
         };
 
         Ok(Self {
@@ -162,6 +169,7 @@ impl Player {
             mpv,
             event_stop,
             _event_thread: Mutex::new(Some(event_thread)),
+            repaint_ctx,
         })
     }
 
@@ -178,7 +186,8 @@ impl Player {
         }
         let start_s = (start_ms as f64 / 1000.0).max(0.0);
         let options = format!("start={start_s},pause=yes");
-        self.mpv.command("loadfile", &[path, "replace", "0", &options])?;
+        self.mpv
+            .command("loadfile", &[path, "replace", "0", &options])?;
         let mut s = self.state.lock().unwrap();
         s.loaded_file = Some(source.to_path_buf());
         s.position_ms = start_ms;
@@ -265,9 +274,20 @@ impl Player {
         // field ordering above.
         let mpv_ref: &Mpv = &self.mpv;
         let mpv_static: &'static Mpv = unsafe { std::mem::transmute(mpv_ref) };
-        let ctx: RenderContext<'static> = mpv_static
+        let mut ctx: RenderContext<'static> = mpv_static
             .create_render_context(params)
             .context("create_render_context failed")?;
+
+        // Decoding and seeks finish asynchronously, often after egui has
+        // gone idle (especially the first paused frame after import).
+        // Wake the UI when mpv has a frame instead of leaving a black or
+        // stale preview until the next mouse/keyboard event. The callback
+        // only schedules painting; all GL/mpv rendering stays on the UI thread.
+        let repaint_ctx = self.repaint_ctx.clone();
+        ctx.set_update_callback(move || {
+            log::debug!("mpv frame ready");
+            repaint_ctx.request_repaint();
+        });
 
         *slot = Some(RenderState {
             ctx: MainThreadOnly(ctx),
@@ -281,14 +301,22 @@ impl Player {
     pub fn render(&self, fbo: i32, width: i32, height: i32, flip: bool) -> Result<()> {
         let slot = self.render.lock().unwrap();
         let rs = slot.as_ref().context("render context not initialized")?;
-        rs.ctx.0
+        // Acknowledge frame notifications so mpv can notify us again.
+        let _ = rs.ctx.0.update();
+        rs.ctx
+            .0
             .render::<Arc<GlLoader>>(fbo, width, height, flip)
             .context("mpv render failed")?;
         Ok(())
     }
 }
 
-fn event_loop(mpv: Arc<Mpv>, state: Arc<Mutex<PlayerState>>, stop: Arc<AtomicBool>) {
+fn event_loop(
+    mpv: Arc<Mpv>,
+    state: Arc<Mutex<PlayerState>>,
+    stop: Arc<AtomicBool>,
+    repaint_ctx: egui::Context,
+) {
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -296,11 +324,23 @@ fn event_loop(mpv: Arc<Mpv>, state: Arc<Mutex<PlayerState>>, stop: Arc<AtomicBoo
         match mpv.wait_event(0.25) {
             None => continue,
             Some(Err(e)) => {
-                log::debug!("mpv event error: {e:?}");
+                log::warn!("mpv event error: {e:?}");
                 continue;
             }
             Some(Ok(Event::Shutdown)) => return,
+            Some(Ok(Event::EndFile(reason))) if reason == libmpv2::mpv_end_file_reason::Error => {
+                log::error!("mpv could not decode the selected media");
+            }
+            Some(Ok(Event::LogMessage {
+                prefix,
+                level,
+                text,
+                ..
+            })) => {
+                log::warn!("mpv {prefix} ({level}): {}", text.trim());
+            }
             Some(Ok(Event::PropertyChange { name, change, .. })) => {
+                log::debug!("mpv property {name}: {change:?}");
                 let mut s = state.lock().unwrap();
                 s.last_update = Some(Instant::now());
                 match (name, change) {
@@ -323,6 +363,10 @@ fn event_loop(mpv: Arc<Mpv>, state: Arc<Mutex<PlayerState>>, stop: Arc<AtomicBoo
                     }
                     _ => {}
                 }
+                // egui may read PlayerState while holding its own context
+                // lock. Release our lock before scheduling a repaint.
+                drop(s);
+                repaint_ctx.request_repaint();
             }
             Some(Ok(_)) => {}
         }

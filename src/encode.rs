@@ -5,8 +5,6 @@
 //! resolutions, and bitrates. Keeping the data types here lets us hand a
 //! plain `EncodeSettings` value around without entangling Project state.
 
-use std::process::Command;
-
 /// Resolution preset for the Custom export panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolutionPreset {
@@ -375,24 +373,26 @@ impl EncodeSettings {
                     // -b:v 0 releases NVENC's default bitrate clamp so
                     // -cq actually drives the size.
                     args.extend([
-                        "-rc".into(), "vbr".into(),
-                        "-cq".into(), q.to_string(),
-                        "-b:v".into(), "0".into(),
+                        "-rc".into(),
+                        "vbr".into(),
+                        "-cq".into(),
+                        q.to_string(),
+                        "-b:v".into(),
+                        "0".into(),
                     ]);
                 }
                 VideoCodec::VaapiH264 | VideoCodec::VaapiHevc => {
-                    args.extend([
-                        "-rc_mode".into(), "CQP".into(),
-                        "-qp".into(), q.to_string(),
-                    ]);
+                    args.extend(["-rc_mode".into(), "CQP".into(), "-qp".into(), q.to_string()]);
                 }
                 VideoCodec::VaapiAv1 => {
                     // av1_vaapi has no -qp of its own (unlike the H.26x
                     // VAAPI encoders); it reads the generic global
                     // quality field, which -q:v sets.
                     args.extend([
-                        "-rc_mode".into(), "CQP".into(),
-                        "-q:v".into(), q.to_string(),
+                        "-rc_mode".into(),
+                        "CQP".into(),
+                        "-q:v".into(),
+                        q.to_string(),
                     ]);
                 }
                 VideoCodec::QsvH264 | VideoCodec::QsvHevc | VideoCodec::QsvAv1 => {
@@ -400,9 +400,12 @@ impl EncodeSettings {
                 }
                 VideoCodec::AmfH264 | VideoCodec::AmfHevc | VideoCodec::AmfAv1 => {
                     args.extend([
-                        "-rc".into(), "cqp".into(),
-                        "-qp_i".into(), q.to_string(),
-                        "-qp_p".into(), q.to_string(),
+                        "-rc".into(),
+                        "cqp".into(),
+                        "-qp_i".into(),
+                        q.to_string(),
+                        "-qp_p".into(),
+                        q.to_string(),
                     ]);
                 }
             },
@@ -670,7 +673,13 @@ impl DiscordNitro {
     ) -> VideoCodec {
         match choice {
             CodecChoice::Auto => Self::pick_codec(
-                duration_ms, target_bytes, src_w, src_h, src_fps, gpu, available,
+                duration_ms,
+                target_bytes,
+                src_w,
+                src_h,
+                src_fps,
+                gpu,
+                available,
             ),
             CodecChoice::H264 => recommend_codec(gpu, available),
             CodecChoice::Av1 => {
@@ -688,8 +697,7 @@ impl DiscordNitro {
         codec: VideoCodec,
     ) -> EncodeSettings {
         let video_kbps = Self::video_kbps_for(duration_ms, target_bytes);
-        let resolution = Self::resolution_for(video_kbps, codec, src_h)
-            .dimensions(src_w, src_h);
+        let resolution = Self::resolution_for(video_kbps, codec, src_h).dimensions(src_w, src_h);
         let video_preset = if matches!(codec, VideoCodec::SvtAv1) {
             Self::svt_preset_for(duration_ms).to_string()
         } else {
@@ -794,25 +802,37 @@ impl NitroPlan {
         available: &[VideoCodec],
     ) -> Self {
         let auto_codec = DiscordNitro::pick_codec(
-            duration_ms, target_bytes, src_w, src_h, src_fps, gpu, available,
+            duration_ms,
+            target_bytes,
+            src_w,
+            src_h,
+            src_fps,
+            gpu,
+            available,
         );
         let codec = DiscordNitro::resolve_codec(
-            choice, duration_ms, target_bytes, src_w, src_h, src_fps, gpu, available,
+            choice,
+            duration_ms,
+            target_bytes,
+            src_w,
+            src_h,
+            src_fps,
+            gpu,
+            available,
         );
         let video_kbps = DiscordNitro::video_kbps_for(duration_ms, target_bytes);
         let audio_kbps = DiscordNitro::audio_kbps_for(duration_ms, target_bytes);
         let resolution = DiscordNitro::resolution_for(video_kbps, codec, src_h);
-        let h264_resolution = DiscordNitro::resolution_for(
-            video_kbps,
-            recommend_codec(gpu, available),
-            src_h,
-        );
+        let h264_resolution =
+            DiscordNitro::resolution_for(video_kbps, recommend_codec(gpu, available), src_h);
         let av1_resolution = DiscordNitro::best_av1(gpu, available)
             .map(|c| DiscordNitro::resolution_for(video_kbps, c, src_h));
         Self {
             codec,
             resolution,
-            dims: resolution.dimensions(src_w, src_h).unwrap_or((src_w, src_h)),
+            dims: resolution
+                .dimensions(src_w, src_h)
+                .unwrap_or((src_w, src_h)),
             video_kbps,
             audio_kbps,
             est_bytes: DiscordNitro::estimated_size_bytes(duration_ms, target_bytes),
@@ -822,9 +842,7 @@ impl NitroPlan {
             av1_resolution,
             choice,
             auto_codec,
-            settings: DiscordNitro::settings_for(
-                duration_ms, target_bytes, src_w, src_h, codec,
-            ),
+            settings: DiscordNitro::settings_for(duration_ms, target_bytes, src_w, src_h, codec),
         }
     }
 
@@ -993,10 +1011,15 @@ pub const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 /// this check the failure surfaces as a dead export minutes in. A
 /// 2-frame encode to the null muxer settles it in under 100 ms.
 pub fn encoder_works(codec: VideoCodec) -> bool {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::platform::command("ffmpeg");
     cmd.args([
-        "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc=d=0.2:s=320x180:r=10",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=d=0.2:s=320x180:r=10",
     ]);
     if codec.needs_vaapi_upload() {
         cmd.args(["-vaapi_device", VAAPI_DEVICE, "-vf", "format=nv12,hwupload"]);
@@ -1005,7 +1028,10 @@ pub fn encoder_works(codec: VideoCodec) -> bool {
     match cmd.output() {
         Ok(out) => out.status.success(),
         Err(e) => {
-            log::warn!("encoder probe for {} failed to run: {e}", codec.ffmpeg_name());
+            log::warn!(
+                "encoder probe for {} failed to run: {e}",
+                codec.ffmpeg_name()
+            );
             false
         }
     }
@@ -1027,7 +1053,10 @@ pub fn verify_av1_encoders(codecs: Vec<VideoCodec>) -> Vec<VideoCodec> {
             }
             let ok = encoder_works(*c);
             if !ok {
-                log::info!("{} advertised but not usable here — dropping", c.ffmpeg_name());
+                log::info!(
+                    "{} advertised but not usable here — dropping",
+                    c.ffmpeg_name()
+                );
             }
             ok
         })
@@ -1040,7 +1069,7 @@ pub fn verify_av1_encoders(codecs: Vec<VideoCodec>) -> Vec<VideoCodec> {
 /// Synchronous — the command is fast (≲ 100ms) and only runs once at
 /// startup.
 pub fn detect_available_codecs() -> Vec<VideoCodec> {
-    let Ok(out) = Command::new("ffmpeg")
+    let Ok(out) = crate::platform::command("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
     else {
@@ -1329,10 +1358,7 @@ mod tests {
         assert!(audio < 128, "expected reduced audio bitrate, got {audio}");
         let est = DiscordNitro::estimated_size_bytes(dur, target);
         let est_mb = est as f64 / (1024.0 * 1024.0);
-        assert!(
-            est_mb <= 10.5,
-            "10 MB target estimated at {est_mb:.1} MB"
-        );
+        assert!(est_mb <= 10.5, "10 MB target estimated at {est_mb:.1} MB");
     }
 
     #[test]
@@ -1349,8 +1375,7 @@ mod tests {
         // the MAX_BITRATE_KBPS cap doesn't dominate, so the slider
         // value actually translates into different bitrates.
         let dur = 5 * 60 * 1000; // 5 minutes
-        let kbps_small =
-            DiscordNitro::video_kbps_for(dur, DiscordNitro::target_bytes_from_mb(100));
+        let kbps_small = DiscordNitro::video_kbps_for(dur, DiscordNitro::target_bytes_from_mb(100));
         let kbps_full = DiscordNitro::video_kbps_for(
             dur,
             DiscordNitro::target_bytes_from_mb(DiscordNitro::MAX_TARGET_MB),
@@ -1360,14 +1385,18 @@ mod tests {
             "smaller target should use less bitrate (small={kbps_small}, full={kbps_full})"
         );
 
-        let est_100 = DiscordNitro::estimated_size_bytes(
-            dur,
-            DiscordNitro::target_bytes_from_mb(100),
-        );
+        let est_100 =
+            DiscordNitro::estimated_size_bytes(dur, DiscordNitro::target_bytes_from_mb(100));
         let mb_100 = est_100 as f64 / (1024.0 * 1024.0);
         // Should be near (but not above) 100 MB.
-        assert!(mb_100 < 100.0, "100 MB target produced {mb_100:.1} MB estimate");
-        assert!(mb_100 > 70.0, "100 MB target should land near 100 MB ({mb_100:.1})");
+        assert!(
+            mb_100 < 100.0,
+            "100 MB target produced {mb_100:.1} MB estimate"
+        );
+        assert!(
+            mb_100 > 70.0,
+            "100 MB target should land near 100 MB ({mb_100:.1})"
+        );
     }
 
     #[test]
@@ -1712,7 +1741,10 @@ mod tests {
     #[test]
     fn recommend_falls_back_to_x264_when_no_hw_available() {
         assert_eq!(recommend_codec(None, &[]), VideoCodec::X264);
-        assert_eq!(recommend_codec(Some(GpuVendor::Nvidia), &[]), VideoCodec::X264);
+        assert_eq!(
+            recommend_codec(Some(GpuVendor::Nvidia), &[]),
+            VideoCodec::X264
+        );
     }
 
     #[test]
@@ -1741,4 +1773,3 @@ mod tests {
         );
     }
 }
-

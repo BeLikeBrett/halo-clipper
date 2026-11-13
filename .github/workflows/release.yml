@@ -1,0 +1,81 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libmpv-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl-dev ffmpeg fonts-dejavu-core
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked && cargo build --release --locked
+      - run: mkdir -p dist && cp target/release/halo-clipper dist/halo-clipper-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/halo-clipper-linux-x86_64
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Download pinned media runtime
+        run: python scripts/fetch-windows-runtime.py dist/runtime
+      - name: Create native import library
+        shell: pwsh
+        run: |
+          $exports = & dumpbin /exports dist/runtime/mpv-dev/libmpv-2.dll
+          'EXPORTS' | Set-Content dist/runtime/mpv-dev/mpv.def
+          $exports | ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(mpv_\w+)') { $Matches[1] | Add-Content dist/runtime/mpv-dev/mpv.def } }
+          lib /nologo /machine:x64 /def:dist/runtime/mpv-dev/mpv.def /out:dist/runtime/mpv-dev/mpv.lib
+          $mpv = (Resolve-Path dist/runtime/mpv-dev).Path
+          $ffmpeg = (Get-ChildItem dist/runtime/ffmpeg -Filter ffprobe.exe -Recurse | Select-Object -First 1).DirectoryName
+          "RUSTFLAGS=-L native=$mpv" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $mpv | Out-File -FilePath $env:GITHUB_PATH -Append
+          $ffmpeg | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+      - run: python scripts/package-windows.py dist/runtime target/release/halo-clipper.exe
+      - name: Build installer
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:/Program Files (x86)/NSIS/makensis.exe')) { choco install nsis -y --no-progress }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          & 'C:/Program Files (x86)/NSIS/makensis.exe' "/DVERSION=$version" packaging/windows.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/Halo-Clipper-Setup.exe
+            dist/Halo-Clipper-windows-x86_64.zip
+  publish:
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+      - run: pip install cryptography
+      - name: Sign update manifest
+        env:
+          HALO_UPDATE_SIGNING_KEY: ${{ secrets.HALO_UPDATE_SIGNING_KEY }}
+        run: |
+          python -c "import os,tomllib; assert os.environ['GITHUB_REF_NAME']=='v'+tomllib.load(open('Cargo.toml','rb'))['package']['version']"
+          python scripts/sign-release.py "$GITHUB_REF_NAME" dist/release
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/release/* --verify-tag --generate-notes --title "Halo Clipper $GITHUB_REF_NAME"

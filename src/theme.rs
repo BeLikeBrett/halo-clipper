@@ -3,34 +3,34 @@
 
 use egui::{Color32, Context, Rounding, Stroke, Visuals};
 
-pub const BG_CANVAS:           Color32 = Color32::from_rgb(14, 15, 18);
-pub const BG_PANEL:            Color32 = Color32::from_rgb(22, 24, 28);
-pub const BG_HEADER:           Color32 = Color32::from_rgb(18, 20, 24);
-pub const BG_PREVIEW:          Color32 = Color32::from_rgb(8, 9, 11);
-pub const BG_STATUS:           Color32 = Color32::from_rgb(28, 31, 36);
-pub const BG_MODAL:            Color32 = Color32::from_rgb(28, 31, 38);
-pub const BG_BUTTON:           Color32 = Color32::from_rgb(46, 50, 58);
-pub const BG_BUTTON_HOVER:     Color32 = Color32::from_rgb(60, 66, 78);
-pub const BG_BUTTON_ACTIVE:    Color32 = Color32::from_rgb(78, 86, 102);
-pub const BG_BUTTON_DISABLED:  Color32 = Color32::from_rgb(36, 38, 44);
+pub const BG_CANVAS: Color32 = Color32::from_rgb(14, 15, 18);
+pub const BG_PANEL: Color32 = Color32::from_rgb(22, 24, 28);
+pub const BG_HEADER: Color32 = Color32::from_rgb(18, 20, 24);
+pub const BG_PREVIEW: Color32 = Color32::from_rgb(8, 9, 11);
+pub const BG_STATUS: Color32 = Color32::from_rgb(28, 31, 36);
+pub const BG_MODAL: Color32 = Color32::from_rgb(28, 31, 38);
+pub const BG_BUTTON: Color32 = Color32::from_rgb(46, 50, 58);
+pub const BG_BUTTON_HOVER: Color32 = Color32::from_rgb(60, 66, 78);
+pub const BG_BUTTON_ACTIVE: Color32 = Color32::from_rgb(78, 86, 102);
+pub const BG_BUTTON_DISABLED: Color32 = Color32::from_rgb(36, 38, 44);
 
-pub const BORDER:              Color32 = Color32::from_rgb(50, 54, 62);
+pub const BORDER: Color32 = Color32::from_rgb(50, 54, 62);
 
-pub const TEXT_PRIMARY:        Color32 = Color32::from_rgb(230, 232, 238);
-pub const TEXT_MUTED:          Color32 = Color32::from_rgb(140, 146, 158);
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(230, 232, 238);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(140, 146, 158);
 
-pub const ACCENT:              Color32 = Color32::from_rgb(96, 168, 255);
-pub const ACCENT_IN:           Color32 = Color32::from_rgb(110, 220, 150);
-pub const ACCENT_OUT:          Color32 = Color32::from_rgb(240, 140, 140);
-pub const ACCENT_OK:           Color32 = Color32::from_rgb(110, 220, 150);
-pub const ACCENT_ERR:          Color32 = Color32::from_rgb(240, 120, 120);
+pub const ACCENT: Color32 = Color32::from_rgb(96, 168, 255);
+pub const ACCENT_IN: Color32 = Color32::from_rgb(110, 220, 150);
+pub const ACCENT_OUT: Color32 = Color32::from_rgb(240, 140, 140);
+pub const ACCENT_OK: Color32 = Color32::from_rgb(110, 220, 150);
+pub const ACCENT_ERR: Color32 = Color32::from_rgb(240, 120, 120);
 
 /// Primary action buttons (Export Clip, Begin Export). Toned-down vs.
 /// ACCENT so they don't glare against the dark UI — same hue family,
 /// lower saturation, paired with a slightly off-white text tone.
-pub const BTN_PRIMARY:         Color32 = Color32::from_rgb(64, 112, 168);
-pub const BTN_PRIMARY_HOVER:   Color32 = Color32::from_rgb(80, 132, 196);
-pub const BTN_PRIMARY_TEXT:    Color32 = Color32::from_rgb(228, 236, 248);
+pub const BTN_PRIMARY: Color32 = Color32::from_rgb(64, 112, 168);
+pub const BTN_PRIMARY_HOVER: Color32 = Color32::from_rgb(80, 132, 196);
+pub const BTN_PRIMARY_TEXT: Color32 = Color32::from_rgb(228, 236, 248);
 
 pub fn apply(ctx: &Context) {
     let mut visuals = Visuals::dark();

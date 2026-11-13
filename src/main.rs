@@ -1,27 +1,49 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 // Halo Clipper — entry point.
 // Sets up logging, creates the eframe window, and hands off to ClipperApp.
 
 mod app;
+mod composition;
+mod diagnostics;
 mod encode;
 mod export;
 mod gl_loader;
 mod media;
+mod platform;
 mod player;
+mod preview;
 mod proxy;
 mod settings;
 mod theme;
 mod timeline;
 mod track;
+mod updater;
 mod video_fbo;
 
 use app::ClipperApp;
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    platform::init();
+    // HaloOS can force MangoHud into every Vulkan client. libmpv probes
+    // Vulkan decoders even though our preview renders with OpenGL; the
+    // overlay can crash inside vkCreateDevice during that probe. Opt this
+    // editor (and its media subprocesses) out before any graphics threads
+    // start. DISABLE_MANGOHUD also covers forced implicit-layer manifests.
+    std::env::set_var("DISABLE_MANGOHUD", "1");
+    std::env::set_var("MANGOHUD", "0");
+
+    diagnostics::init();
 
     // A path argument means we were launched via "Open With" / the
     // .desktop MimeType association (Exec=... %F) or a shell like
     // `halo-clipper clip.mp4`. Open it straight away.
+    let layer_args: Vec<_> = std::env::args_os().collect();
+    let layers: Vec<_> = layer_args
+        .windows(2)
+        .filter(|pair| pair[0] == "--layer")
+        .map(|pair| std::path::PathBuf::from(&pair[1]))
+        .collect();
+    let advanced = layer_args.iter().any(|arg| arg == "--advanced");
     let initial_file = std::env::args_os()
         .nth(1)
         .map(std::path::PathBuf::from)
@@ -53,6 +75,12 @@ fn main() -> eframe::Result<()> {
                 Ok(mut app) => {
                     if let Some(path) = initial_file {
                         app.open_path(path);
+                    }
+                    if advanced {
+                        app.set_mode(app::EditMode::MultiTrack);
+                    }
+                    for layer in layers {
+                        app.add_layer_path(layer);
                     }
                     Ok(Box::new(app) as Box<dyn eframe::App>)
                 }
@@ -90,48 +118,47 @@ fn load_window_icon() -> Option<egui::IconData> {
 /// Proportional family for missing names, so the worst case is "preview
 /// shows base style but export still uses the right font."
 fn load_caption_fonts(ctx: &egui::Context) {
-    let candidates: &[(&str, &[&str])] = &[
-        ("DejaVu Sans", &[
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        ]),
-        ("DejaVu Sans Bold", &[
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ]),
-        ("DejaVu Sans Oblique", &[
-            "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
-        ]),
-        ("DejaVu Serif", &[
-            "/usr/share/fonts/TTF/DejaVuSerif.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-        ]),
-        ("DejaVu Serif Bold", &[
-            "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-        ]),
-        ("DejaVu Sans Mono", &[
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ]),
+    let candidates: &[(&str, &[u8])] = &[
+        (
+            "DejaVu Sans",
+            include_bytes!("../assets/fonts/DejaVuSans.ttf"),
+        ),
+        (
+            "DejaVu Sans Bold",
+            include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf"),
+        ),
+        (
+            "DejaVu Sans Oblique",
+            include_bytes!("../assets/fonts/DejaVuSans-Oblique.ttf"),
+        ),
+        (
+            "DejaVu Serif",
+            include_bytes!("../assets/fonts/DejaVuSerif.ttf"),
+        ),
+        (
+            "DejaVu Serif Bold",
+            include_bytes!("../assets/fonts/DejaVuSerif-Bold.ttf"),
+        ),
+        (
+            "DejaVu Sans Mono",
+            include_bytes!("../assets/fonts/DejaVuSansMono.ttf"),
+        ),
     ];
 
     let mut fonts = egui::FontDefinitions::default();
-    for (name, paths) in candidates {
-        let Some(bytes) = paths.iter().find_map(|p| std::fs::read(p).ok()) else {
-            log::info!("caption font {name} not found on system");
-            continue;
-        };
-        fonts.font_data.insert(
-            (*name).to_string(),
-            egui::FontData::from_owned(bytes),
-        );
+    for (name, bytes) in candidates {
+        fonts
+            .font_data
+            .insert((*name).to_string(), egui::FontData::from_static(bytes));
         fonts.families.insert(
             egui::FontFamily::Name((*name).into()),
             vec![(*name).to_string()],
         );
     }
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("DejaVu Sans".into());
     ctx.set_fonts(fonts);
 }

@@ -5,7 +5,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
@@ -45,10 +44,21 @@ struct FfprobeFormat {
 }
 
 pub fn probe(path: &Path) -> Result<MediaInfo> {
-    let output = Command::new("ffprobe")
+    let info = probe_layer(path)?;
+    if info.width == 0 || info.height == 0 {
+        anyhow::bail!("no video stream in file");
+    }
+    Ok(info)
+}
+
+/// Layer imports also accept audio-only media.
+pub fn probe_layer(path: &Path) -> Result<MediaInfo> {
+    let output = crate::platform::command("ffprobe")
         .args([
-            "-v", "error",
-            "-print_format", "json",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
             "-show_format",
             "-show_streams",
         ])
@@ -63,14 +73,13 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         ));
     }
 
-    let parsed: FfprobeOutput = serde_json::from_slice(&output.stdout)
-        .context("ffprobe returned unparseable JSON")?;
+    let parsed: FfprobeOutput =
+        serde_json::from_slice(&output.stdout).context("ffprobe returned unparseable JSON")?;
 
     let video = parsed
         .streams
         .iter()
-        .find(|s| s.codec_type == "video")
-        .ok_or_else(|| anyhow!("no video stream in file"))?;
+        .find(|s| s.codec_type == "video" && s.width.unwrap_or(0) > 0);
 
     let audio = parsed.streams.iter().find(|s| s.codec_type == "audio");
     let audio_stream_count = parsed
@@ -86,19 +95,23 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("could not determine duration"))?;
 
+    if !duration_secs.is_finite() || duration_secs <= 0.0 {
+        anyhow::bail!("media duration must be positive");
+    }
+    if video.is_none() && audio_stream_count == 0 {
+        anyhow::bail!("no playable video or audio stream");
+    }
     let fps = video
-        .avg_frame_rate
-        .as_deref()
-        .or(video.r_frame_rate.as_deref())
+        .and_then(|v| v.avg_frame_rate.as_deref().or(v.r_frame_rate.as_deref()))
         .and_then(parse_fraction)
         .unwrap_or(30.0);
 
     Ok(MediaInfo {
         duration_ms: (duration_secs * 1000.0) as i64,
-        width: video.width.unwrap_or(0),
-        height: video.height.unwrap_or(0),
+        width: video.and_then(|v| v.width).unwrap_or(0),
+        height: video.and_then(|v| v.height).unwrap_or(0),
         fps,
-        video_codec: video.codec_name.clone().unwrap_or_default(),
+        video_codec: video.and_then(|v| v.codec_name.clone()).unwrap_or_default(),
         audio_codec: audio.and_then(|a| a.codec_name.clone()),
         audio_stream_count,
     })
@@ -109,7 +122,11 @@ fn parse_fraction(s: &str) -> Option<f64> {
     let (num, den) = s.split_once('/')?;
     let n: f64 = num.parse().ok()?;
     let d: f64 = den.parse().ok()?;
-    if d == 0.0 { None } else { Some(n / d) }
+    if d == 0.0 {
+        None
+    } else {
+        Some(n / d)
+    }
 }
 
 /// Find the latest keyframe at-or-before `target_ms` in the source's
@@ -128,7 +145,7 @@ pub fn nearest_keyframe_before(source: &Path, target_ms: i64) -> Result<i64> {
     let window_start = (target_s - 5.0).max(0.0);
     let window_dur = (target_s - window_start) + 0.2;
 
-    let output = Command::new("ffprobe")
+    let output = crate::platform::command("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0"])
         .args(["-skip_frame", "nokey"])
         .args([
@@ -152,7 +169,9 @@ pub fn nearest_keyframe_before(source: &Path, target_ms: i64) -> Result<i64> {
     let mut best: Option<f64> = None;
     for line in text.lines() {
         let s = line.trim().trim_end_matches(',');
-        if s.is_empty() { continue; }
+        if s.is_empty() {
+            continue;
+        }
         if let Ok(t) = s.parse::<f64>() {
             // 1 ms slack on the upper bound — pts_time can be exactly at
             // target_s and we still want to count it as "at-or-before".

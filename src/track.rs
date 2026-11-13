@@ -12,6 +12,8 @@
 //! audio clip below it leaves a hole the export pipeline must fill with
 //! silence).
 
+use crate::media::MediaInfo;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -30,6 +32,30 @@ pub enum TrackKind {
 }
 
 #[derive(Clone, Debug)]
+pub struct LayerSource {
+    pub path: PathBuf,
+    pub media: MediaInfo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform {
+    pub scale: f32,
+    pub x: f32,
+    pub y: f32,
+    pub opacity: f32,
+}
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            x: 0.5,
+            y: 0.5,
+            opacity: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Track {
     pub id: TrackId,
     pub kind: TrackKind,
@@ -43,6 +69,8 @@ pub struct Track {
     /// pulls from. Video tracks: `None`. Lets us probe-once / map-many
     /// when the source has multiple audio streams (game audio + mic, etc.).
     pub source_audio_index: Option<usize>,
+    /// None uses the project source. Imported layers retain their own original.
+    pub source: Option<LayerSource>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,22 +92,29 @@ pub struct Clip {
     /// for now, so a 2× clip still occupies its full source width on
     /// the timeline.
     pub speed: f32,
+    pub transform: Transform,
 }
 
 impl Clip {
     pub fn src_duration_ms(&self) -> i64 {
         (self.src_end_ms - self.src_start_ms).max(0)
     }
+    pub fn duration_ms(&self) -> i64 {
+        (self.src_duration_ms() as f64 / self.speed.clamp(0.25, 4.0) as f64).round() as i64
+    }
     pub fn cut_end_ms(&self) -> i64 {
-        self.cut_start_ms + self.src_duration_ms()
+        self.cut_start_ms + self.duration_ms()
     }
     pub fn contains_cut(&self, t: i64) -> bool {
         t >= self.cut_start_ms && t < self.cut_end_ms()
     }
     /// Map cut-time inside this clip to its source-time equivalent.
     pub fn cut_to_src(&self, cut_ms: i64) -> Option<i64> {
-        self.contains_cut(cut_ms)
-            .then_some(self.src_start_ms + (cut_ms - self.cut_start_ms))
+        self.contains_cut(cut_ms).then_some(
+            self.src_start_ms
+                + ((cut_ms - self.cut_start_ms) as f64 * self.speed.clamp(0.25, 4.0) as f64).round()
+                    as i64,
+        )
     }
 }
 
@@ -137,16 +172,41 @@ impl Default for TextOverlay {
 pub struct FontChoice {
     pub display: &'static str,
     pub egui_family: &'static str,
+    #[cfg_attr(windows, allow(dead_code))]
     pub fontconfig: &'static str,
 }
 
 pub const FONT_CHOICES: &[FontChoice] = &[
-    FontChoice { display: "Sans",        egui_family: "DejaVu Sans",         fontconfig: "Sans" },
-    FontChoice { display: "Sans Bold",   egui_family: "DejaVu Sans Bold",    fontconfig: "Sans:style=Bold" },
-    FontChoice { display: "Sans Italic", egui_family: "DejaVu Sans Oblique", fontconfig: "Sans:style=Italic" },
-    FontChoice { display: "Serif",       egui_family: "DejaVu Serif",        fontconfig: "Serif" },
-    FontChoice { display: "Serif Bold",  egui_family: "DejaVu Serif Bold",   fontconfig: "Serif:style=Bold" },
-    FontChoice { display: "Mono",        egui_family: "DejaVu Sans Mono",    fontconfig: "Monospace" },
+    FontChoice {
+        display: "Sans",
+        egui_family: "DejaVu Sans",
+        fontconfig: "Sans",
+    },
+    FontChoice {
+        display: "Sans Bold",
+        egui_family: "DejaVu Sans Bold",
+        fontconfig: "Sans:style=Bold",
+    },
+    FontChoice {
+        display: "Sans Italic",
+        egui_family: "DejaVu Sans Oblique",
+        fontconfig: "Sans:style=Italic",
+    },
+    FontChoice {
+        display: "Serif",
+        egui_family: "DejaVu Serif",
+        fontconfig: "Serif",
+    },
+    FontChoice {
+        display: "Serif Bold",
+        egui_family: "DejaVu Serif Bold",
+        fontconfig: "Serif:style=Bold",
+    },
+    FontChoice {
+        display: "Mono",
+        egui_family: "DejaVu Sans Mono",
+        fontconfig: "Monospace",
+    },
 ];
 
 pub fn font_choice(display: &str) -> &'static FontChoice {
@@ -217,6 +277,7 @@ pub fn split_clip(
         link: c.link,
         gain: c.gain,
         speed: c.speed,
+        transform: c.transform,
     };
     let right_id = right.id;
     clips.insert(idx + 1, right);
@@ -253,7 +314,9 @@ pub fn split_clips(
     let mut new_ids = Vec::with_capacity(targets.len());
 
     for (id, orig_link) in targets {
-        let Some(new_id) = split_clip(clips, id, cut_ms, id_gen) else { continue };
+        let Some(new_id) = split_clip(clips, id, cut_ms, id_gen) else {
+            continue;
+        };
         if let Some(orig) = orig_link {
             let new_link = *remap.entry(orig).or_insert_with(|| id_gen.next_link());
             if let Some(right) = clips.iter_mut().find(|c| c.id == new_id) {
@@ -309,8 +372,14 @@ pub fn detach_links(clips: &mut [Clip], target: ClipId) -> bool {
 mod tests {
     use super::*;
 
-    fn mk_clip(id: u32, track: u32, cut_start: i64, src_start: i64, src_end: i64,
-               link: Option<u32>) -> Clip {
+    fn mk_clip(
+        id: u32,
+        track: u32,
+        cut_start: i64,
+        src_start: i64,
+        src_end: i64,
+        link: Option<u32>,
+    ) -> Clip {
         Clip {
             id: ClipId(id),
             track_id: TrackId(track),
@@ -320,6 +389,7 @@ mod tests {
             link: link.map(LinkId),
             gain: 1.0,
             speed: 1.0,
+            transform: Transform::default(),
         }
     }
 

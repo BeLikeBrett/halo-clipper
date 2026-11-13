@@ -7,12 +7,15 @@
 // Long-running work (proxy generation, ffmpeg export) lives on background
 // threads. The UI never blocks on subprocess output.
 
+#[path = "layers.rs"]
+mod layers;
+#[path = "support.rs"]
+mod support;
+
 use crate::encode::{
     self, AudioCodec, EncodeQuality, EncodeSettings, GpuVendor, ResolutionPreset, VideoCodec,
 };
-use crate::export::{
-    self, AudioTrackPlan, ClipRange, EncodeMode, ExportHandle, ExportPhase, ExportPlan,
-};
+use crate::export::{self, EncodeMode, ExportHandle, ExportPhase, ExportPlan};
 use crate::media::{self, MediaInfo};
 use crate::player::Player;
 use crate::proxy;
@@ -26,7 +29,6 @@ use egui::{Align2, Color32, Frame, Margin, RichText, Rounding, Stroke};
 use glow::HasContext;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -83,6 +85,7 @@ impl Project {
             muted: false,
             gain: 1.0,
             source_audio_index: None,
+            source: None,
         });
         self.clips.push(Clip {
             id: self.id_gen.next_clip(),
@@ -93,6 +96,7 @@ impl Project {
             link: Some(link),
             gain: 1.0,
             speed: 1.0,
+            transform: track::Transform::default(),
         });
         // One audio track per source audio stream. Guarantee at least
         // one so the data model has consistent shape even for silent
@@ -107,6 +111,7 @@ impl Project {
                 muted: false,
                 gain: 1.0,
                 source_audio_index: Some(i),
+                source: None,
             });
             self.clips.push(Clip {
                 id: self.id_gen.next_clip(),
@@ -117,13 +122,84 @@ impl Project {
                 link: Some(link),
                 gain: 1.0,
                 speed: 1.0,
+                transform: track::Transform::default(),
             });
+        }
+    }
+
+    fn needs_composition(&self) -> bool {
+        if self.media.audio_stream_count > 1 || self.clips.iter().any(|c| c.link.is_none()) {
+            return true;
+        }
+        if self
+            .tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Video && t.muted)
+        {
+            return true;
+        }
+        self.tracks.iter().any(|t| t.source.is_some())
+            || self
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Video)
+                .count()
+                > 1
+            || self.tracks.len() > self.media.audio_stream_count.max(1) + 1
+            || self
+                .clips
+                .iter()
+                .any(|c| c.transform != track::Transform::default())
+    }
+
+    fn composition(&self, preview: bool) -> crate::composition::Composition {
+        let mut segments = Vec::new();
+        // Top lane is painted last. All audio streams remain independent.
+        for t in self.tracks.iter().rev().filter(|t| !t.muted) {
+            let (source, info) = t
+                .source
+                .as_ref()
+                .map(|s| (&s.path, &s.media))
+                .unwrap_or((&self.source, &self.media));
+            if t.kind == TrackKind::Audio
+                && t.source_audio_index.unwrap_or(0) >= info.audio_stream_count
+            {
+                continue;
+            }
+            for c in self.clips.iter().filter(|c| c.track_id == t.id) {
+                segments.push(crate::composition::Segment {
+                    source: if preview && t.source.is_none() && t.kind == TrackKind::Video {
+                        self.proxy.clone().unwrap_or_else(|| source.clone())
+                    } else {
+                        source.clone()
+                    },
+                    audio_index: (t.kind == TrackKind::Audio)
+                        .then_some(t.source_audio_index.unwrap_or(0)),
+                    start_ms: c.cut_start_ms,
+                    end_ms: c.cut_end_ms(),
+                    src_start_ms: c.src_start_ms,
+                    src_end_ms: c.src_end_ms,
+                    speed: c.speed,
+                    gain: c.gain * t.gain,
+                    transform: c.transform,
+                    caption: self.text_overlays.get(&c.id).cloned(),
+                    source_height: info.height,
+                });
+            }
+        }
+        crate::composition::Composition {
+            width: self.media.width,
+            height: self.media.height,
+            fps: self.media.fps,
+            duration_ms: self.content_end_ms(),
+            segments,
         }
     }
 
     /// Preserve the caption on both independently editable split halves.
     fn split_segments(&mut self, target_ids: &[ClipId], cut_ms: i64) -> Vec<ClipId> {
-        let captions_to_copy: Vec<(ClipId, TextOverlay)> = target_ids.iter()
+        let captions_to_copy: Vec<(ClipId, TextOverlay)> = target_ids
+            .iter()
             .filter_map(|id| self.text_overlays.get(id).cloned().map(|o| (*id, o)))
             .collect();
         let new_ids = track::split_clips(&mut self.clips, target_ids, cut_ms, &self.id_gen);
@@ -142,15 +218,19 @@ impl Project {
     }
 
     fn active_caption(&self) -> Option<(ClipId, &TextOverlay)> {
-        if self.mode != EditMode::MultiTrack { return None; }
+        if self.mode != EditMode::MultiTrack {
+            return None;
+        }
         let v = self.first_video_track()?;
         let clip = track::clip_on_track_at(&self.clips, v, self.playhead_ms)?;
         let overlay = self.text_overlays.get(&clip.id)?;
         (!overlay.text.trim().is_empty()).then_some((clip.id, overlay))
     }
 
+    #[cfg(test)]
     fn video_captions(&self, track_id: TrackId) -> Vec<Option<TextOverlay>> {
-        sorted_track_clips(&self.clips, track_id).into_iter()
+        sorted_track_clips(&self.clips, track_id)
+            .into_iter()
             .map(|c| self.text_overlays.get(&c.id).cloned())
             .collect()
     }
@@ -163,7 +243,9 @@ impl Project {
     /// further (which the current UI doesn't permit, but kept for
     /// defense-in-depth).
     fn canvas_length_ms(&self) -> i64 {
-        self.media.duration_ms.max(track::project_cut_duration(&self.clips))
+        self.media
+            .duration_ms
+            .max(track::project_cut_duration(&self.clips))
     }
 
     /// True end of the cut — the rightmost clip-end position. Used as
@@ -180,7 +262,6 @@ impl Project {
             .find(|t| t.kind == TrackKind::Video)
             .map(|t| t.id)
     }
-
 }
 
 /// Snapshot of editable project state for undo/redo. Playhead and mode
@@ -348,6 +429,11 @@ struct ShortcutActions {
 
 pub struct ClipperApp {
     project: Option<Project>,
+    updater: crate::updater::Updater,
+    support_open: bool,
+    layered_preview: crate::preview::Preview,
+    preview_is_composed: bool,
+    layer_edit_active: bool,
     status: String,
     export_mode: ExportMode,
     /// Custom-encode settings persist between modal sessions so the user
@@ -433,18 +519,32 @@ struct ClipDragSession {
 impl ClipperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
         theme::apply(&cc.egui_ctx);
-        let player = Arc::new(Player::new()?);
+        let player = Arc::new(Player::new(cc.egui_ctx.clone())?);
+        // eframe has made the GL context current here. Attach the video
+        // output before main() can open a command-line file: loading first
+        // races the initial paint, and mpv disables video permanently if
+        // vo=libmpv starts without a render context (audio still plays).
+        player.ensure_render_context()?;
         // One probe each — the results feed both the stored fields and
         // the Custom-encode defaults.
         // Hardware AV1 gets a real test encode: ffmpeg lists the encoder
         // on machines whose silicon has no AV1 encode block, and the
         // Discord planner picks from this list without asking.
-        let available_codecs =
-            encode::verify_av1_encoders(encode::detect_available_codecs());
+        let available_codecs = encode::verify_av1_encoders(encode::detect_available_codecs());
         let detected_gpu = encode::detect_gpu();
         let recommended = encode::recommend_codec(detected_gpu, &available_codecs);
+        let settings = Settings::load();
+        let mut updater = crate::updater::Updater::default();
+        if settings.check_updates_on_startup {
+            updater.check();
+        }
         Ok(Self {
             project: None,
+            updater,
+            support_open: false,
+            layered_preview: crate::preview::Preview::default(),
+            preview_is_composed: false,
+            layer_edit_active: false,
             status: "Open a video to begin.".into(),
             export_mode: ExportMode::Auto,
             custom_encode: CustomEncode::default_for(recommended),
@@ -466,7 +566,7 @@ impl ClipperApp {
             last_clip_speed: 1.0,
             clip_drag_session: None,
             proxy_handle: None,
-            settings: Settings::load(),
+            settings,
             settings_open: false,
             discord_target_mb: encode::DiscordNitro::MAX_TARGET_MB,
             discord_codec_choice: encode::CodecChoice::default(),
@@ -481,7 +581,7 @@ impl ClipperApp {
     /// Edge-triggered to avoid hammering mpv every frame.
     fn sync_clip_speed(&mut self) {
         let desired_speed: f32 = match self.project.as_ref() {
-            Some(p) if p.mode == EditMode::MultiTrack => p
+            Some(p) if p.mode == EditMode::MultiTrack && !p.needs_composition() => p
                 .first_video_track()
                 .and_then(|v| track::clip_on_track_at(&p.clips, v, p.playhead_ms))
                 .map(|c| c.speed)
@@ -531,6 +631,9 @@ impl ClipperApp {
         if p.mode != EditMode::MultiTrack {
             return (String::new(), p.simple_audio_muted);
         }
+        if p.needs_composition() {
+            return (String::new(), false);
+        }
         // Preview filter graph is audio-only — text overlays composite
         // in egui (see show_text_overlay_handle). Keeps drag smooth.
         let audio_chain = build_audio_chain(p);
@@ -550,8 +653,12 @@ impl ClipperApp {
     }
 
     fn undo(&mut self) {
-        let Some(snap) = self.undo_stack.pop() else { return };
-        let Some(project) = &mut self.project else { return };
+        let Some(snap) = self.undo_stack.pop() else {
+            return;
+        };
+        let Some(project) = &mut self.project else {
+            return;
+        };
         let current = UndoSnapshot::capture(project);
         snap.apply(project);
         self.redo_stack.push(current);
@@ -559,8 +666,12 @@ impl ClipperApp {
     }
 
     fn redo(&mut self) {
-        let Some(snap) = self.redo_stack.pop() else { return };
-        let Some(project) = &mut self.project else { return };
+        let Some(snap) = self.redo_stack.pop() else {
+            return;
+        };
+        let Some(project) = &mut self.project else {
+            return;
+        };
         let current = UndoSnapshot::capture(project);
         snap.apply(project);
         self.undo_stack.push(current);
@@ -570,7 +681,9 @@ impl ClipperApp {
     /// After an undo/redo restores segments, the playhead may be past the
     /// new cut duration. Pull it back in range so the timeline doesn't lie.
     fn clamp_playhead_after_state_change(&mut self) {
-        let Some(project) = &mut self.project else { return };
+        let Some(project) = &mut self.project else {
+            return;
+        };
         if project.mode == EditMode::MultiTrack {
             let total = project.canvas_length_ms();
             if project.playhead_ms > total {
@@ -608,13 +721,13 @@ impl ClipperApp {
             return;
         }
         if progress.done {
-            if let (Some(dest), Some(project)) =
-                (progress.destination, self.project.as_mut())
-            {
+            if let (Some(dest), Some(project)) = (progress.destination, self.project.as_mut()) {
                 // Mid-edit swap: preserve playhead. mpv re-loads at the
                 // current frame (rounded to its keyframe-step internally).
                 let start_ms = project.playhead_ms;
-                if let Err(e) = self.player.set_file(&dest, start_ms) {
+                if project.mode == EditMode::MultiTrack && project.needs_composition() {
+                    project.proxy = Some(dest);
+                } else if let Err(e) = self.player.set_file(&dest, start_ms) {
                     log::warn!("proxy swap failed: {e:#}");
                 } else {
                     project.proxy = Some(dest);
@@ -644,8 +757,11 @@ impl ClipperApp {
     /// main() when a path arrives on the command line ("Open With" from
     /// a file manager).
     pub fn open_path(&mut self, path: PathBuf) {
+        crate::diagnostics::register_media(&path);
         match media::probe(&path) {
             Ok(info) => {
+                self.layered_preview.reset();
+                self.preview_is_composed = false;
                 let size_str = std::fs::metadata(&path)
                     .ok()
                     .map(|m| format_bytes(m.len()))
@@ -694,9 +810,7 @@ impl ClipperApp {
                             self.proxy_handle = Some(h);
                             self.status = format!(
                                 "{} loaded. Generating scrub proxy…",
-                                path.file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("video")
+                                path.file_name().and_then(|s| s.to_str()).unwrap_or("video")
                             );
                         }
                         Err(e) => {
@@ -736,7 +850,17 @@ impl ClipperApp {
     /// the cut.
     fn tick_multitrack_playback(&mut self, mpv_src_ms: i64) {
         let Some(project) = &self.project else { return };
-        let Some(video_track) = project.first_video_track() else { return };
+        if project.needs_composition() {
+            if self.layered_preview.ready {
+                if let Some(p) = &mut self.project {
+                    p.playhead_ms = mpv_src_ms.min(p.content_end_ms());
+                }
+            }
+            return;
+        }
+        let Some(video_track) = project.first_video_track() else {
+            return;
+        };
 
         let cut_ms = project.playhead_ms;
         let clip = match track::clip_on_track_at(&project.clips, video_track, cut_ms).copied() {
@@ -810,7 +934,8 @@ impl ClipperApp {
 
         // Normal mirror: walk through the current clip's source range.
         if mpv_src_ms >= clip.src_start_ms {
-            let offset = (mpv_src_ms - clip.src_start_ms).max(0);
+            let offset =
+                ((mpv_src_ms - clip.src_start_ms).max(0) as f64 / clip.speed as f64).round() as i64;
             if let Some(p) = &mut self.project {
                 p.playhead_ms = clip.cut_start_ms + offset;
             }
@@ -826,6 +951,9 @@ impl ClipperApp {
         match p.mode {
             EditMode::SimpleClip => Some(p.playhead_ms),
             EditMode::MultiTrack => {
+                if p.needs_composition() {
+                    return self.layered_preview.ready.then_some(p.playhead_ms);
+                }
                 let v = p.first_video_track()?;
                 let clip = track::clip_on_track_at(&p.clips, v, p.playhead_ms)?;
                 clip.cut_to_src(p.playhead_ms)
@@ -844,13 +972,19 @@ impl ClipperApp {
         const SNAP_IN_PX: f32 = 8.0;
         const SNAP_OUT_PX: f32 = 16.0;
 
-        let Some(session) = self.clip_drag_session.as_mut() else { return };
-        if session.primary != id { return }
+        let Some(session) = self.clip_drag_session.as_mut() else {
+            return;
+        };
+        if session.primary != id {
+            return;
+        }
         session.intended_cut += delta_ms;
 
         let Some(p) = &mut self.project else { return };
-        let Some(primary) = track::clip_by_id(&p.clips, id).copied() else { return };
-        let primary_dur = primary.src_duration_ms();
+        let Some(primary) = track::clip_by_id(&p.clips, id).copied() else {
+            return;
+        };
+        let primary_dur = primary.duration_ms();
         let primary_link = primary.link;
         let canvas = p.canvas_length_ms();
         let playhead = p.playhead_ms;
@@ -881,28 +1015,48 @@ impl ClipperApp {
                 }
             }
         };
-        let effective = effective.clamp(0, (canvas - primary_dur).max(0));
+        let effective = effective.max(0);
 
         let group_delta = effective - primary.cut_start_ms;
-        if group_delta == 0 { return; }
+        if group_delta == 0 {
+            return;
+        }
 
         // Apply the delta uniformly to the link group — clamped against
         // every member's individual bounds so the group keeps alignment.
         let group: Vec<ClipId> = match primary_link {
-            Some(l) => p.clips.iter().filter(|c| c.link == Some(l)).map(|c| c.id).collect(),
+            Some(l) => p
+                .clips
+                .iter()
+                .filter(|c| c.link == Some(l))
+                .map(|c| c.id)
+                .collect(),
             None => vec![id],
         };
         let mut allowed = group_delta;
         for cid in &group {
-            let Some(c) = track::clip_by_id(&p.clips, *cid) else { continue };
-            let dur = c.src_duration_ms();
+            let Some(c) = track::clip_by_id(&p.clips, *cid) else {
+                continue;
+            };
             if group_delta < 0 {
                 allowed = allowed.max(-c.cut_start_ms);
-            } else {
-                allowed = allowed.min((canvas - dur) - c.cut_start_ms);
             }
         }
-        if allowed == 0 { return; }
+        if allowed == 0 {
+            return;
+        }
+        for cid in &group {
+            let c = track::clip_by_id(&p.clips, *cid).unwrap();
+            let start = c.cut_start_ms + allowed;
+            if p.clips.iter().any(|other| {
+                other.track_id == c.track_id
+                    && !group.contains(&other.id)
+                    && start < other.cut_end_ms()
+                    && start + c.duration_ms() > other.cut_start_ms
+            }) {
+                return;
+            }
+        }
         for cid in group {
             if let Some(c) = p.clips.iter_mut().find(|c| c.id == cid) {
                 c.cut_start_ms += allowed;
@@ -916,7 +1070,10 @@ impl ClipperApp {
         match action {
             ClipAction::SetIn => p.in_ms = Some(p.playhead_ms),
             ClipAction::SetOut => p.out_ms = Some(p.playhead_ms),
-            ClipAction::Clear => { p.in_ms = None; p.out_ms = None; }
+            ClipAction::Clear => {
+                p.in_ms = None;
+                p.out_ms = None;
+            }
             ClipAction::CycleMark => match (p.in_ms, p.out_ms) {
                 (None, _) => p.in_ms = Some(p.playhead_ms),
                 (Some(_), None) => p.out_ms = Some(p.playhead_ms),
@@ -941,10 +1098,16 @@ impl ClipperApp {
                     let mut linked: HashSet<LinkId> = HashSet::new();
                     let mut unlinked: HashSet<ClipId> = HashSet::new();
                     for id in &p.selected_clips {
-                        let Some(c) = track::clip_by_id(&p.clips, *id) else { continue };
+                        let Some(c) = track::clip_by_id(&p.clips, *id) else {
+                            continue;
+                        };
                         match c.link {
-                            Some(l) => { linked.insert(l); }
-                            None => { unlinked.insert(c.id); }
+                            Some(l) => {
+                                linked.insert(l);
+                            }
+                            None => {
+                                unlinked.insert(c.id);
+                            }
                         }
                     }
                     p.clips
@@ -968,8 +1131,7 @@ impl ClipperApp {
                 let targets: Vec<ClipId> = if p.selected_clips.is_empty() {
                     p.first_video_track()
                         .and_then(|v| {
-                            track::clip_on_track_at(&p.clips, v, p.playhead_ms)
-                                .map(|c| c.id)
+                            track::clip_on_track_at(&p.clips, v, p.playhead_ms).map(|c| c.id)
                         })
                         .into_iter()
                         .collect()
@@ -987,7 +1149,8 @@ impl ClipperApp {
                 for id in targets {
                     track::delete_with_links(&mut p.clips, id);
                 }
-                p.text_overlays.retain(|id, _| p.clips.iter().any(|c| c.id == *id));
+                p.text_overlays
+                    .retain(|id, _| p.clips.iter().any(|c| c.id == *id));
                 p.selected_clips.clear();
                 // Playhead stays where it was. Canvas length is preserved
                 // via Project::canvas_length_ms, so deleted clips leave a
@@ -1012,8 +1175,10 @@ impl ClipperApp {
         }
     }
 
-    fn set_mode(&mut self, new_mode: EditMode) {
-        let Some(project) = &mut self.project else { return };
+    pub fn set_mode(&mut self, new_mode: EditMode) {
+        let Some(project) = &mut self.project else {
+            return;
+        };
         if project.mode == new_mode {
             return;
         }
@@ -1027,9 +1192,7 @@ impl ClipperApp {
                     .first_video_track()
                     .and_then(|v| {
                         project.clips.iter().find(|c| {
-                            c.track_id == v
-                                && c.src_start_ms <= src
-                                && src < c.src_end_ms
+                            c.track_id == v && c.src_start_ms <= src && src < c.src_end_ms
                         })
                     })
                     .map(|c| c.cut_start_ms + (src - c.src_start_ms))
@@ -1060,10 +1223,35 @@ impl ClipperApp {
             _ => {}
         }
         project.mode = new_mode;
+        if new_mode == EditMode::SimpleClip {
+            self.layered_preview.reset();
+            self.preview_is_composed = false;
+            let _ = self.player.set_lavfi_complex("");
+            self.last_lavfi_complex.clear();
+            let _ = self.player.set_file(
+                project.proxy.as_deref().unwrap_or(&project.source),
+                project.playhead_ms,
+            );
+        }
         let _ = self.player.set_paused(true);
     }
 
     fn toggle_play(&mut self) {
+        if let Some(p) = &mut self.project {
+            if p.mode == EditMode::MultiTrack && p.needs_composition() {
+                if !self.layered_preview.ready {
+                    self.status =
+                        "Preparing layered preview. Editing and export remain available.".into();
+                    return;
+                }
+                if p.playhead_ms >= p.content_end_ms() {
+                    p.playhead_ms = 0;
+                    let _ = self.player.seek(0);
+                }
+                let _ = self.player.toggle_play();
+                return;
+            }
+        }
         if self.project.is_none() {
             return;
         }
@@ -1118,8 +1306,9 @@ impl ClipperApp {
                                 project
                                     .clips
                                     .iter()
-                                    .filter(|c| c.track_id == t
-                                        && c.cut_start_ms > project.playhead_ms)
+                                    .filter(|c| {
+                                        c.track_id == t && c.cut_start_ms > project.playhead_ms
+                                    })
                                     .min_by_key(|c| c.cut_start_ms)
                                     .copied()
                                     .or_else(|| {
@@ -1160,19 +1349,7 @@ impl ClipperApp {
                 (Some(a), Some(b)) => (b - a).abs(),
                 _ => project.media.duration_ms,
             },
-            EditMode::MultiTrack => {
-                if let Some(v) = project.first_video_track() {
-                    let clips = collect_track_clips(&project.clips, v);
-                    let end = clips
-                        .iter()
-                        .map(|c| c.cut_start_ms + (c.src_end_ms - c.src_start_ms).max(0))
-                        .max()
-                        .unwrap_or(0);
-                    export::output_duration_ms(&clips, end).max(1)
-                } else {
-                    project.media.duration_ms
-                }
-            }
+            EditMode::MultiTrack => project.content_end_ms().max(1),
         }
     }
 
@@ -1181,12 +1358,33 @@ impl ClipperApp {
 
         let suggested = export::suggest_output(&project.source);
         let Some(destination) = rfd::FileDialog::new()
-            .set_file_name(suggested.file_name().and_then(|s| s.to_str()).unwrap_or("clip.mp4"))
-            .set_directory(suggested.parent().unwrap_or_else(|| std::path::Path::new(".")))
+            .set_file_name(
+                suggested
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("clip.mp4"),
+            )
+            .set_directory(
+                suggested
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
             .save_file()
         else {
             return;
         };
+
+        if destination == project.source
+            || project
+                .tracks
+                .iter()
+                .filter_map(|t| t.source.as_ref())
+                .any(|s| s.path == destination)
+        {
+            self.status =
+                "Choose a different output file — original media cannot be overwritten.".into();
+            return;
+        }
 
         // Source dimensions for resolution-preset math.
         let (src_w, src_h) = (project.media.width, project.media.height);
@@ -1206,9 +1404,9 @@ impl ClipperApp {
         );
 
         // Resolve the encode plan based on the user's chosen export mode.
-        let resolve_encode = |has_modifications: bool, aligned_copy_possible: bool|
-            -> (EncodeMode, Option<String>)
-        {
+        let resolve_encode = |has_modifications: bool,
+                              aligned_copy_possible: bool|
+         -> (EncodeMode, Option<String>) {
             match self.export_mode {
                 ExportMode::Custom => (
                     EncodeMode::Encode(self.custom_encode.to_encode_settings(src_w, src_h)),
@@ -1229,7 +1427,10 @@ impl ClipperApp {
                 ),
                 ExportMode::Auto => {
                     if !has_modifications && aligned_copy_possible {
-                        (EncodeMode::Copy, Some("Auto → stream copy (in mark keyframe-aligned).".into()))
+                        (
+                            EncodeMode::Copy,
+                            Some("Auto → stream copy (in mark keyframe-aligned).".into()),
+                        )
                     } else {
                         (
                             EncodeMode::Encode(EncodeSettings::default_for_source(src_w, src_h)),
@@ -1269,52 +1470,10 @@ impl ClipperApp {
                 )
             }
             EditMode::MultiTrack => {
-                let Some(video_track) = project.first_video_track() else {
-                    self.status = "Multi-track export needs a video track.".into();
-                    return;
-                };
-                let video_clips = collect_track_clips(&project.clips, video_track);
-                if video_clips.is_empty() {
-                    self.status = "Nothing to export — V1 has no clips.".into();
+                if project.clips.is_empty() {
+                    self.status = "Nothing to export — the timeline is empty.".into();
                     return;
                 }
-                // Linked state (no audio clip detached) → only A1 plays.
-                // After Detach Audio → mix every track honoring per-track
-                // mute. Matches the preview's audio routing. Tracks whose
-                // stream index doesn't exist in the source are dropped —
-                // the data model guarantees one audio lane even for
-                // soundless videos, but referencing [0:a:0] on a file
-                // with no audio stream would abort the whole export.
-                let any_audio_detached = project.clips.iter().any(|c| {
-                    c.link.is_none()
-                        && project.tracks.iter().any(|t| {
-                            t.id == c.track_id && t.kind == TrackKind::Audio
-                        })
-                });
-                let audio_track_iter: Box<dyn Iterator<Item = &Track>> = if any_audio_detached {
-                    Box::new(project.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
-                } else {
-                    Box::new(
-                        project
-                            .tracks
-                            .iter()
-                            .find(|t| t.kind == TrackKind::Audio)
-                            .into_iter(),
-                    )
-                };
-                let audio_tracks: Vec<AudioTrackPlan> = audio_track_iter
-                    .filter(|t| {
-                        t.source_audio_index.unwrap_or(0)
-                            < project.media.audio_stream_count
-                    })
-                    .map(|t| AudioTrackPlan {
-                        source_audio_index: t.source_audio_index.unwrap_or(0),
-                        muted: t.muted,
-                        gain: t.gain,
-                        clips: collect_track_clips(&project.clips, t.id),
-                    })
-                    .collect();
-                let video_text_overlays = project.video_captions(video_track);
                 // MultiTrack always re-encodes (filter_complex requires
                 // decode). Auto/Custom/Discord all route through the
                 // filter graph; they just produce different
@@ -1342,16 +1501,9 @@ impl ClipperApp {
                     }
                 });
                 (
-                    ExportPlan::MultiTrack {
-                        source: project.source.clone(),
+                    ExportPlan::Layered {
+                        composition: project.composition(false),
                         destination,
-                        source_codec: project.media.video_codec.clone(),
-                        src_width: project.media.width,
-                        src_height: project.media.height,
-                        src_fps: project.media.fps,
-                        video_clips,
-                        video_text_overlays,
-                        audio_tracks,
                         encode: settings,
                     },
                     note,
@@ -1376,11 +1528,7 @@ impl ClipperApp {
     /// Smart-cut probe for SimpleClip (single In point). Returns
     /// `(frame_accurate, status_note)`. 50 ms tolerance: PTS drift this
     /// small isn't user-visible.
-    fn resolve_smart_cut(
-        &self,
-        source: &std::path::Path,
-        in_ms: i64,
-    ) -> (bool, Option<String>) {
+    fn resolve_smart_cut(&self, source: &std::path::Path, in_ms: i64) -> (bool, Option<String>) {
         const TOLERANCE_MS: i64 = 50;
         if in_ms <= TOLERANCE_MS {
             return (
@@ -1505,7 +1653,9 @@ impl ClipperApp {
 
 impl eframe::App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.updater.poll();
         self.tick_proxy();
+        self.tick_layered_preview(ctx);
         self.sync_audio_mix();
         self.sync_clip_speed();
 
@@ -1518,7 +1668,8 @@ impl eframe::App for ClipperApp {
         // While the user is dragging (or within ~300ms of a release) we
         // skip the mpv mirror — otherwise mpv's lagging time-pos events
         // would yank the playhead away from where the user is dragging it.
-        let in_seek_cooldown = self.seek_cooldown_until
+        let in_seek_cooldown = self
+            .seek_cooldown_until
             .map(|t| std::time::Instant::now() < t)
             .unwrap_or(false);
         let user_owns_playhead = self.was_dragging_seek || in_seek_cooldown;
@@ -1561,8 +1712,12 @@ impl eframe::App for ClipperApp {
         // Record playhead pre-UI so we can detect user-initiated seeks.
         let pre_playhead = self.project.as_ref().map(|p| p.playhead_ms);
         let actions = self.handle_shortcuts(ctx);
-        if actions.undo { self.undo(); }
-        if actions.redo { self.redo(); }
+        if actions.undo {
+            self.undo();
+        }
+        if actions.redo {
+            self.redo();
+        }
         if actions.toggle_play {
             self.toggle_play();
         }
@@ -1570,11 +1725,17 @@ impl eframe::App for ClipperApp {
             let _ = self.player.toggle_mute();
         }
 
+        if self.support_open {
+            self.show_support(ctx);
+        }
+
         // Top bar
         egui::TopBottomPanel::top("top_bar")
-            .frame(Frame::none()
-                .fill(theme::BG_HEADER)
-                .inner_margin(Margin::symmetric(14.0, 10.0)))
+            .frame(
+                Frame::none()
+                    .fill(theme::BG_HEADER)
+                    .inner_margin(Margin::symmetric(14.0, 10.0)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     egui::menu::menu_button(ui, "File", |ui| {
@@ -1593,11 +1754,25 @@ impl eframe::App for ClipperApp {
                         }
                     });
 
+                    if ui
+                        .button(
+                            if matches!(self.updater.state, crate::updater::State::Available(_)) {
+                                "Update available"
+                            } else {
+                                "Help / Updates"
+                            },
+                        )
+                        .clicked()
+                    {
+                        self.support_open = true;
+                    }
                     ui.separator();
-                    ui.label(RichText::new("✂  Halo Clipper")
-                        .size(15.0)
-                        .strong()
-                        .color(theme::TEXT_PRIMARY));
+                    ui.label(
+                        RichText::new("✂  Halo Clipper")
+                            .size(15.0)
+                            .strong()
+                            .color(theme::TEXT_PRIMARY),
+                    );
                     ui.separator();
 
                     // Edit-mode toggle (pill tabs).
@@ -1612,7 +1787,7 @@ impl eframe::App for ClipperApp {
                     )
                     .on_hover_text(
                         "Mark In/Out and export one range. Instant; \
-                         single-cut workflow."
+                         single-cut workflow.",
                     )
                     .clicked()
                     {
@@ -1628,7 +1803,7 @@ impl eframe::App for ClipperApp {
                         "Split / Delete + per-stream audio editing. Audio \
                          follows video by default; press Detach (D) on a \
                          clip to expose all source audio streams as their \
-                         own lanes."
+                         own lanes.",
                     )
                     .clicked()
                     {
@@ -1648,9 +1823,11 @@ impl eframe::App for ClipperApp {
 
         // Bottom controls + status
         egui::TopBottomPanel::bottom("controls")
-            .frame(Frame::none()
-                .fill(theme::BG_PANEL)
-                .inner_margin(Margin::symmetric(14.0, 10.0)))
+            .frame(
+                Frame::none()
+                    .fill(theme::BG_PANEL)
+                    .inner_margin(Margin::symmetric(14.0, 10.0)),
+            )
             .show(ctx, |ui| {
                 self.show_controls(ui);
                 ui.add_space(6.0);
@@ -1661,9 +1838,11 @@ impl eframe::App for ClipperApp {
         egui::SidePanel::left("media_panel")
             .resizable(true)
             .default_width(240.0)
-            .frame(Frame::none()
-                .fill(theme::BG_PANEL)
-                .inner_margin(Margin::same(12.0)))
+            .frame(
+                Frame::none()
+                    .fill(theme::BG_PANEL)
+                    .inner_margin(Margin::same(12.0)),
+            )
             .show(ctx, |ui| {
                 self.show_media_list(ui);
             });
@@ -1679,19 +1858,23 @@ impl eframe::App for ClipperApp {
             egui::SidePanel::right("edit_panel")
                 .resizable(true)
                 .default_width(280.0)
-                .frame(Frame::none()
-                    .fill(theme::BG_PANEL)
-                    .inner_margin(Margin::same(12.0)))
+                .frame(
+                    Frame::none()
+                        .fill(theme::BG_PANEL)
+                        .inner_margin(Margin::same(12.0)),
+                )
                 .show(ctx, |ui| {
-                    self.show_edit_panel(ui);
+                    egui::ScrollArea::vertical().show(ui, |ui| self.show_edit_panel(ui));
                 });
         }
 
         // Central: preview top-right, rest empty (room for future tracks/effects)
         egui::CentralPanel::default()
-            .frame(Frame::none()
-                .fill(theme::BG_CANVAS)
-                .inner_margin(Margin::same(14.0)))
+            .frame(
+                Frame::none()
+                    .fill(theme::BG_CANVAS)
+                    .inner_margin(Margin::same(14.0)),
+            )
             .show(ctx, |ui| {
                 self.show_preview(ui);
             });
@@ -1736,8 +1919,7 @@ impl eframe::App for ClipperApp {
             if let Some(src) = post_src {
                 let _ = self.player.seek(src);
             }
-            self.seek_cooldown_until =
-                Some(std::time::Instant::now() + Duration::from_millis(300));
+            self.seek_cooldown_until = Some(std::time::Instant::now() + Duration::from_millis(300));
         } else if playhead_changed {
             if let Some(src) = post_src {
                 let _ = self.player.seek(src);
@@ -1765,15 +1947,15 @@ impl eframe::App for ClipperApp {
     /// cancel any in-flight transcode so the ffmpeg child doesn't keep
     /// running after our process exits.
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        self.layered_preview.reset();
         if let Some(h) = self.proxy_handle.take() {
             h.cancel();
         }
         if self.settings.auto_clear_cache_on_close {
             match proxy::clear_cache() {
-                Ok(freed) if freed > 0 => log::info!(
-                    "auto-clear: freed {} from proxy cache",
-                    format_bytes(freed)
-                ),
+                Ok(freed) if freed > 0 => {
+                    log::info!("auto-clear: freed {} from proxy cache", format_bytes(freed))
+                }
                 Ok(_) => log::info!("auto-clear: nothing to remove"),
                 Err(e) => log::warn!("auto-clear failed: {e}"),
             }
@@ -1792,17 +1974,22 @@ impl ClipperApp {
     fn show_edit_panel(&mut self, ui: &mut egui::Ui) {
         let mut want_close = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Edit").size(17.0).strong()
-                .color(theme::TEXT_PRIMARY));
+            ui.label(
+                RichText::new("Edit")
+                    .size(17.0)
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let close = ui.add(
-                    egui::Button::new(RichText::new("✕").size(14.0).color(theme::TEXT_MUTED))
-                        .fill(Color32::TRANSPARENT)
-                        .rounding(Rounding::same(4.0))
-                        .min_size(egui::vec2(28.0, 28.0)),
-                )
-                .on_hover_text("Deselect")
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                let close = ui
+                    .add(
+                        egui::Button::new(RichText::new("✕").size(14.0).color(theme::TEXT_MUTED))
+                            .fill(Color32::TRANSPARENT)
+                            .rounding(Rounding::same(4.0))
+                            .min_size(egui::vec2(28.0, 28.0)),
+                    )
+                    .on_hover_text("Deselect")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if close.clicked() {
                     want_close = true;
                 }
@@ -1811,6 +1998,8 @@ impl ClipperApp {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(10.0);
+
+        self.show_layer_properties(ui);
 
         // Snapshot all data we need before touching `self.project` mutably.
         // The intermediate block scopes the borrow so the writes later
@@ -1837,12 +2026,14 @@ impl ClipperApp {
             initial_speed: f32,
         }
         let snap: Option<Snapshot> = 'snap: {
-            let Some(project) = self.project.as_ref() else { break 'snap None };
+            let Some(project) = self.project.as_ref() else {
+                break 'snap None;
+            };
             let Some(&clip_id) = project.selected_clips.iter().min() else {
-                break 'snap None
+                break 'snap None;
             };
             let Some(clip) = track::clip_by_id(&project.clips, clip_id) else {
-                break 'snap None
+                break 'snap None;
             };
             let track = project.tracks.iter().find(|t| t.id == clip.track_id);
             let kind = track.map(|t| t.kind);
@@ -1857,9 +2048,10 @@ impl ClipperApp {
                         .iter()
                         .filter(|c| c.link == Some(link))
                         .filter(|c| {
-                            project.tracks.iter().any(|t| {
-                                t.id == c.track_id && t.kind == TrackKind::Audio
-                            })
+                            project
+                                .tracks
+                                .iter()
+                                .any(|t| t.id == c.track_id && t.kind == TrackKind::Audio)
                         })
                         .map(|c| c.id)
                         .collect(),
@@ -1874,7 +2066,9 @@ impl ClipperApp {
                 .unwrap_or(1.0);
             // Speed applies to clip + link partners (so V/A stay synced).
             let speed_target_clip_ids: Vec<ClipId> = match clip.link {
-                Some(link) => project.clips.iter()
+                Some(link) => project
+                    .clips
+                    .iter()
                     .filter(|c| c.link == Some(link))
                     .map(|c| c.id)
                     .collect(),
@@ -1898,32 +2092,46 @@ impl ClipperApp {
         let Some(snap) = snap else {
             // Shouldn't happen (the panel only renders with a selection),
             // but stay graceful if the selected clip vanished mid-frame.
-            ui.label(RichText::new("Select a clip on the timeline.")
-                .color(theme::TEXT_MUTED));
+            ui.label(RichText::new("Select a clip on the timeline.").color(theme::TEXT_MUTED));
             return;
         };
 
         // Info block — what this Edit panel is editing.
-        ui.label(RichText::new(format!(
-            "{} clip on {}",
-            match snap.track_kind {
-                Some(TrackKind::Video) => "Video",
-                Some(TrackKind::Audio) => "Audio",
-                None => "Unknown",
-            },
-            snap.track_name,
-        )).size(14.0).color(theme::TEXT_PRIMARY).strong());
+        ui.label(
+            RichText::new(format!(
+                "{} clip on {}",
+                match snap.track_kind {
+                    Some(TrackKind::Video) => "Video",
+                    Some(TrackKind::Audio) => "Audio",
+                    None => "Unknown",
+                },
+                snap.track_name,
+            ))
+            .size(14.0)
+            .color(theme::TEXT_PRIMARY)
+            .strong(),
+        );
         ui.add_space(6.0);
-        ui.label(RichText::new(format!(
-            "Position  {} → {}",
-            media::format_timestamp(snap.cut_start),
-            media::format_timestamp(snap.cut_end),
-        )).size(12.0).color(theme::TEXT_MUTED).monospace());
-        ui.label(RichText::new(format!(
-            "Source    {} → {}",
-            media::format_timestamp(snap.src_start),
-            media::format_timestamp(snap.src_end),
-        )).size(12.0).color(theme::TEXT_MUTED).monospace());
+        ui.label(
+            RichText::new(format!(
+                "Position  {} → {}",
+                media::format_timestamp(snap.cut_start),
+                media::format_timestamp(snap.cut_end),
+            ))
+            .size(12.0)
+            .color(theme::TEXT_MUTED)
+            .monospace(),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Source    {} → {}",
+                media::format_timestamp(snap.src_start),
+                media::format_timestamp(snap.src_end),
+            ))
+            .size(12.0)
+            .color(theme::TEXT_MUTED)
+            .monospace(),
+        );
 
         ui.add_space(14.0);
         ui.separator();
@@ -1931,8 +2139,12 @@ impl ClipperApp {
 
         // ─────────── Audio gain ───────────
         if !snap.audio_clip_ids.is_empty() {
-            ui.label(RichText::new("Audio").size(13.5).strong()
-                .color(theme::TEXT_PRIMARY));
+            ui.label(
+                RichText::new("Audio")
+                    .size(13.5)
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
             ui.add_space(6.0);
             let mut gain = snap.initial_gain;
             let resp = ui.add(
@@ -1946,9 +2158,12 @@ impl ClipperApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                for (preset, label) in
-                    [(0.0_f32, "Mute"), (0.5, "-6 dB"), (1.0, "1×"), (1.5, "+3.5 dB")]
-                {
+                for (preset, label) in [
+                    (0.0_f32, "Mute"),
+                    (0.5, "-6 dB"),
+                    (1.0, "1×"),
+                    (1.5, "+3.5 dB"),
+                ] {
                     let active = (gain - preset).abs() < 0.005;
                     if speed_preset_chip(ui, label, active).clicked() {
                         self.push_undo();
@@ -1966,24 +2181,36 @@ impl ClipperApp {
                 }
             }
             ui.add_space(4.0);
-            ui.label(RichText::new(
-                "0 = silent · 1 = original · 2 = +6 dB. This segment only — \
-                 split the clip to make one part quieter. Live in preview + export.")
-                .size(11.5).color(theme::TEXT_MUTED));
+            ui.label(
+                RichText::new(
+                    "0 = silent · 1 = original · 2 = +6 dB. This segment only — \
+                 split the clip to make one part quieter. Live in preview + export.",
+                )
+                .size(11.5)
+                .color(theme::TEXT_MUTED),
+            );
             ui.add_space(14.0);
             ui.separator();
             ui.add_space(14.0);
         }
 
         // ─────────── Speed ───────────
-        ui.label(RichText::new("Speed").size(13.5).strong()
-            .color(theme::TEXT_PRIMARY));
+        ui.label(
+            RichText::new("Speed")
+                .size(13.5)
+                .strong()
+                .color(theme::TEXT_PRIMARY),
+        );
         ui.add_space(6.0);
         let mut speed = snap.initial_speed;
         let speed_resp = ui.add(
             egui::Slider::new(&mut speed, 0.25..=4.0)
                 .step_by(0.05)
-                .text(if snap.speed_target_clip_ids.len() > 1 { "× (all linked)" } else { "×" }),
+                .text(if snap.speed_target_clip_ids.len() > 1 {
+                    "× (all linked)"
+                } else {
+                    "×"
+                }),
         );
         if speed_resp.drag_started() {
             self.push_undo();
@@ -2009,19 +2236,28 @@ impl ClipperApp {
             }
         }
         ui.add_space(4.0);
-        ui.label(RichText::new("Linked V+A move together. Live in preview + export.")
-            .size(11.5).color(theme::TEXT_MUTED));
+        ui.label(
+            RichText::new("Linked V+A move together. Live in preview + export.")
+                .size(11.5)
+                .color(theme::TEXT_MUTED),
+        );
 
         // ─────────── Text overlay (per-segment, V tracks only) ───────────
         if snap.track_kind == Some(TrackKind::Video) {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(10.0);
-            ui.label(RichText::new("Text overlay").color(theme::TEXT_MUTED).small());
+            ui.label(
+                RichText::new("Text overlay")
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
 
             // Caption settings belong only to the video segment being edited.
             let clip_id_for_text = snap.clip_id;
-            let mut overlay_state = self.project.as_ref()
+            let mut overlay_state = self
+                .project
+                .as_ref()
                 .and_then(|p| p.text_overlays.get(&clip_id_for_text).cloned());
             let mut enabled = overlay_state.is_some();
             let prev_enabled = enabled;
@@ -2031,12 +2267,15 @@ impl ClipperApp {
                 self.push_undo();
                 if let Some(p) = self.project.as_mut() {
                     if enabled {
-                        p.text_overlays.insert(clip_id_for_text, TextOverlay::default());
+                        p.text_overlays
+                            .insert(clip_id_for_text, TextOverlay::default());
                     } else {
                         p.text_overlays.remove(&clip_id_for_text);
                     }
                 }
-                overlay_state = self.project.as_ref()
+                overlay_state = self
+                    .project
+                    .as_ref()
                     .and_then(|p| p.text_overlays.get(&clip_id_for_text).cloned());
             }
 
@@ -2057,18 +2296,22 @@ impl ClipperApp {
                         .step_by(0.01)
                         .text("Horiz"),
                 );
-                if x_resp.drag_started() { self.push_undo(); }
+                if x_resp.drag_started() {
+                    self.push_undo();
+                }
                 let y_resp = ui.add(
                     egui::Slider::new(&mut overlay.y, 0.0..=1.0)
                         .step_by(0.01)
                         .text("Vert"),
                 );
-                if y_resp.drag_started() { self.push_undo(); }
-                let size_resp = ui.add(
-                    egui::Slider::new(&mut overlay.font_size_px, 12..=500)
-                        .text("Size"),
-                );
-                if size_resp.drag_started() { self.push_undo(); }
+                if y_resp.drag_started() {
+                    self.push_undo();
+                }
+                let size_resp =
+                    ui.add(egui::Slider::new(&mut overlay.font_size_px, 12..=500).text("Size"));
+                if size_resp.drag_started() {
+                    self.push_undo();
+                }
 
                 // Font family/style dropdown.
                 let mut font_choice = overlay.font.clone();
@@ -2093,10 +2336,12 @@ impl ClipperApp {
                 }
 
                 let mut color = overlay.color;
-                let color_resp = ui.horizontal(|ui| {
-                    ui.label(RichText::new("Color").color(theme::TEXT_MUTED).small());
-                    ui.color_edit_button_srgb(&mut color)
-                }).inner;
+                let color_resp = ui
+                    .horizontal(|ui| {
+                        ui.label(RichText::new("Color").color(theme::TEXT_MUTED).small());
+                        ui.color_edit_button_srgb(&mut color)
+                    })
+                    .inner;
                 if color_resp.changed() {
                     self.push_undo();
                     overlay.color = color;
@@ -2105,24 +2350,26 @@ impl ClipperApp {
                 // Typography extras — outline, shadow, opacity. All baked
                 // into the export via drawtext; the preview approximates
                 // them (see show_text_overlay_handle).
-                let outline_resp = ui.add(
-                    egui::Slider::new(&mut overlay.outline_px, 0..=12)
-                        .text("Outline"),
-                );
-                if outline_resp.drag_started() { self.push_undo(); }
+                let outline_resp =
+                    ui.add(egui::Slider::new(&mut overlay.outline_px, 0..=12).text("Outline"));
+                if outline_resp.drag_started() {
+                    self.push_undo();
+                }
                 let opacity_resp = ui.add(
                     egui::Slider::new(&mut overlay.opacity, 0.1..=1.0)
                         .step_by(0.05)
                         .text("Opacity"),
                 );
-                if opacity_resp.drag_started() { self.push_undo(); }
+                if opacity_resp.drag_started() {
+                    self.push_undo();
+                }
                 let mut shadow = overlay.shadow;
                 if ui.checkbox(&mut shadow, "Drop shadow").changed() {
                     self.push_undo();
                     overlay.shadow = shadow;
                 }
 
-                ui.label(RichText::new("Applies to this segment only. Drag the handle on the preview to reposition.")
+                ui.label(RichText::new("Applies to this segment only. Use Horiz / Vert to position; layered previews rebuild after edits.")
                     .small().color(theme::TEXT_MUTED.linear_multiply(0.7)));
 
                 // Write back if anything actually changed.
@@ -2143,21 +2390,37 @@ impl ClipperApp {
 
     fn show_media_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Media").size(14.0).strong()
-                .color(theme::TEXT_PRIMARY));
+            ui.label(
+                RichText::new("Media")
+                    .size(14.0)
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("+").on_hover_text("Add media…").clicked() {
-                    self.open_file();
+                    if self
+                        .project
+                        .as_ref()
+                        .is_some_and(|p| p.mode == EditMode::MultiTrack)
+                    {
+                        self.import_layer();
+                    } else {
+                        self.open_file();
+                    }
                 }
             });
         });
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(6.0);
+        self.show_layers(ui);
 
         if let Some(project) = &self.project {
-            let name = project.source.file_name()
-                .and_then(|s| s.to_str()).unwrap_or("");
+            let name = project
+                .source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             // Single-item "active" list for now. When we support stacking,
             // this becomes a Vec rendered as a list with drag handles.
             Frame::none()
@@ -2167,25 +2430,28 @@ impl ClipperApp {
                 .stroke(Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.6)))
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(name)
-                            .strong().color(theme::TEXT_PRIMARY));
-                        ui.label(RichText::new(format!(
-                            "{}×{}  ·  {:.0}fps  ·  {}",
-                            project.media.width,
-                            project.media.height,
-                            project.media.fps,
-                            media::format_timestamp(project.media.duration_ms),
-                        ))
+                        ui.label(RichText::new(name).strong().color(theme::TEXT_PRIMARY));
+                        ui.label(
+                            RichText::new(format!(
+                                "{}×{}  ·  {:.0}fps  ·  {}",
+                                project.media.width,
+                                project.media.height,
+                                project.media.fps,
+                                media::format_timestamp(project.media.duration_ms),
+                            ))
                             .small()
-                            .color(theme::TEXT_MUTED));
+                            .color(theme::TEXT_MUTED),
+                        );
                     });
                 });
         } else {
-            ui.label(RichText::new("No media yet.")
-                .color(theme::TEXT_MUTED));
+            ui.label(RichText::new("No media yet.").color(theme::TEXT_MUTED));
             ui.add_space(4.0);
-            ui.label(RichText::new("Use File → Open Video, or the “+” above.")
-                .small().color(theme::TEXT_MUTED.linear_multiply(0.7)));
+            ui.label(
+                RichText::new("Use File → Open Video, or the “+” above.")
+                    .small()
+                    .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+            );
         }
     }
 
@@ -2209,8 +2475,7 @@ impl ClipperApp {
             .as_ref()
             .map(|p| p.media.height.max(1) as f32)
             .unwrap_or(720.0);
-        let font_screen = (overlay.font_size_px as f32 * preview_rect.height() / source_h)
-            .max(6.0);
+        let font_screen = (overlay.font_size_px as f32 * preview_rect.height() / source_h).max(6.0);
 
         // Pick the egui family that matches the user's font choice. We
         // try the loaded DejaVu variant first; if it wasn't found at
@@ -2237,11 +2502,9 @@ impl ClipperApp {
         // pixel scale matches the font scaling above so proportions hold.
         let px = preview_rect.height() / source_h;
 
-        let galley = ui.painter().layout_no_wrap(
-            overlay.text.clone(),
-            font_id.clone(),
-            color,
-        );
+        let galley = ui
+            .painter()
+            .layout_no_wrap(overlay.text.clone(), font_id.clone(), color);
         let text_size = galley.size();
         let text_pos = egui::pos2(cx - text_size.x * 0.5, cy - text_size.y * 0.5);
 
@@ -2250,16 +2513,11 @@ impl ClipperApp {
             let off = (2.0 * px).max(1.0);
             let shadow_color =
                 Color32::from_rgba_unmultiplied(0, 0, 0, (0.6 * opacity * 255.0) as u8);
-            let g = ui.painter().layout_no_wrap(
-                overlay.text.clone(),
-                font_id.clone(),
-                shadow_color,
-            );
-            ui.painter().galley(
-                text_pos + egui::vec2(off, off),
-                g,
-                shadow_color,
-            );
+            let g =
+                ui.painter()
+                    .layout_no_wrap(overlay.text.clone(), font_id.clone(), shadow_color);
+            ui.painter()
+                .galley(text_pos + egui::vec2(off, off), g, shadow_color);
         }
         // Outline: eight offset black passes ringing the fill. Cruder
         // than drawtext's real border but reads the same at preview size.
@@ -2267,15 +2525,22 @@ impl ClipperApp {
             let r = (overlay.outline_px as f32 * px).max(1.0);
             let outline_color = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
             for (dx, dy) in [
-                (-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r),
-                (-r, -r), (r, -r), (-r, r), (r, r),
+                (-r, 0.0),
+                (r, 0.0),
+                (0.0, -r),
+                (0.0, r),
+                (-r, -r),
+                (r, -r),
+                (-r, r),
+                (r, r),
             ] {
                 let g = ui.painter().layout_no_wrap(
                     overlay.text.clone(),
                     font_id.clone(),
                     outline_color,
                 );
-                ui.painter().galley(text_pos + egui::vec2(dx, dy), g, outline_color);
+                ui.painter()
+                    .galley(text_pos + egui::vec2(dx, dy), g, outline_color);
             }
         }
         ui.painter().galley(text_pos, galley, color);
@@ -2343,22 +2608,23 @@ impl ClipperApp {
         let max_w_by_height = avail_h_for_preview * aspect;
         let default_w = avail.width().min(max_w_by_height);
         let current_w = self.preview_width.unwrap_or(default_w);
-        let pw = current_w.clamp(280.0, avail.width().min(max_w_by_height));
+        let max_w = avail.width().min(max_w_by_height).max(1.0);
+        let pw = current_w.clamp(280.0_f32.min(max_w), max_w);
         let ph = pw / aspect;
 
         // Center the preview horizontally in the available width — keeps
         // empty space balanced on both sides when the panel is wider than
         // the aspect-locked frame.
         let preview_x = avail.center().x - pw * 0.5;
-        let preview_rect = egui::Rect::from_min_size(
-            egui::pos2(preview_x, avail.top()),
-            egui::vec2(pw, ph),
-        );
+        let preview_rect =
+            egui::Rect::from_min_size(egui::pos2(preview_x, avail.top()), egui::vec2(pw, ph));
 
         // Render preview frame
-        let mut child = ui.new_child(egui::UiBuilder::new()
-            .max_rect(preview_rect)
-            .layout(egui::Layout::top_down(egui::Align::LEFT)));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(preview_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
         Frame::none()
             .fill(theme::BG_PREVIEW)
             .rounding(Rounding::same(8.0))
@@ -2371,50 +2637,77 @@ impl ClipperApp {
                         preview_rect.size(),
                         egui::Layout::centered_and_justified(egui::Direction::TopDown),
                         |ui| {
-                            ui.label(RichText::new("No media")
-                                .color(theme::TEXT_MUTED).size(13.0));
-                        });
+                            ui.label(
+                                RichText::new("No media")
+                                    .color(theme::TEXT_MUTED)
+                                    .size(13.0),
+                            );
+                        },
+                    );
                     return;
                 }
-                let (rect, _) = ui.allocate_exact_size(
-                    preview_rect.size(),
-                    egui::Sense::hover(),
-                );
+                let (rect, _) = ui.allocate_exact_size(preview_rect.size(), egui::Sense::hover());
                 // In Advanced mode, the playhead can sit in a gap between
                 // clips on V1 (e.g. after split + delete). The export bakes
                 // those gaps as black, so the preview matches by painting
                 // black instead of leaving mpv's stale frame on screen.
-                let in_v1_gap = self
-                    .project
-                    .as_ref()
-                    .is_some_and(|p| {
-                        p.mode == EditMode::MultiTrack
-                            && p.first_video_track().is_some_and(|v| {
-                                track::clip_on_track_at(&p.clips, v, p.playhead_ms).is_none()
-                            })
-                    });
+                let in_v1_gap = self.project.as_ref().is_some_and(|p| {
+                    p.mode == EditMode::MultiTrack
+                        && !p.needs_composition()
+                        && p.first_video_track().is_some_and(|v| {
+                            track::clip_on_track_at(&p.clips, v, p.playhead_ms).is_none()
+                        })
+                });
                 if in_v1_gap {
-                    ui.painter().rect_filled(rect, Rounding::same(0.0), Color32::BLACK);
+                    ui.painter()
+                        .rect_filled(rect, Rounding::same(0.0), Color32::BLACK);
                 } else {
                     let player = self.player.clone();
                     let video_fbo = self.video_fbo.clone();
                     let callback = egui::PaintCallback {
                         rect,
-                        callback: Arc::new(egui_glow::CallbackFn::new(
-                            move |info, painter| {
-                                paint_mpv(&player, &video_fbo, info, painter);
-                            },
-                        )),
+                        callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+                            paint_mpv(&player, &video_fbo, info, painter);
+                        })),
                     };
                     ui.painter().add(callback);
                 }
             });
 
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack && p.needs_composition())
+            && !self.layered_preview.ready
+        {
+            ui.painter()
+                .rect_filled(preview_rect, 8.0, Color32::from_black_alpha(220));
+            ui.painter().text(
+                preview_rect.center(),
+                Align2::CENTER_CENTER,
+                "Updating layered preview…",
+                egui::FontId::proportional(16.0),
+                theme::TEXT_PRIMARY,
+            );
+            ui.label(
+                RichText::new(&self.layered_preview.message)
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            );
+            if ui.button("Retry preview").clicked() {
+                self.layered_preview.retry();
+            }
+        }
+
         // Draw only the caption on the video segment under the playhead.
-        let active_caption = self.project.as_ref()
+        let active_caption = self
+            .project
+            .as_ref()
             .and_then(Project::active_caption)
             .map(|(id, overlay)| (id, overlay.clone()));
-        if let Some((clip_id, overlay)) = active_caption {
+        if let Some((clip_id, overlay)) =
+            active_caption.filter(|_| !self.project.as_ref().is_some_and(|p| p.needs_composition()))
+        {
             self.show_text_overlay_handle(ui, &preview_rect, clip_id, &overlay);
         }
 
@@ -2426,9 +2719,11 @@ impl ClipperApp {
             egui::pos2(preview_rect.left(), preview_rect.bottom() + controls_gap),
             egui::vec2(pw, controls_h),
         );
-        let mut controls_ui = ui.new_child(egui::UiBuilder::new()
-            .max_rect(controls_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)));
+        let mut controls_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(controls_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
         controls_ui.set_min_size(controls_rect.size());
 
         let mut want_popout = false;
@@ -2436,8 +2731,10 @@ impl ClipperApp {
         let mut new_volume: Option<f64> = None;
         controls_ui.horizontal(|ui| {
             if secondary_button(ui, "⧉  Pop Out", true)
-                .on_hover_text("Open this video in a separate mpv window\n\
-                                (the embedded preview keeps working)")
+                .on_hover_text(
+                    "Open this video in a separate mpv window\n\
+                                (the embedded preview keeps working)",
+                )
                 .clicked()
             {
                 want_popout = true;
@@ -2447,29 +2744,38 @@ impl ClipperApp {
             if ui.button(mute_label).on_hover_text("Mute (M)").clicked() {
                 want_mute = true;
             }
-            let vol_response = ui.scope(|ui| {
-                ui.spacing_mut().slider_width = 160.0;
-                ui.add(egui::Slider::new(&mut self.volume_ui, 0.0..=130.0)
-                    .show_value(false))
-            }).inner;
+            let vol_response = ui
+                .scope(|ui| {
+                    ui.spacing_mut().slider_width = 160.0;
+                    ui.add(egui::Slider::new(&mut self.volume_ui, 0.0..=130.0).show_value(false))
+                })
+                .inner;
             if vol_response.changed() {
                 new_volume = Some(self.volume_ui);
             }
             ui.add_space(6.0);
-            ui.label(RichText::new(format!("{:.0}", self.volume_ui))
-                .monospace().color(theme::TEXT_MUTED).small());
+            ui.label(
+                RichText::new(format!("{:.0}", self.volume_ui))
+                    .monospace()
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
         });
         if want_popout {
             if let Some(project) = &self.project {
                 let start = project.playhead_ms as f64 / 1000.0;
-                let _ = std::process::Command::new("mpv")
+                let _ = crate::platform::command("mpv")
                     .arg(format!("--start={start:.3}"))
                     .arg(&project.source)
                     .spawn();
             }
         }
-        if want_mute { let _ = self.player.toggle_mute(); }
-        if let Some(v) = new_volume { let _ = self.player.set_volume(v); }
+        if want_mute {
+            let _ = self.player.toggle_mute();
+        }
+        if let Some(v) = new_volume {
+            let _ = self.player.set_volume(v);
+        }
 
         // Resize grip at the bottom-left corner. Drag down/left to grow,
         // up/right to shrink. Aspect-ratio locked via width.
@@ -2489,9 +2795,8 @@ impl ClipperApp {
             let dw = delta.y - delta.x;
             // Same height-for-preview cap used above — keeps the resize
             // grip from growing the preview into the controls row.
-            let max_w = avail.width().min(avail_h_for_preview * aspect);
             self.preview_width = Some(
-                (self.preview_width.unwrap_or(default_w) + dw).clamp(280.0, max_w),
+                (self.preview_width.unwrap_or(default_w) + dw).clamp(280.0_f32.min(max_w), max_w),
             );
         }
         // Draw the grip glyph (three diagonal lines, bottom-left corner)
@@ -2504,10 +2809,10 @@ impl ClipperApp {
         for i in 0..3 {
             let off = 5.0 + (i as f32) * 4.0;
             grip_painter.line_segment(
-                [egui::pos2(grip_rect.left() + 3.0,
-                            grip_rect.bottom() - 3.0 - off),
-                 egui::pos2(grip_rect.left() + 3.0 + off,
-                            grip_rect.bottom() - 3.0)],
+                [
+                    egui::pos2(grip_rect.left() + 3.0, grip_rect.bottom() - 3.0 - off),
+                    egui::pos2(grip_rect.left() + 3.0 + off, grip_rect.bottom() - 3.0),
+                ],
                 Stroke::new(1.5_f32, grip_color),
             );
         }
@@ -2547,8 +2852,16 @@ impl ClipperApp {
             let mut tl_state = TimelineState {
                 duration_ms: scrubber_duration,
                 playhead_ms: project.playhead_ms,
-                in_ms: if mode == EditMode::SimpleClip { project.in_ms } else { None },
-                out_ms: if mode == EditMode::SimpleClip { project.out_ms } else { None },
+                in_ms: if mode == EditMode::SimpleClip {
+                    project.in_ms
+                } else {
+                    None
+                },
+                out_ms: if mode == EditMode::SimpleClip {
+                    project.out_ms
+                } else {
+                    None
+                },
                 audio_muted: project.simple_audio_muted,
             };
 
@@ -2567,8 +2880,7 @@ impl ClipperApp {
             // Scrubber row: Play button + slim progress bar
             ui.horizontal(|ui| {
                 let play_label = if is_playing { "⏸" } else { "▶" };
-                let play_btn = egui::Button::new(
-                    RichText::new(play_label).size(18.0).strong())
+                let play_btn = egui::Button::new(RichText::new(play_label).size(18.0).strong())
                     .fill(theme::ACCENT)
                     .min_size(egui::vec2(46.0, 30.0));
                 if ui.add(play_btn).on_hover_text("Space").clicked() {
@@ -2599,7 +2911,11 @@ impl ClipperApp {
                         cut_duration_ms: cut_duration,
                         selected_clips: &project.selected_clips,
                     };
-                    let (_, mt_out) = timeline::show_multitrack(ui, &mut mt_state);
+                    let (_, mt_out) = egui::ScrollArea::vertical()
+                        .id_salt("layer_timeline")
+                        .max_height(220.0)
+                        .show(ui, |ui| timeline::show_multitrack(ui, &mut mt_state))
+                        .inner;
                     dragging_any |= mt_out.dragging;
                     project.playhead_ms = mt_state.playhead_cut_ms;
                     want_mute_track = mt_out.mute_toggled;
@@ -2636,70 +2952,64 @@ impl ClipperApp {
             ui.add_space(8.0);
 
             // Action row.
-            ui.horizontal(|ui| {
-                match mode {
-                    EditMode::SimpleClip => {
-                        if accent_button(ui, "Set In  (I)", theme::ACCENT_IN, true).clicked() {
-                            clip_action = Some(ClipAction::SetIn);
-                        }
-                        if accent_button(ui, "Set Out  (O)", theme::ACCENT_OUT, true).clicked() {
-                            clip_action = Some(ClipAction::SetOut);
-                        }
-                        if secondary_button(ui, "Clear", true).clicked() {
-                            clip_action = Some(ClipAction::Clear);
-                        }
-
-                        let can_export = project.in_ms.is_some() && project.out_ms.is_some()
-                            && self.export.is_none();
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if primary_button(ui, "Export Clip…", can_export).clicked() {
-                                want_export = true;
-                            }
-                        });
+            ui.horizontal(|ui| match mode {
+                EditMode::SimpleClip => {
+                    if accent_button(ui, "Set In  (I)", theme::ACCENT_IN, true).clicked() {
+                        clip_action = Some(ClipAction::SetIn);
                     }
-                    EditMode::MultiTrack => {
-                        let can_split = !project.clips.is_empty()
-                            && project.playhead_ms > 0
-                            && project.playhead_ms < cut_duration;
-                        if accent_button(ui, "Split  (S)", theme::ACCENT_OUT, can_split)
-                            .on_hover_text("Split every clip the playhead is on")
-                            .clicked()
-                        {
-                            clip_action = Some(ClipAction::Split);
-                        }
-                        let can_delete = project.clips.len() > 1
-                            && (!project.selected_clips.is_empty()
-                                || project.first_video_track().is_some());
-                        if accent_button(ui, "Delete  (Del)", theme::ACCENT_ERR, can_delete)
-                            .on_hover_text("Delete the selected clip(s) + linked partners")
-                            .clicked()
-                        {
-                            clip_action = Some(ClipAction::DeleteSelected);
-                        }
-                        let can_detach = project
-                            .selected_clips
-                            .iter()
-                            .any(|id| {
-                                track::clip_by_id(&project.clips, *id)
-                                    .is_some_and(|c| c.link.is_some())
-                            });
-                        if secondary_button(ui, "Detach Audio  (D)", can_detach)
-                            .on_hover_text("Detach the selected clip(s) — exposes their audio lanes")
-                            .clicked()
-                        {
-                            clip_action = Some(ClipAction::DetachSelected);
-                        }
-
-                        let can_export = !project.clips.is_empty()
-                            && self.export.is_none();
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if primary_button(ui, "Export Cut…", can_export).clicked() {
-                                want_export = true;
-                            }
-                        });
+                    if accent_button(ui, "Set Out  (O)", theme::ACCENT_OUT, true).clicked() {
+                        clip_action = Some(ClipAction::SetOut);
                     }
+                    if secondary_button(ui, "Clear", true).clicked() {
+                        clip_action = Some(ClipAction::Clear);
+                    }
+
+                    let can_export = project.in_ms.is_some()
+                        && project.out_ms.is_some()
+                        && self.export.is_none();
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Export Clip…", can_export).clicked() {
+                            want_export = true;
+                        }
+                    });
+                }
+                EditMode::MultiTrack => {
+                    let can_split = !project.clips.is_empty()
+                        && project.playhead_ms > 0
+                        && project.playhead_ms < cut_duration;
+                    if accent_button(ui, "Split  (S)", theme::ACCENT_OUT, can_split)
+                        .on_hover_text("Split every clip the playhead is on")
+                        .clicked()
+                    {
+                        clip_action = Some(ClipAction::Split);
+                    }
+                    let can_delete = !project.clips.is_empty()
+                        && (!project.selected_clips.is_empty()
+                            || project.first_video_track().is_some());
+                    if accent_button(ui, "Delete  (Del)", theme::ACCENT_ERR, can_delete)
+                        .on_hover_text("Delete the selected clip(s) + linked partners")
+                        .clicked()
+                    {
+                        clip_action = Some(ClipAction::DeleteSelected);
+                    }
+                    let can_detach = project.selected_clips.iter().any(|id| {
+                        track::clip_by_id(&project.clips, *id).is_some_and(|c| c.link.is_some())
+                    });
+                    if secondary_button(ui, "Detach Audio  (D)", can_detach)
+                        .on_hover_text("Detach the selected clip(s) — exposes their audio lanes")
+                        .clicked()
+                    {
+                        clip_action = Some(ClipAction::DetachSelected);
+                    }
+
+                    let can_export = !project.clips.is_empty() && self.export.is_none();
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Export Cut…", can_export).clicked() {
+                            want_export = true;
+                        }
+                    });
                 }
             });
         } else {
@@ -2712,9 +3022,15 @@ impl ClipperApp {
             });
         }
 
-        if want_open { self.open_file(); }
-        if want_play { self.toggle_play(); }
-        if want_export { self.export_options_open = true; }
+        if want_open {
+            self.open_file();
+        }
+        if want_play {
+            self.toggle_play();
+        }
+        if want_export {
+            self.export_options_open = true;
+        }
         if let Some(action) = clip_action {
             self.apply_clip_action(action);
         }
@@ -2821,11 +3137,7 @@ impl ClipperApp {
             egui::Order::Background,
             egui::Id::new("settings_dim"),
         ))
-        .rect_filled(
-            screen,
-            0.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 140),
-        );
+        .rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 140));
 
         let mut close = false;
         let cache_bytes = proxy::cache_size_bytes();
@@ -2935,13 +3247,10 @@ impl ClipperApp {
 
                 // Manual clear row.
                 ui.label(
-                    RichText::new(format!(
-                        "Cache size on disk: {}",
-                        format_bytes(cache_bytes)
-                    ))
-                    .size(13.0)
-                    .color(theme::TEXT_PRIMARY)
-                    .monospace(),
+                    RichText::new(format!("Cache size on disk: {}", format_bytes(cache_bytes)))
+                        .size(13.0)
+                        .color(theme::TEXT_PRIMARY)
+                        .monospace(),
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -2956,8 +3265,7 @@ impl ClipperApp {
                             }
                             Err(e) => {
                                 log::warn!("clear_cache failed: {e}");
-                                self.status =
-                                    "Could not clear proxy cache — see log.".into();
+                                self.status = "Could not clear proxy cache — see log.".into();
                             }
                         }
                     }
@@ -2975,7 +3283,8 @@ impl ClipperApp {
                     )
                     .rounding(Rounding::same(6.0))
                     .min_size(egui::vec2(110.0, 34.0));
-                    if ui.add(cancel_btn)
+                    if ui
+                        .add(cancel_btn)
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
@@ -2984,21 +3293,17 @@ impl ClipperApp {
                         self.settings = Settings::load();
                         close = true;
                     }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if primary_button(ui, "Save", true).clicked() {
-                                if let Err(e) = self.settings.save() {
-                                    log::warn!("settings save failed: {e:#}");
-                                    self.status =
-                                        "Could not save settings — see log.".into();
-                                } else {
-                                    self.status = "Settings saved.".into();
-                                }
-                                close = true;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Save", true).clicked() {
+                            if let Err(e) = self.settings.save() {
+                                log::warn!("settings save failed: {e:#}");
+                                self.status = "Could not save settings — see log.".into();
+                            } else {
+                                self.status = "Settings saved.".into();
                             }
-                        },
-                    );
+                            close = true;
+                        }
+                    });
                 });
             });
 
@@ -3017,11 +3322,7 @@ impl ClipperApp {
             egui::Order::Background,
             egui::Id::new("export_opts_dim"),
         ))
-        .rect_filled(
-            screen,
-            0.0,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 140),
-        );
+        .rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 140));
 
         let mut begin = false;
         let mut cancel = false;
@@ -3255,8 +3556,7 @@ impl ClipperApp {
             ui.add(
                 egui::Slider::new(
                     &mut self.discord_target_mb,
-                    encode::DiscordNitro::MIN_TARGET_MB
-                        ..=encode::DiscordNitro::MAX_TARGET_MB,
+                    encode::DiscordNitro::MIN_TARGET_MB..=encode::DiscordNitro::MAX_TARGET_MB,
                 )
                 .step_by(5.0)
                 .suffix(" MB"),
@@ -3278,11 +3578,8 @@ impl ClipperApp {
         // exists: someone posting to a server full of phone clients may
         // want H.264 regardless of what the size math prefers, and
         // someone who knows their audience may want AV1 anyway.
-        let av1_available = encode::DiscordNitro::best_av1(
-            self.detected_gpu,
-            &self.available_codecs,
-        )
-        .is_some();
+        let av1_available =
+            encode::DiscordNitro::best_av1(self.detected_gpu, &self.available_codecs).is_some();
         ui.label(
             RichText::new("Codec")
                 .size(13.0)
@@ -3316,8 +3613,7 @@ impl ClipperApp {
         // ── Live stats reflecting the slider value ──
         // Same NitroPlan::compute the export uses, so the panel can't
         // promise a codec or resolution the encode won't deliver.
-        let target_bytes =
-            encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
+        let target_bytes = encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb);
         let plan = encode::NitroPlan::compute(
             duration_ms,
             target_bytes,
@@ -3367,7 +3663,10 @@ impl ClipperApp {
                 format!("{} ({}×{})", resolution.label(), dims.0, dims.1),
             ),
             ("Codec", plan.codec.display().to_string()),
-            ("Approx. output size", format!("≈ {est_mb_rounded} MB  ±10%")),
+            (
+                "Approx. output size",
+                format!("≈ {est_mb_rounded} MB  ±10%"),
+            ),
         ];
 
         egui::Grid::new("discord_nitro_stats")
@@ -3400,8 +3699,7 @@ impl ClipperApp {
                 est_mb_rounded,
             )
         } else if video_kbps + audio_kbps < 500 {
-            "Long clip at this target — bitrate is very low, picture may look soft."
-                .into()
+            "Long clip at this target — bitrate is very low, picture may look soft.".into()
         } else {
             format!(
                 "CBR encode aiming to land near {} MB (±10% in practice).",
@@ -3448,8 +3746,7 @@ impl ClipperApp {
                             self.custom_encode.resolution = *preset;
                             // Snap bitrate to the preset's default so the
                             // user doesn't have to retype every time.
-                            self.custom_encode.video_bitrate_kbps =
-                                preset.default_bitrate_kbps();
+                            self.custom_encode.video_bitrate_kbps = preset.default_bitrate_kbps();
                         }
                     }
                 });
@@ -3527,8 +3824,7 @@ impl ClipperApp {
         // recommended codec gets a "★ Recommended" suffix in the list.
         ui.horizontal(|ui| {
             ui.label(RichText::new("Codec").color(theme::TEXT_MUTED).small());
-            let mut all_codecs: Vec<VideoCodec> =
-                vec![VideoCodec::X264, VideoCodec::X265];
+            let mut all_codecs: Vec<VideoCodec> = vec![VideoCodec::X264, VideoCodec::X265];
             all_codecs.extend(self.available_codecs.iter().copied());
             let current = self.custom_encode.video_codec;
             let selected_text = if current == recommended {
@@ -3556,7 +3852,11 @@ impl ClipperApp {
 
         // Rate control: constant quality (default) vs target bitrate.
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Rate control").color(theme::TEXT_MUTED).small());
+            ui.label(
+                RichText::new("Rate control")
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
             ui.radio_value(
                 &mut self.custom_encode.rate_control,
                 RateControl::ConstantQuality,
@@ -3576,8 +3876,10 @@ impl ClipperApp {
             RateControl::ConstantQuality => {
                 let codec = self.custom_encode.video_codec;
                 let range = codec.quality_range();
-                self.custom_encode.quality =
-                    self.custom_encode.quality.clamp(*range.start(), *range.end());
+                self.custom_encode.quality = self
+                    .custom_encode
+                    .quality
+                    .clamp(*range.start(), *range.end());
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("Quality ({})", codec.quality_name()))
@@ -3601,13 +3903,14 @@ impl ClipperApp {
             }
             RateControl::Bitrate => {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Bitrate (kbps)").color(theme::TEXT_MUTED).small());
+                    ui.label(
+                        RichText::new("Bitrate (kbps)")
+                            .color(theme::TEXT_MUTED)
+                            .small(),
+                    );
                     ui.add(
-                        egui::Slider::new(
-                            &mut self.custom_encode.video_bitrate_kbps,
-                            500..=50_000,
-                        )
-                        .logarithmic(true),
+                        egui::Slider::new(&mut self.custom_encode.video_bitrate_kbps, 500..=50_000)
+                            .logarithmic(true),
                     );
                 });
                 // Rough size estimate so the slider means something.
@@ -3615,14 +3918,11 @@ impl ClipperApp {
                     let dur_ms = self.cut_duration_ms_for_export(project);
                     let total_kbps = self.custom_encode.video_bitrate_kbps as i64
                         + self.custom_encode.audio_bitrate_kbps as i64;
-                    let est_mb =
-                        (total_kbps * dur_ms) as f64 / 8_000.0 / (1024.0 * 1024.0);
+                    let est_mb = (total_kbps * dur_ms) as f64 / 8_000.0 / (1024.0 * 1024.0);
                     ui.label(
-                        RichText::new(format!(
-                            "≈ {est_mb:.0} MB at the current cut length."
-                        ))
-                        .small()
-                        .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+                        RichText::new(format!("≈ {est_mb:.0} MB at the current cut length."))
+                            .small()
+                            .color(theme::TEXT_MUTED.linear_multiply(0.7)),
                     );
                 }
             }
@@ -3641,24 +3941,27 @@ impl ClipperApp {
                 ui.label(RichText::new("Preset").color(theme::TEXT_MUTED).small());
                 let preset_options: &[&str] = match self.custom_encode.video_codec {
                     VideoCodec::X264 | VideoCodec::X265 => &[
-                        "ultrafast", "superfast", "veryfast", "faster", "fast",
-                        "medium", "slow", "slower", "veryslow",
+                        "ultrafast",
+                        "superfast",
+                        "veryfast",
+                        "faster",
+                        "fast",
+                        "medium",
+                        "slow",
+                        "slower",
+                        "veryslow",
                     ],
                     // SVT-AV1 numbers its presets: 0 slowest, 13 fastest.
                     // Below 4 the encode is slower than most people will
                     // sit through, so the list starts at 4.
-                    VideoCodec::SvtAv1 => &[
-                        "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
-                    ],
+                    VideoCodec::SvtAv1 => &["4", "5", "6", "7", "8", "9", "10", "11", "12", "13"],
                     VideoCodec::NvencH264 | VideoCodec::NvencHevc | VideoCodec::NvencAv1 => {
                         &["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
                     }
                     VideoCodec::QsvH264 | VideoCodec::QsvHevc => {
                         &["veryfast", "faster", "fast", "medium", "slow", "veryslow"]
                     }
-                    VideoCodec::AmfH264 | VideoCodec::AmfHevc => {
-                        &["speed", "balanced", "quality"]
-                    }
+                    VideoCodec::AmfH264 | VideoCodec::AmfHevc => &["speed", "balanced", "quality"],
                     // VAAPI has no preset knob at all; av1_qsv / av1_amf
                     // take a bare number with no named aliases, so both
                     // stay on the encoder's own default.
@@ -3701,7 +4004,11 @@ impl ClipperApp {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Audio codec").color(theme::TEXT_MUTED).small());
+                ui.label(
+                    RichText::new("Audio codec")
+                        .color(theme::TEXT_MUTED)
+                        .small(),
+                );
                 let current_audio = self.custom_encode.audio_codec;
                 egui::ComboBox::from_id_salt("custom_audio_codec")
                     .selected_text(current_audio.display())
@@ -3717,13 +4024,14 @@ impl ClipperApp {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Audio bitrate (kbps)").color(theme::TEXT_MUTED).small());
+                ui.label(
+                    RichText::new("Audio bitrate (kbps)")
+                        .color(theme::TEXT_MUTED)
+                        .small(),
+                );
                 ui.add(
-                    egui::Slider::new(
-                        &mut self.custom_encode.audio_bitrate_kbps,
-                        64..=320,
-                    )
-                    .step_by(32.0),
+                    egui::Slider::new(&mut self.custom_encode.audio_bitrate_kbps, 64..=320)
+                        .step_by(32.0),
                 );
             });
         }
@@ -3731,11 +4039,9 @@ impl ClipperApp {
         if self.available_codecs.is_empty() {
             ui.add_space(6.0);
             ui.label(
-                RichText::new(
-                    "No hardware encoders or AV1 support detected in your ffmpeg build.",
-                )
-                .small()
-                .color(theme::TEXT_MUTED.linear_multiply(0.7)),
+                RichText::new("No hardware encoders or AV1 support detected in your ffmpeg build.")
+                    .small()
+                    .color(theme::TEXT_MUTED.linear_multiply(0.7)),
             );
         }
     }
@@ -3746,8 +4052,10 @@ impl ClipperApp {
         // Dim the background.
         let screen = ctx.screen_rect();
         ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background, egui::Id::new("modal_dim")))
-            .rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 140));
+            egui::Order::Background,
+            egui::Id::new("modal_dim"),
+        ))
+        .rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 140));
 
         let mut close = false;
         let mut cancel = false;
@@ -3768,32 +4076,44 @@ impl ClipperApp {
             .collapsible(false)
             .resizable(false)
             .fixed_size([580.0, modal_height])
-            .frame(Frame::window(&ctx.style())
-                .fill(theme::BG_MODAL)
-                .rounding(Rounding::same(12.0))
-                .stroke(Stroke::new(1.0_f32, theme::BORDER))
-                .inner_margin(Margin::same(28.0)))
+            .frame(
+                Frame::window(&ctx.style())
+                    .fill(theme::BG_MODAL)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                    .inner_margin(Margin::same(28.0)),
+            )
             .show(ctx, |ui| {
                 match &progress.phase {
                     ExportPhase::Running => {
                         // Header — title + destination filename.
-                        ui.label(RichText::new("Exporting Clip")
-                            .size(22.0)
-                            .strong()
-                            .color(theme::TEXT_PRIMARY));
+                        ui.label(
+                            RichText::new("Exporting Clip")
+                                .size(22.0)
+                                .strong()
+                                .color(theme::TEXT_PRIMARY),
+                        );
                         ui.add_space(6.0);
-                        ui.label(RichText::new(format!(
-                            "→  {}",
-                            progress.destination.file_name()
-                                .and_then(|s| s.to_str()).unwrap_or("")
-                        )).size(12.5).color(theme::TEXT_MUTED).monospace());
+                        ui.label(
+                            RichText::new(format!(
+                                "→  {}",
+                                progress
+                                    .destination
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                            ))
+                            .size(12.5)
+                            .color(theme::TEXT_MUTED)
+                            .monospace(),
+                        );
 
                         ui.add_space(22.0);
 
                         // State copy + percentage. They sit ABOVE the
                         // bar so the bar itself stays clean.
-                        let initializing = progress.current_ms == 0
-                            && progress.elapsed().as_secs() >= 2;
+                        let initializing =
+                            progress.current_ms == 0 && progress.elapsed().as_secs() >= 2;
                         let pct = (progress.fraction() * 100.0).round() as i32;
                         let state_text = if initializing {
                             "Initializing encoder…".to_string()
@@ -3801,35 +4121,33 @@ impl ClipperApp {
                             format!("Encoding · {pct}%")
                         };
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&state_text)
-                                .size(13.5)
-                                .strong()
-                                .color(theme::TEXT_PRIMARY));
+                            ui.label(
+                                RichText::new(&state_text)
+                                    .size(13.5)
+                                    .strong()
+                                    .color(theme::TEXT_PRIMARY),
+                            );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let speed_label = if initializing
-                                        || progress.speed < 0.01
-                                    {
+                                    let speed_label = if initializing || progress.speed < 0.01 {
                                         String::new()
                                     } else {
                                         format!("{:.2}×", progress.speed)
                                     };
                                     if !speed_label.is_empty() {
-                                        ui.label(RichText::new(speed_label)
-                                            .size(13.5)
-                                            .monospace()
-                                            .color(theme::TEXT_MUTED));
+                                        ui.label(
+                                            RichText::new(speed_label)
+                                                .size(13.5)
+                                                .monospace()
+                                                .color(theme::TEXT_MUTED),
+                                        );
                                     }
                                 },
                             );
                         });
                         ui.add_space(6.0);
-                        paint_progress_bar(
-                            ui,
-                            progress.fraction(),
-                            initializing,
-                        );
+                        paint_progress_bar(ui, progress.fraction(), initializing);
 
                         ui.add_space(20.0);
 
@@ -3839,7 +4157,8 @@ impl ClipperApp {
                         let eta = if initializing {
                             "warming up…".to_string()
                         } else {
-                            progress.eta()
+                            progress
+                                .eta()
                                 .map(export::format_duration)
                                 .unwrap_or_else(|| "calculating…".into())
                         };
@@ -3853,9 +4172,11 @@ impl ClipperApp {
                         } else {
                             format!("{:.0}", progress.fps)
                         };
-                        let progress_v = format!("{} / {}",
+                        let progress_v = format!(
+                            "{} / {}",
                             media::format_timestamp(progress.current_ms),
-                            media::format_timestamp(progress.total_ms));
+                            media::format_timestamp(progress.total_ms)
+                        );
                         let mode_v = progress.mode_label.to_string();
 
                         egui::Grid::new("export_stats_v2")
@@ -3864,10 +4185,8 @@ impl ClipperApp {
                             .min_col_width(70.0)
                             .show(ui, |ui| {
                                 stat_grid_row(ui, "Elapsed", &elapsed, "ETA", &eta);
-                                stat_grid_row(ui, "Speed", &speed_v,
-                                    "Encode FPS", &fps_v);
-                                stat_grid_row(ui, "Progress", &progress_v,
-                                    "Mode", &mode_v);
+                                stat_grid_row(ui, "Speed", &speed_v, "Encode FPS", &fps_v);
+                                stat_grid_row(ui, "Progress", &progress_v, "Mode", &mode_v);
                             });
 
                         ui.add_space(22.0);
@@ -3881,18 +4200,29 @@ impl ClipperApp {
                         });
                     }
                     ExportPhase::Done => {
-                        ui.label(RichText::new("✓  Export Complete")
-                            .size(22.0).strong()
-                            .color(theme::ACCENT_OK));
+                        ui.label(
+                            RichText::new("✓  Export Complete")
+                                .size(22.0)
+                                .strong()
+                                .color(theme::ACCENT_OK),
+                        );
                         ui.add_space(10.0);
-                        ui.label(RichText::new(progress.destination.display().to_string())
-                            .size(12.5).monospace().color(theme::TEXT_PRIMARY));
+                        ui.label(
+                            RichText::new(progress.destination.display().to_string())
+                                .size(12.5)
+                                .monospace()
+                                .color(theme::TEXT_PRIMARY),
+                        );
                         ui.add_space(8.0);
-                        ui.label(RichText::new(format!(
-                            "Took {}  ·  {}",
-                            export::format_duration(progress.elapsed()),
-                            progress.mode_label,
-                        )).size(12.5).color(theme::TEXT_MUTED));
+                        ui.label(
+                            RichText::new(format!(
+                                "Took {}  ·  {}",
+                                export::format_duration(progress.elapsed()),
+                                progress.mode_label,
+                            ))
+                            .size(12.5)
+                            .color(theme::TEXT_MUTED),
+                        );
 
                         ui.add_space(24.0);
                         ui.separator();
@@ -3902,25 +4232,33 @@ impl ClipperApp {
                             if secondary_button(ui, "Open Folder", true).clicked() {
                                 open_folder = true;
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if primary_button(ui, "Done", true).clicked() {
-                                    close = true;
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if primary_button(ui, "Done", true).clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
                         });
                     }
                     ExportPhase::Failed(err) => {
-                        ui.label(RichText::new("✗  Export Failed")
-                            .size(22.0).strong()
-                            .color(theme::ACCENT_ERR));
+                        ui.label(
+                            RichText::new("✗  Export Failed")
+                                .size(22.0)
+                                .strong()
+                                .color(theme::ACCENT_ERR),
+                        );
                         ui.add_space(14.0);
                         egui::ScrollArea::vertical()
                             .max_height(160.0)
                             .show(ui, |ui| {
-                                ui.label(RichText::new(err)
-                                    .size(12.0)
-                                    .monospace()
-                                    .color(theme::TEXT_PRIMARY));
+                                ui.label(
+                                    RichText::new(err)
+                                        .size(12.0)
+                                        .monospace()
+                                        .color(theme::TEXT_PRIMARY),
+                                );
                             });
                         ui.add_space(14.0);
                         ui.separator();
@@ -3932,13 +4270,18 @@ impl ClipperApp {
                         });
                     }
                     ExportPhase::Cancelled => {
-                        ui.label(RichText::new("Export Cancelled")
-                            .size(22.0).strong()
-                            .color(theme::TEXT_PRIMARY));
+                        ui.label(
+                            RichText::new("Export Cancelled")
+                                .size(22.0)
+                                .strong()
+                                .color(theme::TEXT_PRIMARY),
+                        );
                         ui.add_space(12.0);
-                        ui.label(RichText::new("The output file may be incomplete.")
-                            .size(13.0)
-                            .color(theme::TEXT_MUTED));
+                        ui.label(
+                            RichText::new("The output file may be incomplete.")
+                                .size(13.0)
+                                .color(theme::TEXT_MUTED),
+                        );
                         ui.add_space(20.0);
                         ui.separator();
                         ui.add_space(14.0);
@@ -3953,7 +4296,7 @@ impl ClipperApp {
 
         if open_folder {
             if let Some(parent) = progress.destination.parent() {
-                let _ = Command::new("xdg-open").arg(parent).spawn();
+                let _ = crate::platform::command("xdg-open").arg(parent).spawn();
             }
         }
 
@@ -4044,23 +4387,54 @@ fn paint_mpv(
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(my_fbo.fbo()));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, dst_fbo);
         gl.blit_framebuffer(
-            0, 0, vp_w, vp_h,
-            vp_x, vp_y, vp_x + vp_w, vp_y + vp_h,
+            0,
+            0,
+            vp_w,
+            vp_h,
+            vp_x,
+            vp_y,
+            vp_x + vp_w,
+            vp_y + vp_h,
             glow::COLOR_BUFFER_BIT,
             glow::LINEAR,
         );
 
         // Restore for egui's next draws.
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, video_fbo::fbo_from_raw(prev_read_fbo));
+        gl.bind_framebuffer(
+            glow::READ_FRAMEBUFFER,
+            video_fbo::fbo_from_raw(prev_read_fbo),
+        );
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, dst_fbo);
-        gl.viewport(prev_viewport[0], prev_viewport[1],
-                    prev_viewport[2], prev_viewport[3]);
-        gl.scissor(prev_scissor[0], prev_scissor[1],
-                   prev_scissor[2], prev_scissor[3]);
-        if prev_scissor_enabled { gl.enable(glow::SCISSOR_TEST); }
-        if prev_blend_enabled   { gl.enable(glow::BLEND); }       else { gl.disable(glow::BLEND); }
-        if prev_depth_enabled   { gl.enable(glow::DEPTH_TEST); }  else { gl.disable(glow::DEPTH_TEST); }
-        if prev_cull_enabled    { gl.enable(glow::CULL_FACE); }   else { gl.disable(glow::CULL_FACE); }
+        gl.viewport(
+            prev_viewport[0],
+            prev_viewport[1],
+            prev_viewport[2],
+            prev_viewport[3],
+        );
+        gl.scissor(
+            prev_scissor[0],
+            prev_scissor[1],
+            prev_scissor[2],
+            prev_scissor[3],
+        );
+        if prev_scissor_enabled {
+            gl.enable(glow::SCISSOR_TEST);
+        }
+        if prev_blend_enabled {
+            gl.enable(glow::BLEND);
+        } else {
+            gl.disable(glow::BLEND);
+        }
+        if prev_depth_enabled {
+            gl.enable(glow::DEPTH_TEST);
+        } else {
+            gl.disable(glow::DEPTH_TEST);
+        }
+        if prev_cull_enabled {
+            gl.enable(glow::CULL_FACE);
+        } else {
+            gl.disable(glow::CULL_FACE);
+        }
         gl.active_texture(prev_active_tex as u32);
     }
 }
@@ -4105,13 +4479,21 @@ fn build_audio_chain(p: &Project) -> Option<String> {
         p.tracks
             .iter()
             .filter(|t| t.kind == TrackKind::Audio && !t.muted)
-            .filter_map(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, effective_gain(t))))
+            .filter_map(|t| {
+                t.source_audio_index
+                    .filter(stream_exists)
+                    .map(|idx| (idx, effective_gain(t)))
+            })
             .collect()
     } else {
         p.tracks
             .iter()
             .find(|t| t.kind == TrackKind::Audio && !t.muted)
-            .and_then(|t| t.source_audio_index.filter(stream_exists).map(|idx| (idx, effective_gain(t))))
+            .and_then(|t| {
+                t.source_audio_index
+                    .filter(stream_exists)
+                    .map(|idx| (idx, effective_gain(t)))
+            })
             .into_iter()
             .collect()
     };
@@ -4197,57 +4579,66 @@ fn find_snap_target(
 }
 
 /// Shared ordering for exported ranges and their segment captions.
+#[cfg(test)]
 fn sorted_track_clips(clips: &[Clip], track_id: TrackId) -> Vec<&Clip> {
     let mut out: Vec<&Clip> = clips.iter().filter(|c| c.track_id == track_id).collect();
     out.sort_by_key(|c| c.cut_start_ms);
     out
 }
 
-/// Pull every clip on `track_id` in cut-start order and project it into
-/// the export-layer's `ClipRange` shape.
-fn collect_track_clips(clips: &[Clip], track_id: TrackId) -> Vec<ClipRange> {
-    sorted_track_clips(clips, track_id).into_iter()
-        .map(|c| ClipRange {
-            cut_start_ms: c.cut_start_ms,
-            src_start_ms: c.src_start_ms,
-            src_end_ms: c.src_end_ms,
-            gain: c.gain,
-            speed: c.speed,
-        })
-        .collect()
-}
-
 fn format_bytes(b: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
-    if b >= GB { format!("{:.2} GB", b as f64 / GB as f64) }
-    else if b >= MB { format!("{:.1} MB", b as f64 / MB as f64) }
-    else if b >= KB { format!("{:.1} KB", b as f64 / KB as f64) }
-    else { format!("{b} B") }
+    if b >= GB {
+        format!("{:.2} GB", b as f64 / GB as f64)
+    } else if b >= MB {
+        format!("{:.1} MB", b as f64 / MB as f64)
+    } else if b >= KB {
+        format!("{:.1} KB", b as f64 / KB as f64)
+    } else {
+        format!("{b} B")
+    }
 }
 
 fn show_simpleclip_info(ui: &mut egui::Ui, project: &Project) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("In").color(theme::ACCENT_IN).small().strong());
-        ui.label(RichText::new(match project.in_ms {
-            Some(ms) => media::format_timestamp(ms),
-            None => "—".into(),
-        }).monospace().color(theme::TEXT_PRIMARY));
+        ui.label(
+            RichText::new(match project.in_ms {
+                Some(ms) => media::format_timestamp(ms),
+                None => "—".into(),
+            })
+            .monospace()
+            .color(theme::TEXT_PRIMARY),
+        );
 
         ui.add_space(10.0);
-        ui.label(RichText::new("Out").color(theme::ACCENT_OUT).small().strong());
-        ui.label(RichText::new(match project.out_ms {
-            Some(ms) => media::format_timestamp(ms),
-            None => "—".into(),
-        }).monospace().color(theme::TEXT_PRIMARY));
+        ui.label(
+            RichText::new("Out")
+                .color(theme::ACCENT_OUT)
+                .small()
+                .strong(),
+        );
+        ui.label(
+            RichText::new(match project.out_ms {
+                Some(ms) => media::format_timestamp(ms),
+                None => "—".into(),
+            })
+            .monospace()
+            .color(theme::TEXT_PRIMARY),
+        );
 
         if let (Some(i), Some(o)) = (project.in_ms, project.out_ms) {
             ui.add_space(10.0);
             let dur = (i.max(o) - i.min(o)).max(0);
             ui.label(RichText::new("Selection").color(theme::TEXT_MUTED).small());
-            ui.label(RichText::new(media::format_timestamp(dur))
-                .monospace().strong().color(theme::ACCENT));
+            ui.label(
+                RichText::new(media::format_timestamp(dur))
+                    .monospace()
+                    .strong()
+                    .color(theme::ACCENT),
+            );
         }
     });
 }
@@ -4289,20 +4680,28 @@ fn show_multitrack_info(ui: &mut egui::Ui, project: &Project, cut_duration: i64)
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Playhead").color(theme::TEXT_MUTED).small());
-        ui.label(RichText::new(media::format_timestamp(project.playhead_ms))
-            .monospace().strong().color(theme::TEXT_PRIMARY));
-        ui.label(RichText::new(format!(
-            "/ {}",
-            media::format_timestamp(cut_duration)
-        )).monospace().color(theme::TEXT_MUTED));
+        ui.label(
+            RichText::new(media::format_timestamp(project.playhead_ms))
+                .monospace()
+                .strong()
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.label(
+            RichText::new(format!("/ {}", media::format_timestamp(cut_duration)))
+                .monospace()
+                .color(theme::TEXT_MUTED),
+        );
 
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(8.0);
 
         ui.label(RichText::new("V1 clips").color(theme::TEXT_MUTED).small());
-        ui.label(RichText::new(format!("{video_clip_count}"))
-            .monospace().color(theme::TEXT_PRIMARY));
+        ui.label(
+            RichText::new(format!("{video_clip_count}"))
+                .monospace()
+                .color(theme::TEXT_PRIMARY),
+        );
     });
 }
 
@@ -4345,17 +4744,16 @@ fn painted_button(
     _strong: bool,
 ) -> egui::Response {
     let font_id = egui::FontId::new(font_size, egui::FontFamily::Proportional);
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        font_id.clone(),
-        text_normal,
-    );
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font_id.clone(), text_normal);
     let pad_x = 18.0;
-    let desired = egui::vec2(
-        (galley.size().x + pad_x * 2.0).max(min.x),
-        min.y,
-    );
-    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let desired = egui::vec2((galley.size().x + pad_x * 2.0).max(min.x), min.y);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(desired, sense);
 
     let (fill, text_color) = if !enabled {
@@ -4404,12 +4802,7 @@ fn secondary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Resp
 /// Split/Delete actions where the color carries meaning (green = Set In,
 /// red = delete, etc). Stays on the muted grey fill so the row reads as
 /// a uniform action strip, not a row of confetti.
-fn accent_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    accent: Color32,
-    enabled: bool,
-) -> egui::Response {
+fn accent_button(ui: &mut egui::Ui, label: &str, accent: Color32, enabled: bool) -> egui::Response {
     painted_button(
         ui,
         label,
@@ -4426,21 +4819,18 @@ fn accent_button(
 
 /// Pill-shaped tab for the mode toggle. Selected → primary fill + light
 /// text. Unselected → transparent fill + muted text with hover tint.
-fn pill_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    selected: bool,
-    enabled: bool,
-) -> egui::Response {
+fn pill_button(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) -> egui::Response {
     let font_id = egui::FontId::new(13.0, egui::FontFamily::Proportional);
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        font_id.clone(),
-        theme::TEXT_PRIMARY,
-    );
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_string(), font_id.clone(), theme::TEXT_PRIMARY);
     let pad_x = 22.0;
     let size = egui::vec2((galley.size().x + pad_x * 2.0).max(100.0), 30.0);
-    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(size, sense);
 
     let hovered = enabled && response.hovered();
@@ -4527,10 +4917,7 @@ fn paint_progress_bar(ui: &mut egui::Ui, fraction: f32, indeterminate: bool) {
     } else {
         let fill_w = rect.width() * fraction.clamp(0.0, 1.0);
         if fill_w > 0.5 {
-            let fill_rect = egui::Rect::from_min_size(
-                rect.min,
-                egui::vec2(fill_w, height),
-            );
+            let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, height));
             ui.painter()
                 .rect_filled(fill_rect, rounding, theme::BTN_PRIMARY);
         }
@@ -4543,11 +4930,9 @@ fn paint_progress_bar(ui: &mut egui::Ui, fraction: f32, indeterminate: bool) {
 /// buttons that brighten on hover.
 fn speed_preset_chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let font_id = egui::FontId::new(12.5, egui::FontFamily::Proportional);
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        font_id.clone(),
-        theme::TEXT_PRIMARY,
-    );
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_string(), font_id.clone(), theme::TEXT_PRIMARY);
     let size = egui::vec2((galley.size().x + 18.0).max(44.0), 26.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
 
@@ -4593,21 +4978,33 @@ fn stat_grid_row(ui: &mut egui::Ui, k1: &str, v1: &str, k2: &str, v2: &str) {
     ui.end_row();
 }
 
-
 #[cfg(test)]
 mod caption_tests {
     use super::*;
 
     fn project() -> Project {
         let mut p = Project {
-            source: PathBuf::from("test.mp4"), proxy: None,
+            source: PathBuf::from("test.mp4"),
+            proxy: None,
             media: MediaInfo {
-                duration_ms: 6_000, width: 320, height: 180, fps: 30.0,
-                video_codec: "h264".into(), audio_codec: None, audio_stream_count: 0,
+                duration_ms: 6_000,
+                width: 320,
+                height: 180,
+                fps: 30.0,
+                video_codec: "h264".into(),
+                audio_codec: None,
+                audio_stream_count: 0,
             },
-            playhead_ms: 0, in_ms: None, out_ms: None, simple_audio_muted: false,
-            tracks: Vec::new(), clips: Vec::new(), selected_clips: HashSet::new(),
-            text_overlays: HashMap::new(), id_gen: IdGen::default(), mode: EditMode::MultiTrack,
+            playhead_ms: 0,
+            in_ms: None,
+            out_ms: None,
+            simple_audio_muted: false,
+            tracks: Vec::new(),
+            clips: Vec::new(),
+            selected_clips: HashSet::new(),
+            text_overlays: HashMap::new(),
+            id_gen: IdGen::default(),
+            mode: EditMode::MultiTrack,
         };
         p.ensure_tracks_initialized();
         p
@@ -4617,7 +5014,13 @@ mod caption_tests {
     fn split_captions_edit_independently_and_undo_restores_them() {
         let mut p = project();
         let left = p.clips[0].id;
-        p.text_overlays.insert(left, TextOverlay { text: "Before".into(), ..Default::default() });
+        p.text_overlays.insert(
+            left,
+            TextOverlay {
+                text: "Before".into(),
+                ..Default::default()
+            },
+        );
         let before = UndoSnapshot::capture(&p);
         let right = p.split_segments(&[left], 2_000)[0];
         assert_eq!(p.text_overlays[&right].text, "Before");
@@ -4640,10 +5043,30 @@ mod caption_tests {
         let mut p = project();
         let left = p.clips[0].id;
         let right = p.split_segments(&[left], 2_000)[0];
-        p.text_overlays.insert(left, TextOverlay { text: "First".into(), ..Default::default() });
-        p.text_overlays.insert(right, TextOverlay { text: "Second".into(), ..Default::default() });
-        p.clips.iter_mut().find(|c| c.id == left).unwrap().cut_start_ms = 7_000;
-        p.clips.iter_mut().find(|c| c.id == right).unwrap().cut_start_ms = 0;
+        p.text_overlays.insert(
+            left,
+            TextOverlay {
+                text: "First".into(),
+                ..Default::default()
+            },
+        );
+        p.text_overlays.insert(
+            right,
+            TextOverlay {
+                text: "Second".into(),
+                ..Default::default()
+            },
+        );
+        p.clips
+            .iter_mut()
+            .find(|c| c.id == left)
+            .unwrap()
+            .cut_start_ms = 7_000;
+        p.clips
+            .iter_mut()
+            .find(|c| c.id == right)
+            .unwrap()
+            .cut_start_ms = 0;
         let captions = p.video_captions(p.first_video_track().unwrap());
         assert_eq!(captions[0].as_ref().unwrap().text, "Second");
         assert_eq!(captions[1].as_ref().unwrap().text, "First");

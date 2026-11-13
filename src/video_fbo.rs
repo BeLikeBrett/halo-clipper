@@ -24,12 +24,7 @@ impl VideoFbo {
         self.fbo
     }
 
-    pub fn ensure_size(
-        slot: &mut Option<VideoFbo>,
-        gl: &glow::Context,
-        w: i32,
-        h: i32,
-    ) {
+    pub fn ensure_size(slot: &mut Option<VideoFbo>, gl: &glow::Context, w: i32, h: i32) {
         if w <= 0 || h <= 0 {
             return;
         }
@@ -53,10 +48,26 @@ impl VideoFbo {
                 glow::UNSIGNED_BYTE,
                 None,
             );
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
             gl.bind_texture(glow::TEXTURE_2D, None);
 
             let Ok(fbo) = gl.create_framebuffer() else {

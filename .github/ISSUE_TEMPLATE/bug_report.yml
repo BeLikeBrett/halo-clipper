@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a playback, editing, export, installation, or update issue.
+body:
+  - type: markdown
+    attributes:
+      value: 'In Halo Clipper, open **Help / Updates → Export support report**. Review the file before attaching it below. Reports are public. Please keep private media and personal information out of your report.'
+  - type: input
+    id: version
+    attributes:
+      label: Version and operating system
+      placeholder: '0.7.0, Windows 11 / HaloOS / other Linux distribution'
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include what you expected and what happened. Attach your reviewed support report here.
+    validations:
+      required: true
+  - type: textarea
+    id: media
+    attributes:
+      label: Media and export settings
+      description: Resolution, codec, audio streams, approximate duration, and export preset. Share media only if you want to.

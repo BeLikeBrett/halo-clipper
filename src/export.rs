@@ -76,6 +76,11 @@ pub struct AudioTrackPlan {
 
 #[derive(Clone)]
 pub enum ExportPlan {
+    Layered {
+        composition: crate::composition::Composition,
+        destination: PathBuf,
+        encode: EncodeSettings,
+    },
     Simple {
         source: PathBuf,
         destination: PathBuf,
@@ -88,6 +93,7 @@ pub enum ExportPlan {
         /// When true, the output has no audio stream (ffmpeg `-an`).
         audio_muted: bool,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
     MultiTrack {
         source: PathBuf,
         destination: PathBuf,
@@ -119,12 +125,15 @@ pub enum ExportPlan {
 impl ExportPlan {
     pub fn destination(&self) -> &Path {
         match self {
-            Self::Simple { destination, .. } | Self::MultiTrack { destination, .. } => destination,
+            Self::Simple { destination, .. }
+            | Self::MultiTrack { destination, .. }
+            | Self::Layered { destination, .. } => destination,
         }
     }
 
     pub fn total_output_ms(&self) -> i64 {
         match self {
+            Self::Layered { composition, .. } => composition.duration_ms,
             Self::Simple {
                 src_start_ms,
                 src_end_ms,
@@ -143,6 +152,7 @@ impl ExportPlan {
 
     pub fn mode_label(&self) -> &'static str {
         match self {
+            Self::Layered { .. } => "layered composition",
             Self::Simple {
                 encode: EncodeMode::Encode(_),
                 ..
@@ -228,6 +238,7 @@ impl ExportHandle {
 
 pub fn spawn(plan: ExportPlan) -> Result<ExportHandle> {
     let total_ms = plan.total_output_ms();
+    log::info!("{} job started; timeline={}ms", plan.mode_label(), total_ms);
     if total_ms <= 0 {
         anyhow::bail!("Nothing to export — output would be empty.");
     }
@@ -267,6 +278,13 @@ fn run_plan(
     child_slot: Arc<Mutex<Option<Child>>>,
 ) {
     let res = match &plan {
+        ExportPlan::Layered {
+            composition,
+            destination,
+            encode,
+        } => composition
+            .command(destination, encode)
+            .and_then(|cmd| run_ffmpeg_with_progress(cmd, &progress, &cancel_flag, &child_slot)),
         ExportPlan::Simple {
             source,
             destination,
@@ -316,22 +334,27 @@ fn run_plan(
     finalize(&progress, &cancel_flag, res);
 }
 
-fn finalize(
-    progress: &Arc<Mutex<ExportProgress>>,
-    cancel_flag: &Arc<AtomicBool>,
-    res: Result<()>,
-) {
+fn finalize(progress: &Arc<Mutex<ExportProgress>>, cancel_flag: &Arc<AtomicBool>, res: Result<()>) {
     let mut p = progress.lock().unwrap();
     p.finished_at = Some(Instant::now());
     if cancel_flag.load(Ordering::SeqCst) {
+        log::info!("{} job cancelled", p.mode_label);
         p.phase = ExportPhase::Cancelled;
     } else {
         match res {
             Ok(()) => {
+                log::info!(
+                    "{} job completed in {:.2}s",
+                    p.mode_label,
+                    p.started.elapsed().as_secs_f64()
+                );
                 p.phase = ExportPhase::Done;
                 p.current_ms = p.total_ms;
             }
-            Err(e) => p.phase = ExportPhase::Failed(format!("{e:#}")),
+            Err(e) => {
+                log::error!("{} job failed: {e:#}", p.mode_label);
+                p.phase = ExportPhase::Failed(format!("{e:#}"));
+            }
         }
     }
 }
@@ -365,7 +388,7 @@ fn run_simple(
         _ => HwDecode::None,
     };
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::platform::command("ffmpeg");
     cmd.arg("-hide_banner")
         .args(["-loglevel", "error", "-y"])
         .args(["-progress", "pipe:1", "-nostats"]);
@@ -389,14 +412,18 @@ fn run_simple(
     // so subsequent filters and the encoder all see GPU frames.
     if matches!(hw_decode, HwDecode::Vaapi) {
         cmd.args([
-            "-hwaccel", "vaapi",
-            "-hwaccel_output_format", "vaapi",
-            "-hwaccel_device", "vahw",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_output_format",
+            "vaapi",
+            "-hwaccel_device",
+            "vahw",
         ]);
     }
 
     cmd.args(["-ss", &format!("{start:.3}")])
-        .arg("-i").arg(source)
+        .arg("-i")
+        .arg(source)
         .args(["-t", &format!("{duration:.3}")]);
 
     match encode {
@@ -443,14 +470,14 @@ fn run_simple(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    log::info!("ffmpeg (simple): {cmd:?}");
+    log::info!("simple export started");
 
     run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot)
 }
 
 /// Resolves the VAAPI render-node device. Hardcoded for now —
 /// /dev/dri/renderD128 is the default on every distro I've seen.
-fn default_vaapi_device() -> &'static str {
+pub(crate) fn default_vaapi_device() -> &'static str {
     crate::encode::VAAPI_DEVICE
 }
 
@@ -459,7 +486,7 @@ fn default_vaapi_device() -> &'static str {
 /// custom build) refuse to auto-detect when the input filter_complex is
 /// complex enough — the symptom is "Unable to choose an output format".
 /// Passing `-f` removes the ambiguity entirely.
-fn output_format_for(path: &Path) -> Option<&'static str> {
+pub(crate) fn output_format_for(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
         "mp4" | "m4v" => "mp4",
@@ -585,12 +612,20 @@ fn run_multitrack(
     // it — everything after the first gap plays desynced.
     let (src_w, src_h) = src_dims;
     let (out_w, out_h) = encode.resolution.unwrap_or((src_w, src_h));
-    let px_scale = if src_h > 0 { out_h as f64 / src_h as f64 } else { 1.0 };
+    let px_scale = if src_h > 0 {
+        out_h as f64 / src_h as f64
+    } else {
+        1.0
+    };
     let on_gpu_after_post = encode.video_codec.needs_vaapi_upload();
     let black_gap = |filter: &mut String, idx: usize, dur_ms: i64| -> String {
         // Every segment has already been scaled and handed to the
         // encoder's frame domain before concat. Match both for gaps.
-        let bridge = if on_gpu_after_post { ",format=nv12,hwupload" } else { "" };
+        let bridge = if on_gpu_after_post {
+            ",format=nv12,hwupload"
+        } else {
+            ""
+        };
         filter.push_str(&format!(
             "color=c=black:s={}x{}:r={:.3}:d={:.3}{}[gap{}];\n",
             out_w.max(2),
@@ -609,7 +644,11 @@ fn run_multitrack(
     let mut video_cursor: i64 = 0;
     for (i, c) in video_clips.iter().enumerate() {
         if c.cut_start_ms > video_cursor {
-            video_labels.push(black_gap(&mut filter, gap_idx, c.cut_start_ms - video_cursor));
+            video_labels.push(black_gap(
+                &mut filter,
+                gap_idx,
+                c.cut_start_ms - video_cursor,
+            ));
             gap_idx += 1;
         }
         let speed = c.speed.max(0.01);
@@ -623,14 +662,22 @@ fn run_multitrack(
         // Burn the caption into this segment before joining segments.
         // Scope follows the actual frames, including speed changes and
         // concat's frame rounding, rather than an approximate time gate.
-        let drawtext = video_text_overlays.get(i).and_then(Option::as_ref)
+        let drawtext = video_text_overlays
+            .get(i)
+            .and_then(Option::as_ref)
             .filter(|o| !o.text.trim().is_empty())
             .map(|overlay| build_drawtext(overlay, px_scale));
         let post = build_video_post_chain(
-            hw_decode, encode.resolution, drawtext.as_deref(), on_gpu_after_post,
+            hw_decode,
+            encode.resolution,
+            drawtext.as_deref(),
+            on_gpu_after_post,
         );
-        let post_suffix = if post.is_empty() { String::new() }
-            else { format!(",{}", post.join(",")) };
+        let post_suffix = if post.is_empty() {
+            String::new()
+        } else {
+            format!(",{}", post.join(","))
+        };
         filter.push_str(&format!(
             "[0:v]trim=start={:.3}:end={:.3},{}{}[v{}];\n",
             (c.src_start_ms - seek_ms) as f64 / 1000.0,
@@ -736,12 +783,12 @@ fn run_multitrack(
         }
     }
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::platform::command("ffmpeg");
     cmd.arg("-hide_banner")
         .args(["-loglevel", "error", "-y"])
         .args(["-progress", "pipe:1", "-nostats"]);
-    let needs_vaapi_device = matches!(hw_decode, HwDecode::Vaapi)
-        || encode.video_codec.needs_vaapi_upload();
+    let needs_vaapi_device =
+        matches!(hw_decode, HwDecode::Vaapi) || encode.video_codec.needs_vaapi_upload();
     if needs_vaapi_device {
         // -init_hw_device binds the VAAPI device to a named handle that
         // -filter_hw_device then hands to filter_complex's hwupload step.
@@ -759,9 +806,12 @@ fn run_multitrack(
     // see GPU frames — no per-frame CPU→GPU upload required.
     if matches!(hw_decode, HwDecode::Vaapi) {
         cmd.args([
-            "-hwaccel", "vaapi",
-            "-hwaccel_output_format", "vaapi",
-            "-hwaccel_device", "vahw",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_output_format",
+            "vaapi",
+            "-hwaccel_device",
+            "vahw",
         ]);
     }
     // Input-side seek: must precede `-i`. Accurate-seeks to the keyframe
@@ -770,7 +820,8 @@ fn run_multitrack(
     if seek_ms > 0 {
         cmd.args(["-ss", &format!("{:.3}", seek_ms as f64 / 1000.0)]);
     }
-    cmd.arg("-i").arg(source)
+    cmd.arg("-i")
+        .arg(source)
         .args(["-filter_complex", filter.trim_end()])
         .args(["-map", "[vout]"]);
     if want_audio {
@@ -797,7 +848,7 @@ fn run_multitrack(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    log::info!("ffmpeg (multitrack): {cmd:?}");
+    log::info!("multitrack export started");
 
     run_ffmpeg_with_progress(cmd, progress, cancel_flag, child_slot)
 }
@@ -805,11 +856,8 @@ fn run_multitrack(
 /// Extra muxer flags a (codec, container) pair needs. Opus-in-MP4 is
 /// still gated behind `-strict -2` in ffmpeg's MP4 muxer even though
 /// playback support is widespread.
-fn audio_container_args(encode: &EncodeSettings, destination: &Path) -> Vec<String> {
-    let is_mp4_family = matches!(
-        output_format_for(destination),
-        Some("mp4") | Some("mov")
-    );
+pub(crate) fn audio_container_args(encode: &EncodeSettings, destination: &Path) -> Vec<String> {
+    let is_mp4_family = matches!(output_format_for(destination), Some("mp4") | Some("mov"));
     if encode.audio_codec == crate::encode::AudioCodec::Opus && is_mp4_family {
         vec!["-strict".into(), "-2".into()]
     } else {
@@ -822,17 +870,31 @@ fn audio_container_args(encode: &EncodeSettings, destination: &Path) -> Vec<Stri
 /// offset) into output pixels — drawtext runs after the scale step, so
 /// a 4K-source caption exported at 1080p must halve its pixel sizes to
 /// keep the same on-screen proportion the preview showed.
-fn build_drawtext(overlay: &crate::track::TextOverlay, px_scale: f64) -> String {
+pub(crate) fn build_drawtext(overlay: &crate::track::TextOverlay, px_scale: f64) -> String {
     let safe = drawtext_escape(&overlay.text);
     let color_hex = ((overlay.color[0] as u32) << 16)
         | ((overlay.color[1] as u32) << 8)
         | (overlay.color[2] as u32);
-    let font_spec = crate::track::font_choice(&overlay.font).fontconfig;
+    #[cfg(not(windows))]
+    let font_spec = format!(
+        "font='{}'",
+        crate::track::font_choice(&overlay.font).fontconfig
+    );
+    #[cfg(windows)]
+    let font_spec = format!(
+        "fontfile='{}'",
+        drawtext_escape(
+            &crate::platform::caption_font(&overlay.font)
+                .to_string_lossy()
+                .replace('\\', "/")
+        )
+    );
+
     let opacity = overlay.opacity.clamp(0.1, 1.0);
     let scale_px = |px: u32| ((px as f64 * px_scale).round() as u32).max(1);
 
     let mut expr = format!(
-        "drawtext=text='{}':font='{}':x='w*{:.3}-text_w/2':\
+        "drawtext=expansion=none:text='{}':{}:x='w*{:.3}-text_w/2':\
          y='h*{:.3}-text_h/2':fontsize={}:fontcolor=#{:06X}@{:.2}",
         safe,
         font_spec,
@@ -869,18 +931,35 @@ fn run_ffmpeg_with_progress(
     cancel_flag: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
-    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("ffmpeg spawn: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("ffmpeg spawn: {e}"))?;
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     *child_slot.lock().unwrap() = Some(child);
+    if cancel_flag.load(Ordering::SeqCst) {
+        if let Some(c) = child_slot.lock().unwrap().as_mut() {
+            let _ = c.kill();
+        }
+    }
 
     let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let stderr_buf_clone = stderr_buf.clone();
     let stderr_thread = thread::spawn(move || {
-        let mut s = String::new();
-        let mut reader = stderr;
-        let _ = reader.read_to_string(&mut s);
-        *stderr_buf_clone.lock().unwrap() = s;
+        let mut reader = BufReader::new(stderr);
+        let mut tail = std::collections::VecDeque::with_capacity(65536);
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            tail.extend(&chunk[..n]);
+            while tail.len() > 65536 {
+                tail.pop_front();
+            }
+        }
+        *stderr_buf_clone.lock().unwrap() =
+            String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned();
     });
 
     let reader = BufReader::new(stdout);
@@ -889,7 +968,9 @@ fn run_ffmpeg_with_progress(
             break;
         }
         let Ok(line) = line_res else { continue };
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let mut p = progress.lock().unwrap();
         match key {
             // Both keys are microseconds — out_time_ms is a long-standing
@@ -1013,7 +1094,7 @@ pub(crate) fn drawtext_escape(s: &str) -> String {
 /// Build an `atempo` filter expression that handles speeds outside
 /// ffmpeg's 0.5–2.0 per-stage range. Doubles or halves repeatedly until
 /// the residual factor lands in-range, then emits the final atempo.
-fn atempo_chain(speed: f32) -> String {
+pub(crate) fn atempo_chain(speed: f32) -> String {
     let mut s = speed.max(0.01);
     let mut parts: Vec<String> = Vec::new();
     while s < 0.5 {
@@ -1029,7 +1110,10 @@ fn atempo_chain(speed: f32) -> String {
 }
 
 pub fn suggest_output(source: &Path) -> PathBuf {
-    let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clip");
     let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}_clip.{ext}"))
@@ -1097,12 +1181,7 @@ mod tests {
     fn hw_decode_with_drawtext_bridges_to_cpu_then_back() {
         // GPU frames in, drawtext is CPU-only, encoder wants GPU again:
         // expect hwdownload → drawtext → hwupload sandwich.
-        let parts = build_video_post_chain(
-            HwDecode::Vaapi,
-            None,
-            Some("drawtext=text='hi'"),
-            true,
-        );
+        let parts = build_video_post_chain(HwDecode::Vaapi, None, Some("drawtext=text='hi'"), true);
         assert_eq!(
             parts,
             vec![
@@ -1119,12 +1198,7 @@ mod tests {
     #[test]
     fn sw_decode_with_drawtext_no_bridges_needed() {
         // CPU frames throughout — no hwdownload/hwupload, just drawtext.
-        let parts = build_video_post_chain(
-            HwDecode::None,
-            None,
-            Some("drawtext=text='hi'"),
-            false,
-        );
+        let parts = build_video_post_chain(HwDecode::None, None, Some("drawtext=text='hi'"), false);
         assert_eq!(parts, vec!["drawtext=text='hi'"]);
     }
 
@@ -1388,7 +1462,11 @@ mod tests {
             crate::encode::VideoCodec::QsvH264,
             crate::encode::VideoCodec::AmfH264,
         ] {
-            assert_eq!(c.hw_decode(), HwDecode::None, "{c:?} should stay on SW decode");
+            assert_eq!(
+                c.hw_decode(),
+                HwDecode::None,
+                "{c:?} should stay on SW decode"
+            );
         }
     }
 
@@ -1401,11 +1479,10 @@ mod tests {
     // typos, surface-type mismatches, bad option/codec pairings).
 
     use crate::encode::{AudioCodec, EncodeQuality, VideoCodec};
-    use std::process::Command;
     use std::time::Duration as StdDuration;
 
     fn test_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join("halo-clipper-tests");
+        let dir = std::env::temp_dir().join(format!("halo-clipper-tests-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1414,15 +1491,26 @@ mod tests {
     /// once, shared by every test (guarded by the .done marker because
     /// tests run in parallel).
     fn synth_source(with_audio: bool) -> PathBuf {
-        let name = if with_audio { "src_av.mp4" } else { "src_v.mp4" };
+        static GENERATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = GENERATE.lock().unwrap();
+        let name = if with_audio {
+            "src_av.mp4"
+        } else {
+            "src_v.mp4"
+        };
         let path = test_dir().join(name);
         let done = test_dir().join(format!("{name}.done"));
         if done.exists() {
             return path;
         }
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::platform::command("ffmpeg");
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
-            .args(["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=10"]);
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1280x720:rate=30:duration=10",
+            ]);
         if with_audio {
             cmd.args(["-f", "lavfi", "-i", "sine=frequency=440:duration=10"])
                 .args(["-c:a", "aac", "-b:a", "96k"]);
@@ -1453,7 +1541,7 @@ mod tests {
 
     /// (duration_secs, codec_name) of the named stream, via ffprobe.
     fn probe_stream(path: &Path, selector: &str) -> Option<(f64, String)> {
-        let out = Command::new("ffprobe")
+        let out = crate::platform::command("ffprobe")
             .args(["-v", "error", "-select_streams", selector])
             .args(["-show_entries", "stream=codec_name,duration"])
             .args(["-of", "csv=p=0"])
@@ -1488,44 +1576,89 @@ mod tests {
     #[test]
     fn e2e_segment_captions_stay_on_their_own_segments() {
         let source = test_dir().join("caption_black.mp4");
-        let status = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-                "color=black:size=320x180:rate=30:duration=7", "-c:v", "libx264",
-                "-preset", "ultrafast"])
-            .arg(&source).status().unwrap();
+        let status = crate::platform::command("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=320x180:rate=30:duration=7",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
         assert!(status.success());
         let dest = test_dir().join("caption_segments.mp4");
-        let caption = |text: &str, x| Some(crate::track::TextOverlay {
-            text: text.into(), x, y: 0.5, font_size_px: 32, ..Default::default()
-        });
+        let caption = |text: &str, x| {
+            Some(crate::track::TextOverlay {
+                text: text.into(),
+                x,
+                y: 0.5,
+                font_size_px: 32,
+                ..Default::default()
+            })
+        };
         let plan = ExportPlan::MultiTrack {
-            source, destination: dest.clone(), source_codec: "h264".into(),
-            src_width: 320, src_height: 180, src_fps: 30.0,
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_width: 320,
+            src_height: 180,
+            src_fps: 30.0,
             video_clips: vec![
-                placed_clip(0, 1_000, 3_000, 2.0),  // 0..1 output
+                placed_clip(0, 1_000, 3_000, 2.0),     // 0..1 output
                 placed_clip(2_000, 3_000, 4_000, 1.0), // 1..2 output, adjacent
                 placed_clip(4_000, 4_000, 5_000, 1.0), // gap 2..3, uncaptioned 3..4
             ],
             video_text_overlays: vec![caption("LEFT", 0.25), caption("RIGHT", 0.75), None],
-            audio_tracks: Vec::new(), encode: base_encode(VideoCodec::X264),
+            audio_tracks: Vec::new(),
+            encode: base_encode(VideoCodec::X264),
         };
         let progress = run_to_completion(plan);
-        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "{:?}",
+            progress.phase
+        );
         let (duration, _) = probe_stream(&dest, "v:0").unwrap();
         assert!((duration - 4.0).abs() < 0.1, "duration {duration}");
         for (time, left_expected, right_expected) in [
-            (0.5, true, false), (0.967, true, false), (1.034, false, true), (1.5, false, true),
-            (2.5, false, false), (3.5, false, false),
+            (0.5, true, false),
+            (0.967, true, false),
+            (1.034, false, true),
+            (1.5, false, true),
+            (2.5, false, false),
+            (3.5, false, false),
         ] {
-            let out = Command::new("ffmpeg")
-                .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{time:.3}"), "-i"])
+            let out = crate::platform::command("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    &format!("{time:.3}"),
+                    "-i",
+                ])
                 .arg(&dest)
                 .args(["-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-"])
-                .output().unwrap();
+                .output()
+                .unwrap();
             assert!(out.status.success());
             assert_eq!(out.stdout.len(), 320 * 180);
-            let whites = |left: bool| out.stdout.iter().enumerate()
-                .filter(|(i, px)| (**px > 180) && ((*i % 320 < 160) == left)).count();
+            let whites = |left: bool| {
+                out.stdout
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, px)| (**px > 180) && ((*i % 320 < 160) == left))
+                    .count()
+            };
             assert_eq!(whites(true) > 100, left_expected, "left at {time}");
             assert_eq!(whites(false) > 100, right_expected, "right at {time}");
         }
@@ -1577,14 +1710,27 @@ mod tests {
         );
         let (vdur, _) = probe_stream(&dest, "v:0").expect("no video stream");
         let (adur, _) = probe_stream(&dest, "a:0").expect("no audio stream");
-        assert!((vdur - 8.0).abs() < 0.3, "video duration {vdur}, expected ~8s");
-        assert!((adur - 8.0).abs() < 0.3, "audio duration {adur}, expected ~8s");
+        assert!(
+            (vdur - 8.0).abs() < 0.3,
+            "video duration {vdur}, expected ~8s"
+        );
+        assert!(
+            (adur - 8.0).abs() < 0.3,
+            "audio duration {adur}, expected ~8s"
+        );
 
         // The gap (3s..5s on the output) must actually be black.
-        let out = Command::new("ffmpeg")
+        let out = crate::platform::command("ffmpeg")
             .args(["-hide_banner", "-i"])
             .arg(&dest)
-            .args(["-vf", "blackdetect=d=1.5:pix_th=0.10", "-an", "-f", "null", "-"])
+            .args([
+                "-vf",
+                "blackdetect=d=1.5:pix_th=0.10",
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1598,7 +1744,10 @@ mod tests {
             .and_then(|s| s.split_whitespace().next())
             .and_then(|s| s.parse().ok())
             .unwrap();
-        assert!((start - 3.0).abs() < 0.4, "black gap starts at {start}, expected ~3s");
+        assert!(
+            (start - 3.0).abs() < 0.4,
+            "black gap starts at {start}, expected ~3s"
+        );
     }
 
     #[test]
@@ -1625,12 +1774,25 @@ mod tests {
             encode: base_encode(VideoCodec::X264),
         };
         let progress = run_to_completion(plan);
-        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
-        assert_eq!(progress.total_ms, 2_000, "progress total should be speed-aware");
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "{:?}",
+            progress.phase
+        );
+        assert_eq!(
+            progress.total_ms, 2_000,
+            "progress total should be speed-aware"
+        );
         let (vdur, _) = probe_stream(&dest, "v:0").unwrap();
         let (adur, _) = probe_stream(&dest, "a:0").unwrap();
-        assert!((vdur - 2.0).abs() < 0.3, "video duration {vdur}, expected ~2s");
-        assert!((adur - 2.0).abs() < 0.3, "audio duration {adur}, expected ~2s");
+        assert!(
+            (vdur - 2.0).abs() < 0.3,
+            "video duration {vdur}, expected ~2s"
+        );
+        assert!(
+            (adur - 2.0).abs() < 0.3,
+            "audio duration {adur}, expected ~2s"
+        );
     }
 
     #[test]
@@ -1652,10 +1814,17 @@ mod tests {
             encode: base_encode(VideoCodec::X264),
         };
         let progress = run_to_completion(plan);
-        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "{:?}",
+            progress.phase
+        );
         let (vdur, _) = probe_stream(&dest, "v:0").unwrap();
         assert!((vdur - 3.0).abs() < 0.3);
-        assert!(probe_stream(&dest, "a:0").is_none(), "expected no audio stream");
+        assert!(
+            probe_stream(&dest, "a:0").is_none(),
+            "expected no audio stream"
+        );
     }
 
     #[test]
@@ -1674,7 +1843,11 @@ mod tests {
             audio_muted: false,
         };
         let progress = run_to_completion(plan);
-        assert!(matches!(progress.phase, ExportPhase::Done), "{:?}", progress.phase);
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "{:?}",
+            progress.phase
+        );
         let (_, acodec) = probe_stream(&dest, "a:0").expect("no audio stream");
         assert_eq!(acodec, "opus");
     }
@@ -1685,13 +1858,11 @@ mod tests {
         // whole path — plan → bitrate args → mp4 mux — gets exercised for
         // real. Uses whichever AV1 encoder this machine actually has;
         // skips (passes) when it has none.
-        let available = crate::encode::verify_av1_encoders(
-            crate::encode::detect_available_codecs(),
-        );
-        let Some(codec) = crate::encode::DiscordNitro::best_av1(
-            crate::encode::detect_gpu(),
-            &available,
-        ) else {
+        let available =
+            crate::encode::verify_av1_encoders(crate::encode::detect_available_codecs());
+        let Some(codec) =
+            crate::encode::DiscordNitro::best_av1(crate::encode::detect_gpu(), &available)
+        else {
             eprintln!("skipping: no usable AV1 encoder on this machine");
             return;
         };
@@ -1733,9 +1904,15 @@ mod tests {
         );
         let (vdur, vcodec) = probe_stream(&dest, "v:0").unwrap();
         assert_eq!(vcodec, "av1");
-        assert!((vdur - 3.0).abs() < 0.3, "video duration {vdur}, expected ~3s");
+        assert!(
+            (vdur - 3.0).abs() < 0.3,
+            "video duration {vdur}, expected ~3s"
+        );
         let (adur, _) = probe_stream(&dest, "a:0").unwrap();
-        assert!((adur - 3.0).abs() < 0.3, "audio duration {adur}, expected ~3s");
+        assert!(
+            (adur - 3.0).abs() < 0.3,
+            "audio duration {adur}, expected ~3s"
+        );
     }
 
     #[test]
@@ -1744,8 +1921,7 @@ mod tests {
         // hwdownload/drawtext/hwupload → concat with black GPU gaps →
         // h264_vaapi CQP encode. Skips (passes) on machines without a
         // VAAPI-capable ffmpeg + render node.
-        let have_vaapi = crate::encode::detect_available_codecs()
-            .contains(&VideoCodec::VaapiH264)
+        let have_vaapi = crate::encode::detect_available_codecs().contains(&VideoCodec::VaapiH264)
             && Path::new("/dev/dri/renderD128").exists();
         if !have_vaapi {
             eprintln!("skipping: no VAAPI encoder/render node on this machine");
@@ -1790,8 +1966,14 @@ mod tests {
         );
         let (vdur, vcodec) = probe_stream(&dest, "v:0").unwrap();
         assert_eq!(vcodec, "h264");
-        assert!((vdur - 6.0).abs() < 0.3, "video duration {vdur}, expected ~6s");
+        assert!(
+            (vdur - 6.0).abs() < 0.3,
+            "video duration {vdur}, expected ~6s"
+        );
         let (adur, _) = probe_stream(&dest, "a:0").unwrap();
-        assert!((adur - 6.0).abs() < 0.3, "audio duration {adur}, expected ~6s");
+        assert!(
+            (adur - 6.0).abs() < 0.3,
+            "audio duration {adur}, expected ~6s"
+        );
     }
 }

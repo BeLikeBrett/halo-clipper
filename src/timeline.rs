@@ -91,11 +91,7 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
         ),
         egui::vec2(mute_size, mute_size),
     );
-    let mute_resp = ui.interact(
-        mute_rect,
-        egui::Id::new("simple_v1_mute"),
-        Sense::click(),
-    );
+    let mute_resp = ui.interact(mute_rect, egui::Id::new("simple_v1_mute"), Sense::click());
     let glyph_color = if state.audio_muted {
         theme::ACCENT_ERR
     } else if mute_resp.hovered() {
@@ -146,10 +142,8 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
     if let (Some(in_ms), Some(out_ms)) = (state.in_ms, state.out_ms) {
         let lo = in_ms.min(out_ms);
         let hi = in_ms.max(out_ms);
-        let x0 = (lane_area_left + (lo as f32 / dur) * lane_area_width)
-            .max(lane_area_left);
-        let x1 = (lane_area_left + (hi as f32 / dur) * lane_area_width)
-            .min(lane_area_right);
+        let x0 = (lane_area_left + (lo as f32 / dur) * lane_area_width).max(lane_area_left);
+        let x1 = (lane_area_left + (hi as f32 / dur) * lane_area_width).min(lane_area_right);
         if x1 > x0 + 1.0 {
             let sel = Rect::from_min_max(
                 egui::pos2(x0, lane_rect.top() + 1.0),
@@ -166,10 +160,24 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
     );
     draw_ticks(&painter, lane_x_rect, LABEL_BAND_H, state.duration_ms);
     if let Some(in_ms) = state.in_ms {
-        draw_handle(&painter, lane_x_rect, in_ms, state.duration_ms, theme::ACCENT_IN, "I");
+        draw_handle(
+            &painter,
+            lane_x_rect,
+            in_ms,
+            state.duration_ms,
+            theme::ACCENT_IN,
+            "I",
+        );
     }
     if let Some(out_ms) = state.out_ms {
-        draw_handle(&painter, lane_x_rect, out_ms, state.duration_ms, theme::ACCENT_OUT, "O");
+        draw_handle(
+            &painter,
+            lane_x_rect,
+            out_ms,
+            state.duration_ms,
+            theme::ACCENT_OUT,
+            "O",
+        );
     }
 
     // Playhead — same thickness + triangle as show_multitrack.
@@ -187,7 +195,11 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
         egui::pos2(ph_x + 8.0, rect.top()),
         egui::pos2(ph_x, rect.top() + 11.0),
     ];
-    painter.add(egui::Shape::convex_polygon(triangle, Color32::WHITE, Stroke::NONE));
+    painter.add(egui::Shape::convex_polygon(
+        triangle,
+        Color32::WHITE,
+        Stroke::NONE,
+    ));
 
     // Bare-lane click/drag scrubs (Simple Clip has no clips to drag).
     if (response.clicked() || response.dragged())
@@ -266,32 +278,7 @@ pub fn show_multitrack(
     // Audio lanes stay hidden while their clips are still linked to the
     // video — the user sees a single combined V+A row. The lane appears
     // as soon as ANY clip on that track has been detached (link cleared).
-    let visible_tracks: Vec<&Track> = state
-        .tracks
-        .iter()
-        .filter(|t| match t.kind {
-            TrackKind::Video => true,
-            TrackKind::Audio => state
-                .clips
-                .iter()
-                .any(|c| c.track_id == t.id && c.link.is_none()),
-        })
-        .collect();
-
-    // Collapsed-audio detection: there's at least one audio track in the
-    // project, and none of them are currently visible. In that state the
-    // V row "owns" the audio, so V1 gets a mute glyph that toggles every
-    // audio track at once.
-    let any_audio_exists = state.tracks.iter().any(|t| t.kind == TrackKind::Audio);
-    let any_audio_visible = visible_tracks
-        .iter()
-        .any(|t| t.kind == TrackKind::Audio);
-    let collapsed_audio_mode = any_audio_exists && !any_audio_visible;
-    let collapsed_all_muted = state
-        .tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Audio)
-        .all(|t| t.muted);
+    let visible_tracks: Vec<&Track> = state.tracks.iter().collect();
 
     let num_tracks = visible_tracks.len().max(1) as f32;
     let height = LANE_H * num_tracks + LANE_GAP * (num_tracks - 1.0).max(0.0) + LABEL_BAND_H + 8.0;
@@ -365,12 +352,12 @@ pub fn show_multitrack(
         //   That click toggles every audio track at once.
         let show_mute_glyph = match track.kind {
             TrackKind::Audio => true,
-            TrackKind::Video => collapsed_audio_mode,
+            TrackKind::Video => true,
         };
         if show_mute_glyph {
             let muted_display = match track.kind {
                 TrackKind::Audio => track.muted,
-                TrackKind::Video => collapsed_all_muted,
+                TrackKind::Video => track.muted,
             };
             let mute_size = 18.0;
             let mute_rect = Rect::from_min_size(
@@ -380,11 +367,8 @@ pub fn show_multitrack(
                 ),
                 egui::vec2(mute_size, mute_size),
             );
-            let mute_resp = ui.interact(
-                mute_rect,
-                egui::Id::new(("mute", track.id)),
-                Sense::click(),
-            );
+            let mute_resp =
+                ui.interact(mute_rect, egui::Id::new(("mute", track.id)), Sense::click());
             let glyph_color = if muted_display {
                 theme::ACCENT_ERR
             } else if mute_resp.hovered() {
@@ -392,7 +376,17 @@ pub fn show_multitrack(
             } else {
                 theme::TEXT_MUTED
             };
-            let mute_text = if muted_display { "🔇" } else { "🔊" };
+            let mute_text = if track.kind == TrackKind::Video {
+                if muted_display {
+                    "○"
+                } else {
+                    "◉"
+                }
+            } else if muted_display {
+                "🔇"
+            } else {
+                "🔊"
+            };
             painter.text(
                 mute_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -403,7 +397,7 @@ pub fn show_multitrack(
             if mute_resp.clicked() {
                 match track.kind {
                     TrackKind::Audio => out.mute_toggled = Some(track.id),
-                    TrackKind::Video => out.linked_audio_mute_toggled = true,
+                    TrackKind::Video => out.mute_toggled = Some(track.id),
                 }
             }
         }
@@ -435,23 +429,21 @@ pub fn show_multitrack(
 
         for (idx, clip) in t_clips.iter().enumerate() {
             let cut_w = state.cut_duration_ms.max(1) as f32;
-            let mut x0 = lane_area_left
-                + (clip.cut_start_ms as f32 / cut_w) * lane_area_width;
-            let mut x1 = lane_area_left
-                + (clip.cut_end_ms() as f32 / cut_w) * lane_area_width;
+            let mut x0 = lane_area_left + (clip.cut_start_ms as f32 / cut_w) * lane_area_width;
+            let mut x1 = lane_area_left + (clip.cut_end_ms() as f32 / cut_w) * lane_area_width;
             // Pull the edge in by half a gap on any side that has an
             // adjacent clip (so the gap visually splits the two).
             if idx > 0 && t_clips[idx - 1].cut_end_ms() == clip.cut_start_ms {
                 x0 += CLIP_GAP * 0.5;
             }
-            if idx + 1 < t_clips.len()
-                && t_clips[idx + 1].cut_start_ms == clip.cut_end_ms()
-            {
+            if idx + 1 < t_clips.len() && t_clips[idx + 1].cut_start_ms == clip.cut_end_ms() {
                 x1 -= CLIP_GAP * 0.5;
             }
             let x0 = x0.max(lane_area_left);
             let x1 = x1.min(lane_area_right);
-            if x1 <= x0 + 1.0 { continue; }
+            if x1 <= x0 + 1.0 {
+                continue;
+            }
 
             let block = Rect::from_min_max(
                 egui::pos2(x0, lane_top + 2.0),
@@ -488,7 +480,10 @@ pub fn show_multitrack(
             );
             if clip_resp.clicked() {
                 let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-                out.clicked_clip = Some(ClickedClip { id: clip.id, additive });
+                out.clicked_clip = Some(ClickedClip {
+                    id: clip.id,
+                    additive,
+                });
             }
             if clip_resp.drag_started() {
                 let cut_per_px = state.cut_duration_ms.max(1) as f32 / lane_area_width;
@@ -516,10 +511,7 @@ pub fn show_multitrack(
     }
 
     // Time ticks (in the label band).
-    let time_rect = Rect::from_min_max(
-        egui::pos2(lane_area_left, rect.top()),
-        rect.right_bottom(),
-    );
+    let time_rect = Rect::from_min_max(egui::pos2(lane_area_left, rect.top()), rect.right_bottom());
     draw_ticks(&painter, time_rect, LABEL_BAND_H, state.cut_duration_ms);
 
     // Playhead — thicker white line + bigger triangle head. The visible
@@ -531,7 +523,10 @@ pub fn show_multitrack(
     let lane_area_top = rect.top() + 4.0;
     let lane_area_bot = rect.bottom() - LABEL_BAND_H;
     painter.line_segment(
-        [egui::pos2(ph_x, lane_area_top), egui::pos2(ph_x, lane_area_bot)],
+        [
+            egui::pos2(ph_x, lane_area_top),
+            egui::pos2(ph_x, lane_area_bot),
+        ],
         Stroke::new(2.5_f32, Color32::WHITE),
     );
     let triangle = vec![
@@ -561,8 +556,7 @@ pub fn show_multitrack(
     if ph_resp.dragged() {
         if let Some(pos) = ph_resp.interact_pointer_pos() {
             let frac = ((pos.x - lane_area_left) / lane_area_width).clamp(0.0, 1.0);
-            state.playhead_cut_ms =
-                (frac as f64 * state.cut_duration_ms as f64) as i64;
+            state.playhead_cut_ms = (frac as f64 * state.cut_duration_ms as f64) as i64;
             out.seeked = true;
             out.dragging = true;
         }
@@ -574,12 +568,10 @@ pub fn show_multitrack(
         if let Some(pos) = response.interact_pointer_pos() {
             if pos.x >= lane_area_left {
                 let frac = ((pos.x - lane_area_left) / lane_area_width).clamp(0.0, 1.0);
-                state.playhead_cut_ms =
-                    (frac as f64 * state.cut_duration_ms as f64) as i64;
+                state.playhead_cut_ms = (frac as f64 * state.cut_duration_ms as f64) as i64;
                 out.seeked = true;
-                let modifier = ui.input(|i| {
-                    i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift
-                });
+                let modifier =
+                    ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift);
                 if !modifier {
                     out.clicked_empty = true;
                 }
@@ -618,16 +610,17 @@ pub fn scrubber(ui: &mut Ui, state: &mut TimelineState) -> ScrubberOutput {
     let track_w = track.width();
 
     // Filled progress portion
-    let progress = Rect::from_min_size(
-        track.min,
-        Vec2::new(track_w * frac, track.height()),
-    );
+    let progress = Rect::from_min_size(track.min, Vec2::new(track_w * frac, track.height()));
     painter.rect_filled(progress, radius, theme::ACCENT);
 
     // Draggable handle
     let handle_x = track.left() + frac * track_w;
     let handle_pos = egui::pos2(handle_x, rect.center().y);
-    let handle_r = if response.hovered() || response.dragged() { 10.0 } else { 8.0 };
+    let handle_r = if response.hovered() || response.dragged() {
+        10.0
+    } else {
+        8.0
+    };
     painter.circle_filled(handle_pos, handle_r, theme::ACCENT);
     painter.circle_stroke(handle_pos, handle_r, Stroke::new(1.5_f32, Color32::WHITE));
 
@@ -647,12 +640,7 @@ fn x_of(rect: Rect, ms: i64, duration_ms: i64) -> f32 {
     rect.left() + frac as f32 * rect.width()
 }
 
-fn draw_ticks(
-    painter: &egui::Painter,
-    rect: Rect,
-    label_band_h: f32,
-    duration_ms: i64,
-) {
+fn draw_ticks(painter: &egui::Painter, rect: Rect, label_band_h: f32, duration_ms: i64) {
     let duration_s = duration_ms as f64 / 1000.0;
     let pixels_per_second = rect.width() as f64 / duration_s.max(0.001);
 
@@ -671,8 +659,7 @@ fn draw_ticks(
         while t <= duration_s {
             let x = rect.left() + (t / duration_s) as f32 * rect.width();
             painter.line_segment(
-                [egui::pos2(x, label_top),
-                 egui::pos2(x, label_top + 4.0)],
+                [egui::pos2(x, label_top), egui::pos2(x, label_top + 4.0)],
                 Stroke::new(1.0_f32, minor_color),
             );
             t += minor_interval_s;
@@ -685,14 +672,15 @@ fn draw_ticks(
         let x = rect.left() + (t / duration_s) as f32 * rect.width();
         // Long vertical tick line in upper area
         painter.line_segment(
-            [egui::pos2(x, upper_bottom),
-             egui::pos2(x, upper_bottom - 10.0)],
+            [
+                egui::pos2(x, upper_bottom),
+                egui::pos2(x, upper_bottom - 10.0),
+            ],
             Stroke::new(1.5_f32, major_color),
         );
         // Tick inside label band
         painter.line_segment(
-            [egui::pos2(x, label_top),
-             egui::pos2(x, label_top + 8.0)],
+            [egui::pos2(x, label_top), egui::pos2(x, label_top + 8.0)],
             Stroke::new(1.5_f32, major_color),
         );
         // Label, larger and more readable
@@ -710,7 +698,9 @@ fn draw_ticks(
 fn pick_interval(pixels_per_second: f64, target_px: f64) -> f64 {
     let target_seconds = target_px / pixels_per_second;
     // Snap to a "nice" interval
-    for &candidate in &[1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0] {
+    for &candidate in &[
+        1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+    ] {
         if candidate >= target_seconds {
             return candidate;
         }
@@ -750,8 +740,7 @@ fn draw_handle(
     );
     // Clamp the flag rect so it stays fully visible even when the mark
     // is at the very start (x = rect.left()) or end of the timeline.
-    let flag_left = (x - FLAG_W * 0.5)
-        .clamp(rect.left() + 1.0, rect.right() - FLAG_W - 1.0);
+    let flag_left = (x - FLAG_W * 0.5).clamp(rect.left() + 1.0, rect.right() - FLAG_W - 1.0);
     let flag = Rect::from_min_size(
         egui::pos2(flag_left, rect.top() + 10.0),
         egui::vec2(FLAG_W, FLAG_H),
