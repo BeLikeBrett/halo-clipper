@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "halo_clipper"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "ab_glyph",
  "anyhow",

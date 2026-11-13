@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.10.3
+## 0.10.4
+
+- Correct the Windows native import library to reference the bundled libmpv-2.dll.
 
 - Bundle the verified Vulkan loader needed by Windows libmpv and test the
   complete portable payload without developer runtime paths.

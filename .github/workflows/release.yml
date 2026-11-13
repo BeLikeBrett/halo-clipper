@@ -34,9 +34,9 @@ jobs:
         shell: pwsh
         run: |
           $exports = & dumpbin /exports dist/runtime/mpv-dev/libmpv-2.dll
-          'EXPORTS' | Set-Content dist/runtime/mpv-dev/mpv.def
+          'LIBRARY libmpv-2.dll', 'EXPORTS' | Set-Content dist/runtime/mpv-dev/mpv.def
           $exports | ForEach-Object { if ($_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(mpv_\w+)') { $Matches[1] | Add-Content dist/runtime/mpv-dev/mpv.def } }
-          lib /nologo /machine:x64 /def:dist/runtime/mpv-dev/mpv.def /out:dist/runtime/mpv-dev/mpv.lib
+          lib /nologo /machine:x64 /name:libmpv-2.dll /def:dist/runtime/mpv-dev/mpv.def /out:dist/runtime/mpv-dev/mpv.lib
           $mpv = (Resolve-Path dist/runtime/mpv-dev).Path
           $ffmpeg = (Get-ChildItem dist/runtime/ffmpeg -Filter ffprobe.exe -Recurse | Select-Object -First 1).DirectoryName
           "RUSTFLAGS=-C target-feature=+crt-static -L native=$mpv" | Out-File -FilePath $env:GITHUB_ENV -Append

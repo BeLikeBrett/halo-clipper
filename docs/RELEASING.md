@@ -122,3 +122,8 @@ The Windows mpv DLL imports vulkan-1.dll. Do not rely on a developer SDK or
 a GPU driver having installed that loader globally. The pinned LunarG x64
 loader and its notices ship in the payload; CI initializes the packaged
 application with only Windows System32 on PATH.
+
+When producing MSVC's mpv.lib, set `LIBRARY libmpv-2.dll` in the DEF file
+and `/NAME:libmpv-2.dll` on LIB. Otherwise the linker may import mpv.dll,
+which is not the shipped runtime filename. The startup check exercises the
+real DLL imports; tests that never initialize mpv can dead-strip those imports.
