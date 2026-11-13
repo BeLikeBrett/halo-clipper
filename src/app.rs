@@ -727,6 +727,7 @@ impl ClipperApp {
                 let start_ms = project.playhead_ms;
                 if project.mode == EditMode::MultiTrack && project.needs_composition() {
                     project.proxy = Some(dest);
+                    self.status = "Scrub proxy ready for layered preview.".into();
                 } else if let Err(e) = self.player.set_file(&dest, start_ms) {
                     log::warn!("proxy swap failed: {e:#}");
                 } else {
@@ -1374,12 +1375,20 @@ impl ClipperApp {
             return;
         };
 
-        if destination == project.source
+        let same_file = |source: &std::path::Path| {
+            source == destination
+                || source
+                    .canonicalize()
+                    .ok()
+                    .zip(destination.canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b)
+        };
+        if same_file(&project.source)
             || project
                 .tracks
                 .iter()
                 .filter_map(|t| t.source.as_ref())
-                .any(|s| s.path == destination)
+                .any(|s| same_file(&s.path))
         {
             self.status =
                 "Choose a different output file — original media cannot be overwritten.".into();
@@ -1654,6 +1663,11 @@ impl ClipperApp {
 impl eframe::App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.updater.poll();
+        if self.proxy_handle.is_some()
+            || matches!(self.updater.state, crate::updater::State::Working(_))
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         self.tick_proxy();
         self.tick_layered_preview(ctx);
         self.sync_audio_mix();
