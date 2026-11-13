@@ -14,9 +14,11 @@ and caption fonts. The portable ZIP contains `windows/halo-clipper.exe` and its
 runtime files; keep those files together.
 
 **HaloOS / Arch Linux:** Use the HaloOS package, or build and run `./install.sh`.
-The Linux release binary needs `ffmpeg` and `mpv` installed through your package
-manager. Ubuntu / Debian: `sudo apt install ffmpeg libmpv2 mpv` (older releases
-may name the library `libmpv1`).
+The Linux release binary targets Ubuntu 24.04 or newer and current HaloOS / Arch,
+and requires `libmpv.so.2` (mpv 0.35+), FFmpeg, and mpv from the package manager.
+Ubuntu 24.04 / current Debian: `sudo apt install ffmpeg libmpv2 mpv`.
+Older distributions with only `libmpv1` are unsupported by the current mpv bindings.
+Linux updates check native-library compatibility before replacing the working app.
 
 ## Edit
 

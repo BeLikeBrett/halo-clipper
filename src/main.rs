@@ -18,6 +18,7 @@ mod platform;
 mod player;
 mod proxy;
 mod settings;
+mod startup;
 mod text;
 mod textrender;
 mod theme;
@@ -31,6 +32,13 @@ use app::ClipperApp;
 
 fn main() -> eframe::Result<()> {
     platform::init();
+    if std::env::args_os().any(|arg| arg == "--self-check") {
+        if let Err(error) = startup::check_runtime() {
+            eprintln!("Halo Clipper startup check failed: {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // HaloOS can force MangoHud into every Vulkan client. libmpv probes
     // Vulkan decoders even though our preview renders with OpenGL; the
     // overlay can crash inside vkCreateDevice during that probe. Opt this

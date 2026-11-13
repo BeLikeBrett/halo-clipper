@@ -225,6 +225,55 @@ impl Updater {
         }
     }
 }
+/// The downloaded executable must load its native libraries and initialize
+/// mpv before the current executable or its known-good backup is touched.
+#[cfg(not(windows))]
+fn prepare_linux_update(exe: &Path, path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let next = exe.with_extension("update");
+    let backup = exe.with_extension("previous");
+    std::fs::copy(path, &next).context("Application folder is not writable")?;
+    std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755))?;
+    if let Err(error) = verify_linux_candidate(&next) {
+        let _ = std::fs::remove_file(&next);
+        return Err(error);
+    }
+    std::fs::copy(exe, &backup)?;
+    std::fs::rename(&next, exe)?;
+    Ok(backup)
+}
+
+#[cfg(not(windows))]
+fn verify_linux_candidate(path: &Path) -> Result<()> {
+    use std::{process::Stdio, time::Instant};
+    let mut child = crate::platform::command(path)
+        .arg("--self-check")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("The update cannot start. The current application was kept.")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = child.wait_with_output()?;
+            anyhow::ensure!(
+                status.success(),
+                "The update failed its startup check. The current application was kept.\n{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "The update's startup check timed out. The current application was kept."
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 pub fn install(path: &Path) -> Result<()> {
     let exe = std::env::current_exe()?;
     #[cfg(windows)]
@@ -235,24 +284,59 @@ pub fn install(path: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
         anyhow::ensure!(
             !exe.starts_with("/usr") && !exe.starts_with("/opt"),
             "This is a system-managed install. Update through your package manager."
         );
-        let next = exe.with_extension("update");
-        let backup = exe.with_extension("previous");
-        std::fs::copy(path, &next).context("Application folder is not writable")?;
-        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::copy(&exe, &backup)?;
-        std::fs::rename(&next, &exe)?;
-        crate::platform::command(&exe).spawn()?;
+        let backup = prepare_linux_update(&exe, path)?;
+        let launch = (|| -> Result<()> {
+            let mut child = crate::platform::command(&exe).spawn()?;
+            // An immediate loader/window failure must not close the old UI.
+            for _ in 0..20 {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("The updated application exited during startup ({status}).");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(())
+        })();
+        if let Err(error) = launch {
+            let restore = exe.with_extension("restore");
+            std::fs::copy(&backup, &restore).context("Could not restore the previous version")?;
+            std::fs::rename(&restore, &exe)?;
+            return Err(
+                error.context("The previous version was restored; this application will stay open")
+            );
+        }
     }
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_linux_startup_keeps_current_binary_and_good_backup() {
+        let dir = std::env::temp_dir().join(format!("halo-update-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("halo-clipper");
+        let backup = current.with_extension("previous");
+        let candidate = dir.join("candidate");
+        std::fs::write(&current, b"working current").unwrap();
+        std::fs::write(&backup, b"working backup").unwrap();
+        std::fs::write(
+            &candidate,
+            b"#!/bin/sh\necho 'missing libmpv.so.2' >&2\nexit 127\n",
+        )
+        .unwrap();
+        let error = prepare_linux_update(&current, &candidate).unwrap_err();
+        assert!(format!("{error:#}").contains("missing libmpv.so.2"));
+        assert_eq!(std::fs::read(&current).unwrap(), b"working current");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"working backup");
+        assert!(!current.with_extension("update").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn reject_unsigned_or_modified_manifest() {
         assert!(verify_manifest(br#"{"version":"9.0.0","assets":[]}"#, b"AAAA").is_err());

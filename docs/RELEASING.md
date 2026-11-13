@@ -107,3 +107,13 @@ Windows updates use a short-lived PowerShell helper to wait for the app to exit,
 run the verified per-user installer silently, and restart. Linux user-local
 updates atomically rename a verified replacement over the executable and retain
 a `.previous` backup. System package installations defer to the package manager.
+
+## Linux runtime compatibility
+
+The Rust mpv bindings require client API major 2. Linux release builds use
+Ubuntu 24.04 and link libmpv.so.2; Ubuntu 22.04's libmpv.so.1 is incompatible.
+Release validation must run `halo-clipper --self-check`, which actually
+initializes the mpv core without video/audio/window output. Model/FFmpeg tests
+alone do not establish that the app can start. Linux self-updates execute this
+check on the candidate before replacing either the installed executable or its
+backup, and restore the backup if the replacement exits during restart.

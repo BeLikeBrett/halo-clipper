@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.2
+
+- Fix Linux updates failing to reopen on HaloOS / Arch: build against the
+  supported mpv client API 2 on Ubuntu 24.04.
+- Add a real mpv initialization check to Linux/Windows release validation.
+- Check Linux update startup before touching the current binary or backup;
+  restore the previous version on immediate restart failure and keep the old UI open.
+
 ## 0.10.1
 
 - Keep animated clip dimensions correct across Windows and Linux media runtimes.
