@@ -34,3 +34,10 @@ packages also contain third-party software under its respective licenses.
 Runtime binaries are redistributed without modifying their contents. They are
 not covered by the Halo Clipper source license. Retain runtime notices when
 redistributing a package. Linux uses system media libraries and programs.
+
+The Windows bundle includes the x64 Vulkan loader from LunarG's official
+Vulkan Runtime 1.4.363.0 component archive. Its license notices are included
+under licenses/ in the payload. This supplies libmpv's loader dependency;
+graphics drivers remain supplied by the operating system or GPU vendor.
+Source and runtime provenance: https://github.com/KhronosGroup/Vulkan-Loader
+and https://vulkan.lunarg.com/sdk/home/.

@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.10.2
+## 0.10.3
+
+- Bundle the verified Vulkan loader needed by Windows libmpv and test the
+  complete portable payload without developer runtime paths.
 
 - Fix Linux updates failing to reopen on HaloOS / Arch: build against the
   supported mpv client API 2 on Ubuntu 24.04.

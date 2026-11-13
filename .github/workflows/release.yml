@@ -40,12 +40,23 @@ jobs:
           $mpv = (Resolve-Path dist/runtime/mpv-dev).Path
           $ffmpeg = (Get-ChildItem dist/runtime/ffmpeg -Filter ffprobe.exe -Recurse | Select-Object -First 1).DirectoryName
           "RUSTFLAGS=-C target-feature=+crt-static -L native=$mpv" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $vulkan = (Get-ChildItem dist/runtime/vulkan -Filter vulkan-1.dll -Recurse | Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1).DirectoryName
+          $vulkan | Out-File -FilePath $env:GITHUB_PATH -Append
           $mpv | Out-File -FilePath $env:GITHUB_PATH -Append
           $ffmpeg | Out-File -FilePath $env:GITHUB_PATH -Append
       - run: cargo test --release --locked
       - run: cargo build --release --locked
       - run: target/release/halo-clipper.exe --self-check
       - run: python scripts/package-windows.py dist/runtime target/release/halo-clipper.exe
+      - name: Verify complete portable runtime without developer tools
+        shell: pwsh
+        run: |
+          $savedPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot/System32"
+            & ./dist/windows/halo-clipper.exe --self-check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { $env:PATH = $savedPath }
       - name: Build installer
         shell: pwsh
         run: |

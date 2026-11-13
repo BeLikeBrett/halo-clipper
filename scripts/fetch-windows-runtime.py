@@ -8,11 +8,11 @@ lock=json.loads((root/'packaging/runtime-lock.json').read_text())
 for asset in lock['assets']:
     archive=out/asset['name']
     if not archive.exists():
-        with urllib.request.urlopen(asset['url']) as response, archive.open('wb') as target:
+        with urllib.request.urlopen(urllib.request.Request(asset['url'],headers={'User-Agent':'Mozilla/5.0 Halo-Clipper-Release'})) as response, archive.open('wb') as target:
             while chunk:=response.read(1024*1024): target.write(chunk)
     if hashlib.file_digest(archive.open('rb'),'sha256').hexdigest()!=asset['sha256']:
         raise SystemExit(f"Checksum mismatch for {archive.name}")
-    folder=out/('mpv-dev' if asset['name'].startswith('mpv-dev') else 'ffmpeg' if asset['name'].startswith('ffmpeg') else 'mpv')
+    folder=out/asset.get('folder',('mpv-dev' if asset['name'].startswith('mpv-dev') else 'ffmpeg' if asset['name'].startswith('ffmpeg') else 'mpv'))
     if folder.exists(): shutil.rmtree(folder)
     folder.mkdir(exist_ok=True)
     subprocess.run(['7z','x','-y',f'-o{folder}',str(archive)],check=True,stdout=subprocess.DEVNULL)

@@ -18,6 +18,7 @@ PAYLOAD = ROOT / "dist" / "windows"
 # (file name, runtime subfolder it is found in)
 RUNTIME_FILES = [
     ("libmpv-2.dll", "mpv-dev"),
+    ("vulkan-1.dll", "vulkan"),
     ("ffmpeg.exe", "ffmpeg"),
     ("ffprobe.exe", "ffmpeg"),
     ("mpv.exe", "mpv"),
@@ -27,6 +28,8 @@ RUNTIME_FILES = [
 
 def find_runtime_file(runtime: pathlib.Path, name: str, folder: str) -> pathlib.Path:
     matches = sorted((runtime / folder).rglob(name))
+    if folder == "vulkan":
+        matches = [p for p in matches if "x64" in p.parts]
     if not matches:
         raise SystemExit(f"Missing runtime file: {folder}/**/{name}")
     # The ffmpeg folder can hold both the pinned n8 build and an older

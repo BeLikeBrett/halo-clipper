@@ -117,3 +117,8 @@ initializes the mpv core without video/audio/window output. Model/FFmpeg tests
 alone do not establish that the app can start. Linux self-updates execute this
 check on the candidate before replacing either the installed executable or its
 backup, and restore the backup if the replacement exits during restart.
+
+The Windows mpv DLL imports vulkan-1.dll. Do not rely on a developer SDK or
+a GPU driver having installed that loader globally. The pinned LunarG x64
+loader and its notices ship in the payload; CI initializes the packaged
+application with only Windows System32 on PATH.
