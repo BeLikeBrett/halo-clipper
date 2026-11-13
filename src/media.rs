@@ -36,6 +36,21 @@ struct FfprobeStream {
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    #[serde(default)]
+    disposition: StreamDisposition,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamDisposition {
+    #[serde(default)]
+    attached_pic: u32,
+}
+impl FfprobeStream {
+    fn is_video(&self) -> bool {
+        self.codec_type == "video"
+            && self.width.unwrap_or(0) > 0
+            && self.disposition.attached_pic == 0
+    }
 }
 
 #[derive(Deserialize)]
@@ -76,10 +91,7 @@ pub fn probe_layer(path: &Path) -> Result<MediaInfo> {
     let parsed: FfprobeOutput =
         serde_json::from_slice(&output.stdout).context("ffprobe returned unparseable JSON")?;
 
-    let video = parsed
-        .streams
-        .iter()
-        .find(|s| s.codec_type == "video" && s.width.unwrap_or(0) > 0);
+    let video = parsed.streams.iter().find(|s| s.is_video());
 
     let audio = parsed.streams.iter().find(|s| s.codec_type == "audio");
     let audio_stream_count = parsed
@@ -194,5 +206,21 @@ pub fn format_timestamp(ms: i64) -> String {
         format!("{:02}:{:02}:{:02}.{:03}", h, m, s, frac)
     } else {
         format!("{:02}:{:02}.{:03}", m, s, frac)
+    }
+}
+
+#[cfg(test)]
+mod layer_media_tests {
+    use super::*;
+    #[test]
+    fn audio_cover_art_is_not_a_video_layer() {
+        let stream: FfprobeStream = serde_json::from_str(
+            r#"{"codec_type":"video","width":600,"height":600,"disposition":{"attached_pic":1}}"#,
+        )
+        .unwrap();
+        assert!(!stream.is_video());
+        let stream: FfprobeStream =
+            serde_json::from_str(r#"{"codec_type":"video","width":600,"height":600}"#).unwrap();
+        assert!(stream.is_video());
     }
 }
