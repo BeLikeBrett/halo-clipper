@@ -374,6 +374,43 @@ mod tests {
     }
 
     #[test]
+    fn mixed_flash_and_zoom_edges_keep_alpha_and_frame_size() {
+        use crate::animation::{Animation, Effect};
+        let d = dir();
+        let source = video(&d, "mixed.mp4", "red");
+        for (intro, outro) in [
+            (Effect::Flash, Effect::SnapZoom),
+            (Effect::PullBack, Effect::Flash),
+            (Effect::Whip, Effect::SnapZoom),
+        ] {
+            let mut top = segment(source.clone(), 0, 2000);
+            top.animation = Animation {
+                intro,
+                outro,
+                in_ms: 300.0,
+                out_ms: 300.0,
+                amount: 1.0,
+            };
+            let c = Composition {
+                width: 64,
+                height: 64,
+                fps: 30.0,
+                duration_ms: 2000,
+                background: Default::default(),
+                segments: vec![top],
+                texts: vec![],
+            };
+            let path = render(c, d.join(format!("mixed-{intro:?}-{outro:?}.mp4")));
+            let middle = pixel(&path, "1.0", 32, 32);
+            assert!(
+                middle[0] > 200 && middle[1] < 30,
+                "{intro:?}/{outro:?}: {middle:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn clip_animations_export_on_both_edges_of_a_delayed_segment() {
         use crate::animation::{Animation, Effect};
         let d = dir();

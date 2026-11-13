@@ -134,6 +134,10 @@ impl Animation {
                 filters.push_str(&format!(",geq=r='r(X,Y)+(255-r(X,Y))*{amount:.6}*{}':g='g(X,Y)+(255-g(X,Y))*{amount:.6}*{}':b='b(X,Y)+(255-b(X,Y))*{amount:.6}*{}':a='alpha(X,Y)':enable='{enable}'", self.flash_expression(way, duration, length), self.flash_expression(way, duration, length), self.flash_expression(way, duration, length)));
             }
         }
+        // geq negotiates planar RGB; restore packed RGBA while the size
+        // is still fixed, before any animated scale. This also covers
+        // mixed Flash + zoom edges without a downstream autoscaler.
+        filters.push_str(",format=rgba");
         let zoom = self.zoom_expression("t", duration_ms);
         if self.intro.zoom() != 0.0 || self.outro.zoom() != 0.0 {
             filters.push_str(&format!(",scale=w='max(2,trunc(iw*({zoom})/2)*2)':h='max(2,trunc(ih*({zoom})/2)*2)':eval=frame"));
