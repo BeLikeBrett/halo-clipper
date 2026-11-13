@@ -1094,7 +1094,9 @@ pub fn detect_available_codecs() -> Vec<VideoCodec> {
     ];
     candidates
         .iter()
-        .filter(|(name, _)| text.contains(name))
+        .filter(|(name, codec)| {
+            text.contains(name) && !(cfg!(windows) && codec.needs_vaapi_upload())
+        })
         .map(|&(_, codec)| codec)
         .collect()
 }

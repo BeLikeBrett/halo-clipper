@@ -700,6 +700,9 @@ impl ClipperApp {
     /// then ride on the GPU instead of libx264. Drops the wall-clock
     /// for a 14-min 4K source from ~6 minutes to ~2 minutes on AMD VCN.
     fn proxy_can_use_vaapi(&self) -> bool {
+        if cfg!(windows) {
+            return false;
+        }
         self.available_codecs
             .iter()
             .any(|c| matches!(c, VideoCodec::VaapiH264))
