@@ -104,9 +104,3 @@ fn lookup(lib: &Library, symbol: &[u8], name: &std::ffi::CStr) -> Option<*mut c_
             .map(|sym| sym(name.as_ptr()))
     }
 }
-
-// Trampoline matching the signature libmpv2's OpenGLInitParams expects:
-//   fn(ctx: &GLContext, name: &str) -> *mut c_void
-pub fn get_proc_address(loader: &std::sync::Arc<GlLoader>, name: &str) -> *mut c_void {
-    loader.get_proc(name)
-}

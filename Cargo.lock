@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "halo_clipper"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1555,6 +1555,7 @@ dependencies = [
  "image",
  "libloading",
  "libmpv2",
+ "libmpv2-sys",
  "log",
  "reqwest",
  "rfd",

@@ -8,8 +8,10 @@ mod diagnostics;
 mod encode;
 mod export;
 mod framing;
+mod gl_interop;
 mod gl_loader;
 mod media;
+mod mpv_render;
 mod platform;
 mod player;
 mod proxy;
@@ -159,6 +161,6 @@ fn load_caption_fonts(ctx: &egui::Context) {
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .push("DejaVu Sans".into());
+        .insert(0, "DejaVu Sans".into());
     ctx.set_fonts(fonts);
 }

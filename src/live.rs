@@ -394,7 +394,48 @@ unsafe fn paint_layers(
         .iter()
         .find(|l| l.transform.opacity > 0.0)
         .map(|l| l.id);
-    // Render the blurred canvas first; foreground passes retain all transforms.
+    // Complete every decoder render before touching the screen. A later mpv
+    // context can reset/clear GL targets while preparing its own frame.
+    for layer in layers {
+        let ratio = (960.0 / layer.width.max(1) as f32)
+            .min(540.0 / layer.height.max(1) as f32)
+            .min(1.0);
+        let w = (layer.width as f32 * ratio).round().max(2.0) as i32;
+        let h = (layer.height as f32 * ratio).round().max(2.0) as i32;
+        let mut fbo = layer.fbo.lock().unwrap();
+        VideoFbo::ensure_size(&mut fbo, gl, w, h);
+        let Some(fbo) = fbo.as_ref() else { continue };
+        gl.disable(glow::SCISSOR_TEST);
+        gl.disable(glow::BLEND);
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::CULL_FACE);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo.fbo()));
+        gl.viewport(0, 0, w, h);
+        if let Err(e) = layer.player.render(fbo.fbo_id_i32(), w, h, true) {
+            log::error!("Live frame render: {e:#}");
+            continue;
+        }
+    }
+    let rgb = background.rgb();
+    let mut clear_color = [0.0; 4];
+    gl.get_parameter_f32_slice(glow::COLOR_CLEAR_VALUE, &mut clear_color);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, video_fbo::fbo_from_raw(draw));
+    gl.enable(glow::SCISSOR_TEST);
+    gl.scissor(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
+    gl.clear_color(
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+        1.0,
+    );
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    gl.clear_color(
+        clear_color[0],
+        clear_color[1],
+        clear_color[2],
+        clear_color[3],
+    );
+    // Then paint the canvas and foregrounds without re-entering mpv.
     let passes = layers
         .iter()
         .filter(|l| {
@@ -415,24 +456,8 @@ unsafe fn paint_layers(
         if !rect.intersects(canvas) {
             continue;
         }
-        let ratio = (960.0 / layer.width.max(1) as f32)
-            .min(540.0 / layer.height.max(1) as f32)
-            .min(1.0);
-        let w = (layer.width as f32 * ratio).round().max(2.0) as i32;
-        let h = (layer.height as f32 * ratio).round().max(2.0) as i32;
-        let mut fbo = layer.fbo.lock().unwrap();
-        VideoFbo::ensure_size(&mut fbo, gl, w, h);
+        let fbo = layer.fbo.lock().unwrap();
         let Some(fbo) = fbo.as_ref() else { continue };
-        gl.disable(glow::SCISSOR_TEST);
-        gl.disable(glow::BLEND);
-        gl.disable(glow::DEPTH_TEST);
-        gl.disable(glow::CULL_FACE);
-        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo.fbo()));
-        gl.viewport(0, 0, w, h);
-        if let Err(e) = layer.player.render(fbo.fbo_id_i32(), w, h, true) {
-            log::error!("Live frame render: {e:#}");
-            continue;
-        }
         gl.bind_framebuffer(glow::FRAMEBUFFER, video_fbo::fbo_from_raw(draw));
         gl.enable(glow::SCISSOR_TEST);
         gl.scissor(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);

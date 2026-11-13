@@ -20,21 +20,29 @@ may name the library `libmpv1`).
 
 ## Edit
 
-**Simple Clip:** Open a video, mark In and Out, and export. Auto mode copies
-keyframe-aligned clips when possible and re-encodes when needed.
+**Simple Clip:** Import videos, click a media thumbnail to focus the video you
+are clipping, mark In and Out, and export. Each video remembers its own marks,
+playhead, mute, and undo/redo history. Switching tabs preserves the separate
+Advanced timeline. Auto mode copies keyframe-aligned clips when possible and
+re-encodes when needed.
 
 **Advanced:**
 
 - **Import** adds video and audio to the media bin. Nothing is placed on the
   timeline automatically. Drag a media item to the time and lane you want; a
-  full clip preview shows where it will land. Imported clips snap into a new
-  layer above or below the lane under the pointer; hold Shift to bypass time snapping.
+  preview opens a separate lane and moves existing rows aside before you drop.
+  Hover above/below a row to choose the layer order. The first drop into an empty
+  timeline holds at 0:00; move sideways after entering to choose another time.
+  Hold Shift to bypass snapping.
 - Drag clips horizontally to change timing or vertically to another lane.
   Drag a track name up or down to change its layer order. Video at the top
   appears in front; audio lanes mix together.
 - Click a video on the preview to select it. Drag the video to move it, and
   drag its corner handles to resize it while keeping its aspect ratio. Videos
-  can extend outside the canvas. Transform edits update immediately on the GPU.
+  can extend outside the canvas. Scroll over a focused video to zoom around the
+  pointer. Reset frame (or the video context menu) centers and fills the canvas;
+  Ctrl+Z reverses it. The selection outline fades while idle without deselecting.
+  Transform edits update immediately on the GPU.
 - The canvas automatically follows the largest-resolution video **placed on
   the timeline**. Importing alone does not change it. Choose Original, 16:9,
   9:16 (Reels / TikTok), 1:1, or 4:5 above the preview. These formats retain
@@ -52,13 +60,16 @@ keyframe-aligned clips when possible and re-encodes when needed.
   **Ctrl+Shift+Z**. Attached pieces edit together; detached pieces edit independently.
 - Click a clip to show its controls for framing, audio, speed, opacity, and
   captions. Right-click a clip for edit actions, or a track name to mute / hide
-  that track. Read-only clip details stay collapsed until needed.
+  that track. The Edit panel scrolls within its available height.
 - Each active video and audio lane uses an independent live decoder. Timeline
   playback, scrubbing and transform edits do not rebuild a rendered timeline.
   Exports always read the original media through the shared composition model.
 
-The preview keeps most of the window. The compact timeline can be resized by
-its upper divider and scrolls only when more lanes are present than fit.
+Advanced automatically sizes the timeline for its visible layers and reserves
+an extra lane while dragging media. Its upper divider remains resizable. Taller
+clip bars include thumbnails, and shortcuts stay visible below the timeline.
+The Background editor stays open while choosing a color; close it with Done,
+the close button, or Escape.
 Simple Clip retains its focused mark-and-export workflow. Sessions are currently
 in memory: **export your edit before closing or updating**.
 

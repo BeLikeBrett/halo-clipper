@@ -10,6 +10,7 @@ impl Project {
             playhead_ms: 0,
             in_ms: None,
             out_ms: None,
+            simple: Default::default(),
             simple_audio_muted: false,
             assets: Vec::new(),
             canvas: Default::default(),
@@ -115,6 +116,10 @@ impl Project {
             .collect();
         self.clips.retain(|c| !removed.contains(&c.id));
         self.assets.retain(|a| a.id != id);
+        self.simple.edits.remove(&id);
+        if self.simple.focus == Some(id) {
+            self.simple.focus = None;
+        }
         self.prune_tracks();
         self.selected_clips.retain(|id| !removed.contains(id));
         self.text_overlays.retain(|id, _| !removed.contains(id));
@@ -129,6 +134,18 @@ impl Project {
                 self.playhead_ms = 0;
                 self.proxy = None;
             }
+        }
+        if self.mode == EditMode::SimpleClip
+            && !self.assets.iter().any(|a| a.source.media.width > 0)
+        {
+            self.source = PathBuf::new();
+            self.proxy = None;
+            self.media = Self::blank_media();
+            self.playhead_ms = 0;
+            self.in_ms = None;
+            self.out_ms = None;
+            self.simple_audio_muted = false;
+            self.simple.focus = None;
         }
     }
     pub(super) fn next_layer_name(&self, kind: TrackKind) -> String {

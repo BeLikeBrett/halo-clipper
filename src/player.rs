@@ -2,25 +2,23 @@
 //
 // Architecture:
 //   * `Mpv` is initialized once with `vo=libmpv` (so it doesn't create its
-//     own window) and `hwdec=auto-safe`. We hold it in an `Arc<Mpv>` because
+//     own window) and `hwdec=auto-copy`. We hold it in an `Arc<Mpv>` because
 //     it's Send+Sync and we share it with a background event thread.
 //   * A background thread loops on `mpv.wait_event()` and pushes property
 //     changes (time-pos / pause / volume / mute / duration) into a shared
 //     `PlayerState` the UI polls each frame.
-//   * The `RenderContext` is created while eframe initializes the app,
-//     before any media is loaded. Because it borrows
-//     from `Mpv`, we use a transmute to give it `'static` lifetime; drop
-//     order is enforced manually in `Player::drop`.
+//   * The native renderer is created before loading media. It owns an Arc
+//     to the player core, loader, and repaint callback, with no lifetime cast.
 //   * `Player` is shared with the egui paint callback as `Arc<Player>`,
 //     which requires Send + Sync. `RenderContext` is `!Send`, so we wrap
 //     it in `MainThreadOnly` and assert Send+Sync — justified because egui
 //     paint callbacks are always invoked from the main thread.
 
-use crate::gl_loader::{self, GlLoader};
+use crate::{gl_loader::GlLoader, mpv_render::NativeRender};
 
 use anyhow::{Context, Result};
+use glow::HasContext;
 use libmpv2::events::{Event, PropertyData};
-use libmpv2::render::{OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType};
 use libmpv2::{Format, Mpv};
 
 use std::path::{Path, PathBuf};
@@ -66,8 +64,8 @@ unsafe impl<T> Send for MainThreadOnly<T> {}
 unsafe impl<T> Sync for MainThreadOnly<T> {}
 
 struct RenderState {
-    ctx: MainThreadOnly<RenderContext<'static>>,
-    _gl_loader: Arc<GlLoader>,
+    gl: MainThreadOnly<glow::Context>,
+    ctx: MainThreadOnly<NativeRender>,
 }
 
 struct Inner {
@@ -76,8 +74,7 @@ struct Inner {
 }
 
 pub struct Player {
-    // Declared FIRST so it drops FIRST — RenderContext borrows from Mpv via
-    // a transmute, and dropping in the wrong order is undefined behavior.
+    // Render resources are released on the UI thread before the player core.
     render: Mutex<Option<RenderState>>,
     inner: Mutex<Inner>,
     state: Arc<Mutex<PlayerState>>,
@@ -104,7 +101,10 @@ impl Player {
                 init.set_property("msg-level", "all=v")?;
             }
             init.set_property("vo", if audio_only { "null" } else { "libmpv" })?;
-            init.set_property("hwdec", "auto-safe")?;
+            // Each layer owns a renderer inside egui's GL context. Copy-back
+            // decode retains hardware acceleration without importing decoder
+            // surfaces across incompatible GPU/GL contexts (including llvmpipe).
+            init.set_property("hwdec", "auto-copy")?;
             init.set_property("audio-display", "no")?;
             if audio_only {
                 init.set_property("vid", "no")?;
@@ -292,38 +292,31 @@ impl Player {
             return Ok(());
         }
         let loader = Arc::new(GlLoader::new().context("GL function loader init failed")?);
-        let init_params = OpenGLInitParams {
-            get_proc_address: gl_loader::get_proc_address,
-            ctx: loader.clone(),
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| loader.get_proc(name).cast_const())
         };
-        let params = vec![
-            RenderParam::ApiType(RenderParamApiType::OpenGl),
-            RenderParam::InitParams(init_params),
-        ];
-
-        // Lifetime extension: mpv lives in the same struct alongside the
-        // render context. Drop order is enforced manually below and via
-        // field ordering above.
-        let mpv_ref: &Mpv = &self.mpv;
-        let mpv_static: &'static Mpv = unsafe { std::mem::transmute(mpv_ref) };
-        let mut ctx: RenderContext<'static> = mpv_static
-            .create_render_context(params)
-            .context("create_render_context failed")?;
-
-        // Decoding and seeks finish asynchronously, often after egui has
-        // gone idle (especially the first paused frame after import).
-        // Wake the UI when mpv has a frame instead of leaving a black or
-        // stale preview until the next mouse/keyboard event. The callback
-        // only schedules painting; all GL/mpv rendering stays on the UI thread.
-        let repaint_ctx = self.repaint_ctx.clone();
-        ctx.set_update_callback(move || {
-            log::debug!("mpv frame ready");
-            repaint_ctx.request_repaint();
-        });
-
+        let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) }.to_ascii_lowercase();
+        let software = [
+            "llvmpipe",
+            "softpipe",
+            "swrast",
+            "swiftshader",
+            "software",
+            "gdi generic",
+        ]
+        .iter()
+        .any(|name| renderer.contains(name));
+        if software {
+            self.mpv.set_property("hwdec", "no")?;
+            log::info!("Software OpenGL renderer: using software video decoding");
+        }
+        let ctx = {
+            let _state = unsafe { crate::gl_interop::Guard::new(&gl) };
+            NativeRender::new(self.mpv.clone(), loader, self.repaint_ctx.clone())?
+        };
         *slot = Some(RenderState {
+            gl: MainThreadOnly(gl),
             ctx: MainThreadOnly(ctx),
-            _gl_loader: loader,
         });
         Ok(())
     }
@@ -333,12 +326,8 @@ impl Player {
     pub fn render(&self, fbo: i32, width: i32, height: i32, flip: bool) -> Result<()> {
         let slot = self.render.lock().unwrap();
         let rs = slot.as_ref().context("render context not initialized")?;
-        // Acknowledge frame notifications so mpv can notify us again.
-        let _ = rs.ctx.0.update();
-        rs.ctx
-            .0
-            .render::<Arc<GlLoader>>(fbo, width, height, flip)
-            .context("mpv render failed")?;
+        let _state = unsafe { crate::gl_interop::Guard::new(&rs.gl.0) };
+        rs.ctx.0.render(fbo, width, height, flip)?;
         Ok(())
     }
 }
@@ -412,6 +401,10 @@ impl Drop for Player {
         // the Mpv Arc.
         self.event_stop.store(true, Ordering::SeqCst);
         let _ = self.mpv.command("stop", &[]);
-        self.render.lock().unwrap().take();
+        if let Some(state) = self.render.lock().unwrap().take() {
+            let RenderState { gl, ctx, .. } = state;
+            let _state = unsafe { crate::gl_interop::Guard::new(&gl.0) };
+            drop(ctx);
+        }
     }
 }

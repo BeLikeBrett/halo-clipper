@@ -9,9 +9,9 @@ pub const BG_HEADER: Color32 = Color32::from_rgb(18, 20, 24);
 pub const BG_PREVIEW: Color32 = Color32::from_rgb(8, 9, 11);
 pub const BG_STATUS: Color32 = Color32::from_rgb(28, 31, 36);
 pub const BG_MODAL: Color32 = Color32::from_rgb(28, 31, 38);
-pub const BG_BUTTON: Color32 = Color32::from_rgb(46, 50, 58);
-pub const BG_BUTTON_HOVER: Color32 = Color32::from_rgb(60, 66, 78);
-pub const BG_BUTTON_ACTIVE: Color32 = Color32::from_rgb(78, 86, 102);
+pub const BG_BUTTON: Color32 = Color32::from_rgb(34, 39, 47);
+pub const BG_BUTTON_HOVER: Color32 = Color32::from_rgb(47, 55, 67);
+pub const BG_BUTTON_ACTIVE: Color32 = Color32::from_rgb(56, 69, 86);
 pub const BG_BUTTON_DISABLED: Color32 = Color32::from_rgb(36, 38, 44);
 
 pub const BORDER: Color32 = Color32::from_rgb(50, 54, 62);
@@ -38,7 +38,7 @@ pub fn apply(ctx: &Context) {
     visuals.panel_fill = BG_PANEL;
     visuals.window_fill = BG_MODAL;
     visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.window_rounding = Rounding::same(10.0);
+    visuals.window_rounding = Rounding::same(4.0);
     visuals.extreme_bg_color = Color32::from_rgb(10, 11, 14);
     visuals.faint_bg_color = Color32::from_rgb(30, 33, 38);
     visuals.override_text_color = Some(TEXT_PRIMARY);
@@ -52,32 +52,42 @@ pub fn apply(ctx: &Context) {
 
     visuals.widgets.inactive.bg_fill = BG_BUTTON;
     visuals.widgets.inactive.weak_bg_fill = BG_BUTTON;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(61, 70, 83));
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
-    visuals.widgets.inactive.rounding = Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = Rounding::same(4.0);
 
     visuals.widgets.hovered.bg_fill = BG_BUTTON_HOVER;
     visuals.widgets.hovered.weak_bg_fill = BG_BUTTON_HOVER;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT.linear_multiply(0.7));
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
-    visuals.widgets.hovered.rounding = Rounding::same(6.0);
+    visuals.widgets.hovered.rounding = Rounding::same(4.0);
 
     visuals.widgets.active.bg_fill = BG_BUTTON_ACTIVE;
     visuals.widgets.active.weak_bg_fill = BG_BUTTON_ACTIVE;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
-    visuals.widgets.active.rounding = Rounding::same(6.0);
+    visuals.widgets.active.rounding = Rounding::same(4.0);
 
     visuals.widgets.open.bg_fill = BG_BUTTON_HOVER;
     visuals.widgets.open.weak_bg_fill = BG_BUTTON_HOVER;
-    visuals.widgets.open.rounding = Rounding::same(6.0);
+    visuals.widgets.open.rounding = Rounding::same(4.0);
 
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.menu_margin = egui::Margin::same(6.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.interact_size.y = 28.0;
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
     // Default-disable text-cursor over labels. Selectable labels make
     // every text widget show an I-beam on hover, which competes with
     // the pointing-hand cursor on the button/card under it and feels

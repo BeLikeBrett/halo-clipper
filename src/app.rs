@@ -17,6 +17,8 @@ mod grouping;
 mod layers;
 #[path = "live.rs"]
 mod live;
+#[path = "simple.rs"]
+mod simple;
 #[path = "support.rs"]
 mod support;
 #[path = "thumbnails.rs"]
@@ -64,6 +66,7 @@ struct Project {
     /// In `SimpleClip` mode: source-time. In `MultiTrack`: cut-time.
     playhead_ms: i64,
     // SimpleClip state
+    simple: simple::Workspace,
     in_ms: Option<i64>,
     out_ms: Option<i64>,
     /// Simple Clip's V1 mute toggle. Skips the audio stream in the
@@ -292,6 +295,7 @@ impl Project {
 /// are intentionally excluded — they're navigation/view state, not edits.
 #[derive(Clone)]
 struct UndoSnapshot {
+    simple_only: bool,
     source: PathBuf,
     media: MediaInfo,
     proxy: Option<PathBuf>,
@@ -310,23 +314,55 @@ struct UndoSnapshot {
 impl UndoSnapshot {
     fn capture(p: &Project) -> Self {
         Self {
+            simple_only: p.mode == EditMode::SimpleClip,
             source: p.source.clone(),
             media: p.media.clone(),
             proxy: p.proxy.clone(),
             in_ms: p.in_ms,
             out_ms: p.out_ms,
             simple_audio_muted: p.simple_audio_muted,
-            assets: p.assets.clone(),
+            assets: if p.mode == EditMode::SimpleClip {
+                Default::default()
+            } else {
+                p.assets.clone()
+            },
             canvas: p.canvas,
-            groups: p.groups.clone(),
-            tracks: p.tracks.clone(),
-            clips: p.clips.clone(),
-            selected_clips: p.selected_clips.clone(),
-            text_overlays: p.text_overlays.clone(),
+            groups: if p.mode == EditMode::SimpleClip {
+                Default::default()
+            } else {
+                p.groups.clone()
+            },
+            tracks: if p.mode == EditMode::SimpleClip {
+                Default::default()
+            } else {
+                p.tracks.clone()
+            },
+            clips: if p.mode == EditMode::SimpleClip {
+                Default::default()
+            } else {
+                p.clips.clone()
+            },
+            selected_clips: if p.mode == EditMode::SimpleClip {
+                Default::default()
+            } else {
+                p.selected_clips.clone()
+            },
+            text_overlays: if p.mode == EditMode::SimpleClip {
+                Default::default()
+            } else {
+                p.text_overlays.clone()
+            },
         }
     }
 
     fn apply(self, p: &mut Project) {
+        if self.simple_only {
+            p.in_ms = self.in_ms;
+            p.out_ms = self.out_ms;
+            p.simple_audio_muted = self.simple_audio_muted;
+            p.remember_simple();
+            return;
+        }
         p.source = self.source;
         p.media = self.media;
         p.proxy = self.proxy;
@@ -477,6 +513,7 @@ pub struct ClipperApp {
     live: live::LivePreview,
     thumbnails: thumbnails::Thumbnails,
     canvas_drag: Option<canvas::CanvasDrag>,
+    canvas_ui: canvas::CanvasUi,
     status: String,
     export_mode: ExportMode,
     /// Custom-encode settings persist between modal sessions so the user
@@ -515,6 +552,7 @@ pub struct ClipperApp {
     user_dragging_seek: bool,
     was_dragging_seek: bool,
     seek_cooldown_until: Option<std::time::Instant>,
+    histories: HashMap<simple::HistoryKey, (Vec<UndoSnapshot>, Vec<UndoSnapshot>)>,
     undo_stack: Vec<UndoSnapshot>,
     redo_stack: Vec<UndoSnapshot>,
     /// When true, the Export Options modal is shown. The actual export
@@ -588,6 +626,7 @@ impl ClipperApp {
             live: live::LivePreview::default(),
             thumbnails: thumbnails::Thumbnails::default(),
             canvas_drag: None,
+            canvas_ui: Default::default(),
             status: "Open a video to begin.".into(),
             export_mode: ExportMode::Auto,
             custom_encode: CustomEncode::default_for(recommended),
@@ -601,6 +640,7 @@ impl ClipperApp {
             user_dragging_seek: false,
             was_dragging_seek: false,
             seek_cooldown_until: None,
+            histories: HashMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             export_options_open: false,
@@ -710,6 +750,7 @@ impl ClipperApp {
     }
 
     fn undo(&mut self) {
+        self.canvas_ui.stop_wheel();
         log::info!("Undo requested");
         let Some(snap) = self.undo_stack.pop() else {
             return;
@@ -724,6 +765,7 @@ impl ClipperApp {
     }
 
     fn redo(&mut self) {
+        self.canvas_ui.stop_wheel();
         let Some(snap) = self.redo_stack.pop() else {
             return;
         };
@@ -806,13 +848,14 @@ impl ClipperApp {
     }
 
     fn open_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        if let Some(paths) = rfd::FileDialog::new()
             .add_filter("Video", &["mp4", "mkv", "mov", "webm", "avi", "m4v"])
-            .pick_file()
-        else {
-            return;
-        };
-        self.open_path(path);
+            .pick_files()
+        {
+            for path in paths {
+                self.open_path(path);
+            }
+        }
     }
 
     /// Open a source file directly — used by the file dialog, and by
@@ -828,6 +871,20 @@ impl ClipperApp {
             return;
         }
         crate::diagnostics::register_media(&path);
+        if self.project.is_some() {
+            match media::probe(&path) {
+                Ok(info) => {
+                    let id = self
+                        .project
+                        .as_mut()
+                        .unwrap()
+                        .import_asset(track::LayerSource { path, media: info });
+                    self.select_simple_media(id);
+                }
+                Err(e) => self.status = format!("Could not import video: {e:#}"),
+            }
+            return;
+        }
         match media::probe(&path) {
             Ok(info) => {
                 self.live.clear();
@@ -895,6 +952,7 @@ impl ClipperApp {
                     playhead_ms: 0,
                     in_ms: None,
                     out_ms: None,
+                    simple: Default::default(),
                     simple_audio_muted: false,
                     assets: Vec::new(),
                     canvas: Default::default(),
@@ -915,6 +973,10 @@ impl ClipperApp {
                         },
                     });
                 }
+                if let Some(p) = &mut self.project {
+                    p.simple.focus = p.assets.first().map(|a| a.id);
+                }
+                self.histories.clear();
                 self.undo_stack.clear();
                 self.redo_stack.clear();
             }
@@ -1127,29 +1189,57 @@ impl ClipperApp {
         if self.project.is_none() && new_mode == EditMode::MultiTrack {
             self.project = Some(Project::empty());
         }
-        let Some(p) = &mut self.project else {
-            return;
-        };
-        if p.mode == new_mode {
+        if self.project.as_ref().is_some_and(|p| p.mode == new_mode) {
             return;
         }
+        self.stash_history();
+        let p = self.project.as_mut().unwrap();
+        if p.mode == EditMode::SimpleClip {
+            p.remember_simple();
+        } else {
+            p.simple.advanced_position = p.playhead_ms;
+        }
+        if new_mode == EditMode::SimpleClip {
+            let focus = p
+                .simple
+                .focus
+                .filter(|id| {
+                    p.assets
+                        .iter()
+                        .any(|a| a.id == *id && a.source.media.width > 0)
+                })
+                .or_else(|| {
+                    p.assets
+                        .iter()
+                        .find(|a| a.source.media.width > 0)
+                        .map(|a| a.id)
+                });
+            // Focus restoration must not save the Advanced playhead as a source position.
+            if let Some(id) = focus {
+                p.focus_simple(id);
+            } else {
+                p.source = PathBuf::new();
+                p.media = Project::blank_media();
+                p.playhead_ms = 0;
+                p.in_ms = None;
+                p.out_ms = None;
+            }
+        } else {
+            p.playhead_ms = p.simple.advanced_position;
+        }
         p.mode = new_mode;
-        p.playhead_ms = 0;
-        p.selected_clips.clear();
         self.live.clear();
         self.canvas_drag = None;
+        self.canvas_ui = Default::default();
         let _ = self.player.set_paused(true);
         let _ = self.player.set_lavfi_complex("");
         self.last_lavfi_complex.clear();
-        if new_mode == EditMode::MultiTrack {
-            if let Some(h) = self.proxy_handle.take() {
-                h.cancel();
-            }
+        if let Some(h) = self.proxy_handle.take() {
+            h.cancel();
         }
-        if new_mode == EditMode::SimpleClip && p.source.is_file() {
-            let _ = self
-                .player
-                .set_file(p.proxy.as_deref().unwrap_or(&p.source), 0);
+        self.restore_history();
+        if new_mode == EditMode::SimpleClip {
+            self.load_simple_preview();
         }
     }
     fn toggle_play(&mut self) {
@@ -1426,6 +1516,7 @@ impl ClipperApp {
         {
             return actions;
         }
+        let background_editor = self.canvas_ui.background_open;
         let Some(project) = &mut self.project else {
             // Even without a project, swallow ctrl+z so it doesn't reach
             // unrelated widgets. With a project, undo is handled below.
@@ -1453,6 +1544,9 @@ impl ClipperApp {
             }
             if (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Y) {
                 actions.redo = true;
+            }
+            if background_editor {
+                return;
             }
             match project.mode {
                 EditMode::SimpleClip => {
@@ -1712,16 +1806,34 @@ impl eframe::App for ClipperApp {
             .project
             .as_ref()
             .is_some_and(|p| p.mode == EditMode::MultiTrack);
-        let mut panel = egui::TopBottomPanel::bottom("controls").frame(
+        let rows = self
+            .project
+            .as_ref()
+            .map(|p| p.timeline_view().0.len())
+            .unwrap_or(0);
+        let dragging = egui::DragAndDrop::payload::<editor::EditorDrag>(ctx)
+            .is_some_and(|payload| matches!(payload.as_ref(), editor::EditorDrag::Asset(_)));
+        let fit_rows = (rows + usize::from(dragging && rows > 0)).max(1);
+        let panel_id = if advanced {
+            egui::Id::new(("advanced_timeline", fit_rows))
+        } else {
+            egui::Id::new("simple_controls")
+        };
+        let mut panel = egui::TopBottomPanel::bottom(panel_id).frame(
             Frame::none()
                 .fill(theme::BG_PANEL)
                 .inner_margin(Margin::symmetric(12.0, 8.0)),
         );
         if advanced {
+            let max = (ctx.available_rect().height() - 150.0).max(160.0);
             panel = panel
                 .resizable(true)
-                .default_height(230.0)
-                .height_range(140.0..=(ctx.screen_rect().height() * 0.55).max(160.0));
+                .default_height((fit_rows as f32 * 54.0 + 136.0).min(max))
+                .height_range(150.0..=max);
+        } else {
+            panel = panel
+                .default_height(360.0)
+                .height_range(300.0..=(ctx.available_rect().height() - 130.0).max(360.0));
         }
         panel.show(ctx, |ui| {
             self.show_controls(ui);
@@ -1762,7 +1874,17 @@ impl eframe::App for ClipperApp {
                         .inner_margin(Margin::same(12.0)),
                 )
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.show_edit_panel(ui));
+                    egui::ScrollArea::vertical()
+                        .id_salt("clip_edit_scroll")
+                        .max_height(ui.available_height())
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .show(ui, |ui| {
+                            self.show_edit_panel(ui);
+                            ui.add_space(12.0);
+                        });
                 });
         }
 
@@ -1909,11 +2031,6 @@ impl ClipperApp {
         struct Snapshot {
             clip_id: ClipId,
             track_kind: Option<TrackKind>,
-            track_name: String,
-            cut_start: i64,
-            cut_end: i64,
-            src_start: i64,
-            src_end: i64,
             /// Which audio CLIPS this Edit affects. Gain is per-clip so
             /// one loud segment can be pulled down without touching the
             /// rest of the track. For an audio clip: just itself. For a
@@ -1961,11 +2078,6 @@ impl ClipperApp {
             Some(Snapshot {
                 clip_id,
                 track_kind: kind,
-                track_name: track.map(|t| t.name.clone()).unwrap_or_default(),
-                cut_start: clip.cut_start_ms,
-                cut_end: clip.cut_end_ms(),
-                src_start: clip.src_start_ms,
-                src_end: clip.src_end_ms,
                 audio_clip_ids,
                 initial_gain,
                 speed_target_clip_ids,
@@ -1979,45 +2091,6 @@ impl ClipperApp {
             ui.label(RichText::new("Select a clip on the timeline.").color(theme::TEXT_MUTED));
             return;
         };
-
-        ui.collapsing("Clip details", |ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{} clip on {}",
-                    match snap.track_kind {
-                        Some(TrackKind::Video) => "Video",
-                        Some(TrackKind::Audio) => "Audio",
-                        None => "Unknown",
-                    },
-                    snap.track_name,
-                ))
-                .size(14.0)
-                .color(theme::TEXT_PRIMARY)
-                .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!(
-                    "Position  {} → {}",
-                    media::format_timestamp(snap.cut_start),
-                    media::format_timestamp(snap.cut_end),
-                ))
-                .size(12.0)
-                .color(theme::TEXT_MUTED)
-                .monospace(),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "Source    {} → {}",
-                    media::format_timestamp(snap.src_start),
-                    media::format_timestamp(snap.src_end),
-                ))
-                .size(12.0)
-                .color(theme::TEXT_MUTED)
-                .monospace(),
-            );
-        });
-        ui.add_space(6.0);
 
         // ─────────── Audio gain ───────────
         if !snap.audio_clip_ids.is_empty() {
@@ -2918,11 +2991,15 @@ impl ClipperApp {
             .inner_margin(Margin::symmetric(14.0, 8.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(&self.status)
-                            .size(12.5)
-                            .color(theme::TEXT_PRIMARY),
-                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&self.status)
+                                .size(12.5)
+                                .color(theme::TEXT_PRIMARY),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&self.status);
                 });
             });
     }
@@ -4122,16 +4199,16 @@ impl ClipperApp {
 //
 // Pipeline:
 //   1. Snapshot GL state we might disturb.
-//   2. (Re)create our offscreen FBO sized to the target rect.
+//   2. Keep an offscreen FBO at a stable source size (up to 1080p).
 //   3. Bind our FBO, ask mpv to render into it.
 //   4. Bind the original draw FBO back, blit our FBO into the rect.
 //   5. Restore GL state for egui's subsequent draws.
 //
 // Why the FBO indirection: mpv calls glViewport(0,0,w,h) internally before
 // drawing, so any viewport we set is overwritten — mpv always paints into
-// the bottom-left corner of whatever framebuffer is bound. To get the
-// video into an arbitrary rect we render into a private FBO at (0,0,w,h)
-// then blit-copy that FBO into the rect we want.
+// the bottom-left corner of whatever framebuffer is bound. A stable
+// source-sized FBO avoids reallocations and fractional scaler artifacts
+// while changing focus or resizing. Blit-copy it into the display rect.
 fn paint_mpv(
     player: &Arc<Player>,
     video_fbo: &Arc<Mutex<Option<VideoFbo>>>,
@@ -4144,6 +4221,7 @@ fn paint_mpv(
     }
 
     let gl = painter.gl();
+    let _interop = unsafe { crate::gl_interop::Guard::capture(gl) };
     let vp = info.viewport_in_pixels();
     let (vp_x, vp_y) = (vp.left_px, vp.from_bottom_px);
     let (vp_w, vp_h) = (vp.width_px, vp.height_px);
@@ -4151,12 +4229,17 @@ fn paint_mpv(
         return;
     }
 
+    let (source_w, source_h) = player
+        .state()
+        .video_size
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .unwrap_or((vp_w, vp_h));
+    let fit = (1920.0 / source_w as f32)
+        .min(1080.0 / source_h as f32)
+        .min(1.0);
+    let render_w = (source_w as f32 * fit).round().max(2.0) as i32;
+    let render_h = (source_h as f32 * fit).round().max(2.0) as i32;
     let mut fbo_slot = video_fbo.lock().unwrap();
-    VideoFbo::ensure_size(&mut fbo_slot, gl, vp_w, vp_h);
-    let Some(my_fbo) = fbo_slot.as_ref() else {
-        log::error!("video FBO allocation failed; skipping frame");
-        return;
-    };
 
     unsafe {
         // Snapshot
@@ -4172,12 +4255,18 @@ fn paint_mpv(
         let prev_cull_enabled = gl.is_enabled(glow::CULL_FACE);
         let prev_active_tex = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
 
+        VideoFbo::ensure_size(&mut fbo_slot, gl, render_w, render_h);
+        let Some(my_fbo) = fbo_slot.as_ref() else {
+            log::error!("video FBO allocation failed; skipping frame");
+            return;
+        };
+
         gl.disable(glow::SCISSOR_TEST);
 
         // 1. Bind our FBO and let mpv render into it.
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(my_fbo.fbo()));
-        gl.viewport(0, 0, vp_w, vp_h);
-        if let Err(e) = player.render(my_fbo.fbo_id_i32(), vp_w, vp_h, true) {
+        gl.viewport(0, 0, render_w, render_h);
+        if let Err(e) = player.render(my_fbo.fbo_id_i32(), render_w, render_h, true) {
             log::error!("mpv render: {e:#}");
         }
 
@@ -4188,8 +4277,8 @@ fn paint_mpv(
         gl.blit_framebuffer(
             0,
             0,
-            vp_w,
-            vp_h,
+            render_w,
+            render_h,
             vp_x,
             vp_y,
             vp_x + vp_w,
@@ -4563,7 +4652,21 @@ fn painted_button(
         (fill_normal, text_normal)
     };
 
-    ui.painter().rect_filled(rect, Rounding::same(6.0), fill);
+    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    if enabled {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            4.0,
+            Stroke::new(
+                1.0_f32,
+                if response.hovered() {
+                    theme::ACCENT.gamma_multiply(0.7)
+                } else {
+                    theme::BORDER
+                },
+            ),
+        );
+    }
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -4643,11 +4746,11 @@ fn pill_button(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) ->
         (Color32::TRANSPARENT, theme::TEXT_MUTED)
     };
 
-    ui.painter().rect_filled(rect, Rounding::same(15.0), fill);
+    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
     if !selected && enabled {
         ui.painter().rect_stroke(
             rect,
-            Rounding::same(15.0),
+            Rounding::same(4.0),
             Stroke::new(1.0_f32, theme::BORDER),
         );
     }
@@ -4744,7 +4847,7 @@ fn speed_preset_chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Resp
         (theme::BG_BUTTON, theme::TEXT_PRIMARY)
     };
 
-    ui.painter().rect_filled(rect, Rounding::same(13.0), fill);
+    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -4797,6 +4900,7 @@ mod caption_tests {
             playhead_ms: 0,
             in_ms: None,
             out_ms: None,
+            simple: Default::default(),
             simple_audio_muted: false,
             assets: Vec::new(),
             canvas: Default::default(),
