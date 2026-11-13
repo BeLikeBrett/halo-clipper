@@ -14,6 +14,7 @@ for name in ['LICENSE','THIRD-PARTY-NOTICES.md']:shutil.copy2(root/name,payload/
 shutil.copy2(root/'packaging/runtime-lock.json',payload/'runtime-lock.json')
 licenses=payload/'licenses';licenses.mkdir(exist_ok=True)
 shutil.copy2(root/'assets/fonts/LICENSE',licenses/'DejaVu-LICENSE')
+for font in ['Inter','JetBrainsMono']:shutil.copy2(root/f'assets/fonts/{font}-LICENSE.txt',licenses/f'{font}-LICENSE')
 for source in runtime.rglob('*'):
     if source.is_file() and ('LICENSE' in source.name.upper() or 'COPYING' in source.name.upper()) and source.suffix not in ['.7z','.zip']:
         name='-'.join(source.relative_to(runtime).parts)

@@ -35,6 +35,9 @@ pub(super) struct LivePreview {
     pub frames: Vec<FrameLayer>,
     gpu: Arc<Mutex<Option<CompositeGpu>>>,
     retired: Arc<Mutex<Vec<FrameBuffer>>>,
+    /// Audio tracks silenced for monitoring only. Lives here, not on the
+    /// project, so it never reaches undo history or the export.
+    pub monitor_muted: HashSet<TrackId>,
 }
 impl LivePreview {
     pub fn position(&self) -> i64 {
@@ -168,7 +171,7 @@ impl LivePreview {
                 let _ = slot.player.set_paused(!self.playing);
                 slot.playing = self.playing;
             }
-            let mute = !audio || muted;
+            let mute = !audio || muted || self.monitor_muted.contains(&t.id);
             if slot.muted != Some(mute) {
                 let _ = slot.player.set_mute(mute);
                 slot.muted = Some(mute);

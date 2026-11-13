@@ -44,6 +44,22 @@ impl Project {
             (a.min(c.cut_start_ms), b.max(c.cut_end_ms()))
         })
     }
+    /// Audio tracks folded into compound (V+A) bars on `video_track`. The
+    /// row's monitor toggle acts on these, since their own lanes are hidden
+    /// while attached.
+    pub(super) fn attached_audio_tracks(&self, video_track: TrackId) -> HashSet<TrackId> {
+        let track_of = |id: &ClipId| track::clip_by_id(&self.clips, *id).map(|c| c.track_id);
+        self.groups
+            .values()
+            .filter(|g| g.attached && g.members.iter().any(|id| track_of(id) == Some(video_track)))
+            .flat_map(|g| {
+                g.members
+                    .iter()
+                    .filter(|id| !self.is_video(**id))
+                    .filter_map(track_of)
+            })
+            .collect()
+    }
     pub(super) fn is_video(&self, id: ClipId) -> bool {
         track::clip_by_id(&self.clips, id).is_some_and(|c| {
             self.tracks

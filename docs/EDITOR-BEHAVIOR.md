@@ -74,6 +74,41 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## Interface pass (2026-11-13)
+
+- Typography: Inter (Regular/Medium/SemiBold) for the interface and
+  JetBrains Mono for timecodes, embedded as small Latin subsets. DejaVu stays
+  as fallback and for caption previews. Weights are separate font families
+  because egui has no synthetic bold; use `theme::medium/semibold/mono`.
+- Icons are painted (`widgets.rs`), never emoji glyphs, so weight and
+  alignment don't depend on the fallback font.
+- Top-bar menus unroll out of their button (shared fill, square inner corner,
+  160 ms ease-out reveal). Hovering a sibling while one is open switches menus.
+- Advanced timeline: the ruler is pinned above the scrolling lanes and its
+  header cell shows the live playhead time. The whole ruler scrubs; the
+  playhead head is a large grab handle and the line itself is grabbable ±5 px.
+- A clip being dragged disappears from its old spot as soon as a drop
+  position exists; only the full-fidelity ghost (thumbnail, label, audio
+  strip) is drawn.
+- Abutting clips (splits) are separated by a 2 px gap with splice notches at
+  the seam. Selection outlines are drawn inside the clip so they never
+  overlap a neighbour.
+- V+A compounds show their attached audio as a green strip along the bottom
+  of the bar instead of a "· V+A" suffix.
+- Track headers have a monitor (speaker) toggle on audio tracks and on video
+  rows that carry attached audio. It mutes the preview only:
+  `LivePreview::monitor_muted` is outside the project, undo history and the
+  export. The right-click "Disable track" still affects export.
+- Canvas move/resize snaps magnetically (10 px) to canvas edges and center
+  and to other layers' edges/centers, with guides; dragging further breaks
+  free, Alt disables snapping.
+- Reset frame is aspect-aware: when the source and canvas shapes differ by more
+  than 12 % (e.g. 16:9 gameplay in 9:16) it fits whole and centered with bars;
+  otherwise it fills.
+- The timeline panel's content claims the full panel height. egui stores a
+  resizable panel's height from its content, so any shortfall in the height
+  budget made the panel shrink a few pixels every frame.
+
 ## Native rendering
 
 The render adapter passes the generated native `mpv_opengl_fbo`, including its

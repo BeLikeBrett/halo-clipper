@@ -28,6 +28,8 @@ pub(super) struct CanvasUi {
     wheel_blocked: bool,
     outline_clip: Option<ClipId>,
     outline_until: f64,
+    /// Snap guides for the drag in progress (empty when not snapped).
+    guides: Vec<Guide>,
 }
 impl Default for CanvasUi {
     fn default() -> Self {
@@ -40,6 +42,7 @@ impl Default for CanvasUi {
             wheel_blocked: false,
             outline_clip: None,
             outline_until: 0.0,
+            guides: Vec::new(),
         }
     }
 }
@@ -65,6 +68,107 @@ fn zoom_at(
     transform.y = (center.y - canvas.top()) / canvas.height();
     transform
 }
+/// Screen-pixel radius inside which an edge locks to a guide. Firm
+/// enough to square a layer up without aiming; dragging further breaks
+/// free, and Alt turns snapping off entirely.
+const SNAP_PX: f32 = 10.0;
+
+/// Lines a moving layer can lock to: the canvas edges and center, plus
+/// the edges and centers of the other visible layers.
+#[derive(Debug, Default)]
+struct SnapTargets {
+    xs: Vec<f32>,
+    ys: Vec<f32>,
+}
+impl SnapTargets {
+    fn new(canvas: egui::Rect, others: impl IntoIterator<Item = egui::Rect>) -> Self {
+        let mut t = Self {
+            xs: vec![canvas.left(), canvas.center().x, canvas.right()],
+            ys: vec![canvas.top(), canvas.center().y, canvas.bottom()],
+        };
+        for r in others {
+            t.xs.extend([r.left(), r.center().x, r.right()]);
+            t.ys.extend([r.top(), r.center().y, r.bottom()]);
+        }
+        t
+    }
+}
+
+/// A guide drawn while snapped: vertical (`x`) or horizontal (`y`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Guide {
+    X(f32),
+    Y(f32),
+}
+
+/// Smallest correction that puts one of `edges` on one of `targets`,
+/// with the target hit, if any lies within `SNAP_PX`.
+fn nearest(edges: &[f32], targets: &[f32]) -> Option<(f32, f32)> {
+    edges
+        .iter()
+        .flat_map(|e| targets.iter().map(move |t| (t - e, *t)))
+        .filter(|(d, _)| d.abs() <= SNAP_PX)
+        .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
+}
+
+/// Snaps a moved layer: each axis independently aligns its nearest edge
+/// or center. Returns the corrected rect plus the guides to draw.
+fn snap_move(rect: egui::Rect, targets: &SnapTargets) -> (egui::Rect, Vec<Guide>) {
+    let mut guides = Vec::new();
+    let mut offset = egui::Vec2::ZERO;
+    if let Some((dx, x)) = nearest(&[rect.left(), rect.center().x, rect.right()], &targets.xs) {
+        offset.x = dx;
+        guides.push(Guide::X(x));
+    }
+    if let Some((dy, y)) = nearest(&[rect.top(), rect.center().y, rect.bottom()], &targets.ys) {
+        offset.y = dy;
+        guides.push(Guide::Y(y));
+    }
+    (rect.translate(offset), guides)
+}
+
+/// Snaps a corner resize. The opposite corner (`anchor`) is fixed and the
+/// aspect ratio is locked, so only one axis can lock: whichever free edge
+/// is closer to a guide decides the scale.
+fn snap_resize(
+    anchor: egui::Pos2,
+    corner: (f32, f32),
+    size: egui::Vec2,
+    targets: &SnapTargets,
+) -> Option<(f32, Guide)> {
+    let (sx, sy) = corner;
+    let free = anchor + egui::vec2(sx * size.x, sy * size.y);
+    let x = nearest(&[free.x], &targets.xs)
+        .map(|(d, t)| (d.abs(), (t - anchor.x).abs() / size.x.max(1.0), Guide::X(t)));
+    let y = nearest(&[free.y], &targets.ys)
+        .map(|(d, t)| (d.abs(), (t - anchor.y).abs() / size.y.max(1.0), Guide::Y(t)));
+    [x, y]
+        .into_iter()
+        .flatten()
+        .filter(|(_, factor, _)| *factor > 0.02)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, factor, guide)| (factor, guide))
+}
+
+/// Reset framing that suits the canvas: a source whose shape is close to
+/// the canvas fills it (no hairline bars); a clearly different shape —
+/// landscape gameplay in a 9:16 canvas — fits whole and centered, with
+/// bars, so nothing is cropped away.
+pub(super) fn reset_transform(source: (u32, u32), canvas: (u32, u32), opacity: f32) -> Transform {
+    let aspect = |(w, h): (u32, u32)| w.max(1) as f32 / h.max(1) as f32;
+    let (a, b) = (aspect(source), aspect(canvas));
+    let mismatch = a.max(b) / a.min(b);
+    Transform {
+        fit: if mismatch > 1.12 {
+            crate::framing::Fit::Fit
+        } else {
+            crate::framing::Fit::Fill
+        },
+        opacity,
+        ..Default::default()
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CanvasDrag {
     clip: ClipId,
@@ -107,7 +211,7 @@ impl ClipperApp {
             }
             if ui
                 .add_enabled(focused.is_some(), egui::Button::new("Reset frame"))
-                .on_hover_text("Center the selected video and fill the canvas. Ctrl+Z to undo.")
+                .on_hover_text("Center the selected video. Fills the canvas when the shapes match; fits whole with bars when they don't (e.g. gameplay in 9:16). Ctrl+Z to undo.")
                 .clicked()
             {
                 reset = focused;
@@ -222,7 +326,7 @@ impl ClipperApp {
                 )
                 .on_hover_cursor(egui::CursorIcon::Move);
             response.context_menu(|ui| {
-                if ui.button("Reset frame · fill & center").clicked() {
+                if ui.button("Reset frame").clicked() {
                     reset = Some(layer.id);
                     ui.close_menu();
                 }
@@ -308,23 +412,49 @@ impl ClipperApp {
             self.live.pause();
             self.canvas_drag = Some(drag);
         }
+        if self.canvas_drag.is_none() {
+            self.canvas_ui.guides.clear();
+        }
         if let (Some(drag), Some(pointer)) = (&self.canvas_drag, drag_pointer) {
             let mut transform = drag.origin;
+            let snapping = !ui.input(|i| i.modifiers.alt);
+            let targets = SnapTargets::new(
+                canvas,
+                frames
+                    .iter()
+                    .filter(|f| f.id != drag.clip)
+                    .map(|f| layer_rect(canvas, f.width, f.height, f.transform)),
+            );
+            self.canvas_ui.guides.clear();
             if let Some((sx, sy)) = drag.corner {
                 let anchor = drag.rect.center()
                     - egui::vec2(sx * drag.rect.width() * 0.5, sy * drag.rect.height() * 0.5);
                 let relative = egui::vec2((pointer.x - anchor.x) * sx, (pointer.y - anchor.y) * sy);
                 let diagonal = drag.rect.size();
-                let factor = (relative.dot(diagonal) / diagonal.length_sq().max(1.0)).max(0.02);
+                let mut factor = (relative.dot(diagonal) / diagonal.length_sq().max(1.0)).max(0.02);
+                if snapping {
+                    if let Some((snapped, guide)) =
+                        snap_resize(anchor, (sx, sy), diagonal * factor, &targets)
+                            .map(|(f, g)| (f * factor, g))
+                    {
+                        factor = snapped;
+                        self.canvas_ui.guides.push(guide);
+                    }
+                }
                 transform.scale = (drag.origin.scale * factor).clamp(0.03, 8.0);
                 let size = drag.rect.size() * (transform.scale / drag.origin.scale);
                 let center = anchor + egui::vec2(sx * size.x * 0.5, sy * size.y * 0.5);
                 transform.x = (center.x - canvas.left()) / canvas.width();
                 transform.y = (center.y - canvas.top()) / canvas.height();
             } else {
-                let delta = pointer - drag.pointer;
-                transform.x = drag.origin.x + delta.x / canvas.width();
-                transform.y = drag.origin.y + delta.y / canvas.height();
+                let mut moved = drag.rect.translate(pointer - drag.pointer);
+                if snapping {
+                    let (snapped, guides) = snap_move(moved, &targets);
+                    moved = snapped;
+                    self.canvas_ui.guides = guides;
+                }
+                transform.x = (moved.center().x - canvas.left()) / canvas.width();
+                transform.y = (moved.center().y - canvas.top()) / canvas.height();
             }
             if let Some(c) = self
                 .project
@@ -392,16 +522,17 @@ impl ClipperApp {
         if let Some(id) = reset {
             self.canvas_ui.stop_wheel();
             self.push_undo();
-            if let Some(clip) = self
-                .project
-                .as_mut()
-                .and_then(|p| p.clips.iter_mut().find(|c| c.id == id))
-            {
-                clip.transform = Transform {
-                    fit: crate::framing::Fit::Fill,
-                    opacity: clip.transform.opacity,
-                    ..Default::default()
-                };
+            let canvas_size = (media.width, media.height);
+            if let Some(p) = self.project.as_mut() {
+                let source = track::clip_by_id(&p.clips, id)
+                    .map(|c| {
+                        let m = p.clip_source(c).1;
+                        (m.width, m.height)
+                    })
+                    .unwrap_or(canvas_size);
+                if let Some(clip) = p.clips.iter_mut().find(|c| c.id == id) {
+                    clip.transform = reset_transform(source, canvas_size, clip.transform.opacity);
+                }
             }
             if let Some(p) = &mut self.project {
                 p.selected_clips = [id].into_iter().collect();
@@ -460,6 +591,17 @@ impl ClipperApp {
                 );
             }
         }
+        if !self.canvas_ui.guides.is_empty() {
+            let painter = ui.painter().with_clip_rect(canvas.expand(1.0));
+            let stroke = Stroke::new(1.0_f32, theme::PLAYHEAD);
+            for guide in &self.canvas_ui.guides {
+                let points = match *guide {
+                    Guide::X(x) => [egui::pos2(x, canvas.top()), egui::pos2(x, canvas.bottom())],
+                    Guide::Y(y) => [egui::pos2(canvas.left(), y), egui::pos2(canvas.right(), y)],
+                };
+                painter.line_segment(points, stroke);
+            }
+        }
         if self.project.as_ref().is_some_and(|p| p.clips.is_empty()) {
             ui.painter().text(
                 canvas.center(),
@@ -489,6 +631,42 @@ mod tests {
         let restored = zoom_at(canvas, 1920, 1080, zoomed, pointer, -100.0);
         assert!((restored.scale - t.scale).abs() < 0.0001);
         assert!((restored.x - t.x).abs() < 0.0001 && (restored.y - t.y).abs() < 0.0001);
+    }
+    #[test]
+    fn moving_near_an_edge_locks_flush_and_far_moves_stay_free() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0));
+        let targets = SnapTargets::new(canvas, []);
+        let near = egui::Rect::from_min_size(egui::pos2(7.0, 100.0), egui::vec2(300.0, 200.0));
+        let (snapped, guides) = snap_move(near, &targets);
+        assert_eq!(snapped.left(), 0.0);
+        assert!(guides.contains(&Guide::X(0.0)));
+        let far = near.translate(egui::vec2(40.0, 0.0));
+        assert_eq!(snap_move(far, &targets).0.left(), far.left());
+    }
+    #[test]
+    fn corner_resize_snaps_the_free_edge_to_the_canvas() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0));
+        let targets = SnapTargets::new(canvas, []);
+        // Anchor top-left at the origin; bottom-right corner lands 6 px
+        // short of the right edge.
+        let (factor, guide) = snap_resize(
+            egui::Pos2::ZERO,
+            (1.0, 1.0),
+            egui::vec2(994.0, 300.0),
+            &targets,
+        )
+        .unwrap();
+        assert_eq!(guide, Guide::X(1000.0));
+        assert!((994.0 * factor - 1000.0).abs() < 0.01);
+    }
+    #[test]
+    fn reset_fits_mismatched_shapes_and_fills_close_ones() {
+        let vertical = reset_transform((1920, 1080), (1080, 1920), 1.0);
+        assert_eq!(vertical.fit, crate::framing::Fit::Fit);
+        assert_eq!((vertical.x, vertical.y, vertical.scale), (0.5, 0.5, 1.0));
+        let near = reset_transform((1920, 1080), (1920, 1200), 0.5);
+        assert_eq!(near.fit, crate::framing::Fit::Fill);
+        assert_eq!(near.opacity, 0.5);
     }
     #[test]
     fn a_full_frame_layer_can_move_and_resize_freely() {

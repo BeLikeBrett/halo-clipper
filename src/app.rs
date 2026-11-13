@@ -1590,6 +1590,15 @@ impl ClipperApp {
             if i.key_pressed(egui::Key::L) || i.key_pressed(egui::Key::ArrowRight) {
                 project.playhead_ms = (project.playhead_ms + step).min(max_playhead);
             }
+            if i.key_pressed(egui::Key::Home) {
+                project.playhead_ms = 0;
+            }
+            if i.key_pressed(egui::Key::End) {
+                project.playhead_ms = match project.mode {
+                    EditMode::SimpleClip => max_playhead,
+                    EditMode::MultiTrack => project.content_end_ms(),
+                };
+            }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 actions.toggle_play = true;
             }
@@ -1715,90 +1724,84 @@ impl eframe::App for ClipperApp {
             .frame(
                 Frame::none()
                     .fill(theme::BG_HEADER)
-                    .inner_margin(Margin::symmetric(14.0, 10.0)),
+                    .inner_margin(Margin::symmetric(12.0, 7.0))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    egui::menu::menu_button(ui, "File", |ui| {
-                        if ui.button("Open Video…").clicked() {
-                            ui.close_menu();
-                            self.open_file();
-                        }
-                        ui.separator();
-                        if ui.button("Settings…").clicked() {
-                            ui.close_menu();
-                            self.settings_open = true;
-                        }
-                        ui.separator();
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    paint_brand(ui);
+                    ui.add_space(14.0);
+                    let mut want_open = false;
+                    let mut want_settings = false;
+                    let mut want_support = false;
+                    let mut want_quit = false;
+                    crate::widgets::menu_bar_button(ui, "File", 210.0, |ui| {
+                        want_open = crate::widgets::menu_item(ui, "Open Video…", None).clicked();
+                        crate::widgets::menu_separator(ui);
+                        want_settings = crate::widgets::menu_item(ui, "Settings…", None).clicked();
+                        crate::widgets::menu_separator(ui);
+                        want_quit = crate::widgets::menu_item(ui, "Quit", None).clicked();
+                        want_open || want_settings || want_quit
                     });
-
-                    if ui
-                        .button(
-                            if matches!(self.updater.state, crate::updater::State::Available(_)) {
-                                "Update available"
+                    let update = matches!(self.updater.state, crate::updater::State::Available(_));
+                    crate::widgets::menu_bar_button(ui, "Help", 210.0, |ui| {
+                        want_support = crate::widgets::menu_item(
+                            ui,
+                            if update {
+                                "Install update…"
                             } else {
-                                "Help / Updates"
+                                "Help & updates…"
                             },
+                            None,
                         )
-                        .clicked()
-                    {
+                        .clicked();
+                        want_support
+                    });
+                    if update {
+                        // A quiet badge instead of renaming the menu.
+                        let dot = ui.min_rect().right_top() + egui::vec2(-6.0, 7.0);
+                        ui.painter().circle_filled(dot, 3.5, theme::ACCENT);
+                    }
+                    if want_open {
+                        self.open_file();
+                    }
+                    if want_settings {
+                        self.settings_open = true;
+                    }
+                    if want_support {
                         self.support_open = true;
                     }
-                    ui.separator();
-                    ui.label(
-                        RichText::new("✂  Halo Clipper")
-                            .size(15.0)
-                            .strong()
-                            .color(theme::TEXT_PRIMARY),
-                    );
-                    ui.separator();
+                    if want_quit {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
 
-                    // Edit-mode toggle (pill tabs).
+                    // Mode switch, centered in the bar regardless of what
+                    // sits on the left.
                     let mode = self.project.as_ref().map(|p| p.mode);
-                    let has_project = true;
-                    let mut want_mode: Option<EditMode> = None;
-                    if pill_button(
-                        ui,
-                        "Simple Clip",
-                        mode == Some(EditMode::SimpleClip),
-                        has_project,
-                    )
-                    .on_hover_text(
-                        "Mark In/Out and export one range. Instant; \
-                         single-cut workflow.",
-                    )
-                    .clicked()
-                    {
-                        want_mode = Some(EditMode::SimpleClip);
+                    let options = [
+                        (
+                            "Simple Clip",
+                            "Mark In/Out and export one range. Instant; single-cut workflow.",
+                        ),
+                        (
+                            "Advanced",
+                            "Multi-track editing: split, delete, layer video and audio, \
+                             detach audio streams into their own lanes.",
+                        ),
+                    ];
+                    let switch_w = 214.0;
+                    let center = ui.max_rect().center().x;
+                    let gap = (center - switch_w * 0.5 - ui.cursor().left()).max(8.0);
+                    ui.add_space(gap);
+                    let selected = usize::from(mode == Some(EditMode::MultiTrack));
+                    if let Some(index) = crate::widgets::segmented(ui, "mode", &options, selected) {
+                        self.set_mode(if index == 0 {
+                            EditMode::SimpleClip
+                        } else {
+                            EditMode::MultiTrack
+                        });
                     }
-                    if pill_button(
-                        ui,
-                        "Advanced",
-                        mode == Some(EditMode::MultiTrack),
-                        has_project,
-                    )
-                    .on_hover_text(
-                        "Split / Delete + per-stream audio editing. Audio \
-                         follows video by default; press Detach (D) on a \
-                         clip to expose all source audio streams as their \
-                         own lanes.",
-                    )
-                    .clicked()
-                    {
-                        want_mode = Some(EditMode::MultiTrack);
-                    }
-                    if let Some(m) = want_mode {
-                        self.set_mode(m);
-                    }
-
-                    // (Export-mode picker moved into the Export Options
-                    // modal that appears when you click Export.)
-
-                    // (Filename moved to the bottom-left status bar — no
-                    // need to show it here too.)
                 });
             });
 
@@ -1828,7 +1831,7 @@ impl eframe::App for ClipperApp {
             let max = (ctx.available_rect().height() - 150.0).max(160.0);
             panel = panel
                 .resizable(true)
-                .default_height((fit_rows as f32 * 54.0 + 136.0).min(max))
+                .default_height((fit_rows as f32 * 54.0 + 134.0).min(max))
                 .height_range(150.0..=max);
         } else {
             panel = panel
@@ -2751,11 +2754,10 @@ impl ClipperApp {
 
             // Scrubber row: Play button + slim progress bar
             ui.horizontal(|ui| {
-                let play_label = if is_playing { "⏸" } else { "▶" };
-                let play_btn = egui::Button::new(RichText::new(play_label).size(18.0).strong())
-                    .fill(theme::ACCENT)
-                    .min_size(egui::vec2(46.0, 30.0));
-                if ui.add(play_btn).on_hover_text("Space").clicked() {
+                if crate::widgets::play_button(ui, is_playing)
+                    .on_hover_text("Play / pause  ·  Space")
+                    .clicked()
+                {
                     want_play = true;
                 }
                 let scrubber_out = timeline::scrubber(ui, &mut tl_state);
@@ -4593,6 +4595,34 @@ fn show_multitrack_info(ui: &mut egui::Ui, project: &Project, cut_duration: i64)
     });
 }
 
+/// App mark + name for the top bar: a ring (the "halo") with a bright arc,
+/// painted so it stays crisp at any scale.
+fn paint_brand(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 28.0), egui::Sense::hover());
+    let c = rect.center();
+    ui.painter().circle_stroke(
+        c,
+        7.5,
+        Stroke::new(2.0_f32, theme::ACCENT.gamma_multiply(0.35)),
+    );
+    let arc: Vec<_> = (0..=14)
+        .map(|i| {
+            let a = -2.4 + 1.9 * i as f32 / 14.0;
+            c + egui::vec2(a.cos(), a.sin()) * 7.5
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(
+        arc,
+        egui::epaint::PathStroke::new(2.0_f32, theme::ACCENT),
+    ));
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("Halo Clipper")
+            .font(theme::semibold(13.5))
+            .color(theme::TEXT_PRIMARY),
+    );
+}
+
 /// Primary call-to-action button. Uses the muted-teal `BTN_PRIMARY`
 /// palette instead of the high-contrast `ACCENT` so it draws the eye
 /// without glaring. One source of truth for every primary CTA
@@ -4717,56 +4747,6 @@ fn accent_button(ui: &mut egui::Ui, label: &str, accent: Color32, enabled: bool)
         13.5,
         true,
     )
-}
-
-/// Pill-shaped tab for the mode toggle. Selected → primary fill + light
-/// text. Unselected → transparent fill + muted text with hover tint.
-fn pill_button(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) -> egui::Response {
-    let font_id = egui::FontId::new(13.0, egui::FontFamily::Proportional);
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_string(), font_id.clone(), theme::TEXT_PRIMARY);
-    let pad_x = 22.0;
-    let size = egui::vec2((galley.size().x + pad_x * 2.0).max(100.0), 30.0);
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(size, sense);
-
-    let hovered = enabled && response.hovered();
-    let (fill, text_color) = if !enabled {
-        (Color32::TRANSPARENT, theme::TEXT_MUTED)
-    } else if selected {
-        (theme::BTN_PRIMARY, theme::BTN_PRIMARY_TEXT)
-    } else if hovered {
-        (theme::BG_BUTTON_HOVER, theme::TEXT_PRIMARY)
-    } else {
-        (Color32::TRANSPARENT, theme::TEXT_MUTED)
-    };
-
-    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
-    if !selected && enabled {
-        ui.painter().rect_stroke(
-            rect,
-            Rounding::same(4.0),
-            Stroke::new(1.0_f32, theme::BORDER),
-        );
-    }
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        font_id,
-        text_color,
-    );
-
-    if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        response
-    }
 }
 
 /// Slim progress bar used by the export modal — designed to fit the

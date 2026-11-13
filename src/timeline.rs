@@ -92,19 +92,24 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
         egui::vec2(mute_size, mute_size),
     );
     let mute_resp = ui.interact(mute_rect, egui::Id::new("simple_v1_mute"), Sense::click());
-    let glyph_color = if state.audio_muted {
-        theme::ACCENT_ERR
-    } else if mute_resp.hovered() {
-        theme::ACCENT
-    } else {
-        theme::TEXT_MUTED
-    };
-    painter.text(
-        mute_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        if state.audio_muted { "🔇" } else { "🔊" },
-        FontId::proportional(13.0),
-        glyph_color,
+    let mute_resp = mute_resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if state.audio_muted {
+            "Unmute audio"
+        } else {
+            "Mute audio"
+        });
+    crate::widgets::paint_icon_button(
+        ui,
+        mute_rect.expand(4.0),
+        &mute_resp,
+        if state.audio_muted {
+            crate::widgets::Icon::SpeakerMuted
+        } else {
+            crate::widgets::Icon::Speaker
+        },
+        state.audio_muted,
+        theme::ACCENT_ERR,
     );
     if mute_resp.clicked() {
         out.mute_toggled = true;
@@ -188,16 +193,16 @@ pub fn show(ui: &mut Ui, state: &mut TimelineState) -> (Response, TimelineOutput
             egui::pos2(ph_x, rect.top() + 4.0),
             egui::pos2(ph_x, rect.bottom() - LABEL_BAND_H),
         ],
-        Stroke::new(2.5_f32, Color32::WHITE),
+        Stroke::new(2.0_f32, theme::PLAYHEAD),
     );
     let triangle = vec![
-        egui::pos2(ph_x - 8.0, rect.top()),
-        egui::pos2(ph_x + 8.0, rect.top()),
-        egui::pos2(ph_x, rect.top() + 11.0),
+        egui::pos2(ph_x - 7.0, rect.top()),
+        egui::pos2(ph_x + 7.0, rect.top()),
+        egui::pos2(ph_x, rect.top() + 10.0),
     ];
     painter.add(egui::Shape::convex_polygon(
         triangle,
-        Color32::WHITE,
+        theme::PLAYHEAD,
         Stroke::NONE,
     ));
 

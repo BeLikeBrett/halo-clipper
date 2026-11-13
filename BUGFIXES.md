@@ -5,6 +5,58 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-13 — Advanced: dragged clip stayed visible in its old lane
+
+### Symptom
+
+Dragging a clip (or a V+A compound) to another track drew the drop ghost
+at the target while the original bar kept rendering at its old position until
+release, so the clip looked duplicated rather than moved.
+
+### Root cause
+
+The lane loop painted every clip unconditionally; the drag payload only added
+a ghost on top.
+
+### Fix
+
+`show_editor_timeline` skips the clip whose id matches an `EditorDrag::Clip`
+payload once `placement` resolves a drop position, and the ghost is painted
+with the full clip renderer (thumbnail, label, audio strip). Seam markers
+ignore the moving clip, so a split partner doesn't show a cut against a gap.
+
+### Verification
+
+Headless Xvfb rig: split a clip, dragged the right half to a new lane, and
+captured mid-drag. The old lane was empty; only the ghost was drawn.
+
+---
+
+## 2026-11-13 — Advanced timeline panel shrank 8 px per frame
+
+### Symptom
+
+While building the pinned ruler, the bottom panel shrank on every frame
+until the floor height, ignoring the row-count default.
+
+### Root cause
+
+egui's resizable `TopBottomPanel` stores the height its content actually
+used. The lane `ScrollArea` budget subtracted two item spacings while only one
+followed it, so content came up 8 px short each frame.
+
+### Fix
+
+Budget exactly one spacing, and end the timeline with
+`ui.expand_to_include_rect(ui.max_rect())` so a short frame can never
+ratchet the panel down.
+
+### Verification
+
+Rig: dropped a second clip; panel grew to the 2-row default and stayed put.
+
+---
+
 ## 2026-08-27 — Edit panel: audio gain applied to the whole track, not the clip
 
 ### Symptom

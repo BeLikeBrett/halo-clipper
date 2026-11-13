@@ -17,6 +17,11 @@ packages also contain third-party software under its respective licenses.
   downloaded package's license files are included under licenses/.
 - DejaVu fonts: https://dejavu-fonts.github.io, license in assets/fonts/LICENSE
   and licenses/DejaVu-LICENSE in Windows packages.
+- Inter (https://github.com/rsms/inter) and JetBrains Mono
+  (https://github.com/JetBrains/JetBrainsMono) interface fonts, SIL Open Font
+  License 1.1. Embedded as Latin subsets; licenses in
+  assets/fonts/Inter-LICENSE.txt and assets/fonts/JetBrainsMono-LICENSE.txt
+  (licenses/ in Windows packages).
 
 Runtime binaries are redistributed without modifying their contents. They are
 not covered by the Halo Clipper source license. Retain runtime notices when

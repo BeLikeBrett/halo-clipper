@@ -7,7 +7,41 @@ pub(super) enum EditorDrag {
     Track(TrackId),
 }
 const LANE_HEIGHT: f32 = 54.0;
-const RULER_HEIGHT: f32 = 30.0;
+const RULER_HEIGHT: f32 = 28.0;
+/// Track-header column width (name, kind, monitor toggle).
+const HEADER_W: f32 = 128.0;
+/// Breathing room after the last second so the end handle isn't flush.
+const RIGHT_PAD: f32 = 10.0;
+/// Vertical inset of a clip inside its lane.
+const CLIP_INSET: f32 = 4.0;
+
+/// Horizontal time mapping shared by the ruler and the lanes, plus the
+/// top of the first lane for row hit-testing.
+#[derive(Clone, Copy, Debug)]
+struct Lanes {
+    left: f32,
+    width: f32,
+    top: f32,
+    duration: i64,
+}
+impl Lanes {
+    fn new(rect: egui::Rect, duration: i64) -> Self {
+        Self {
+            left: rect.left() + HEADER_W,
+            width: (rect.width() - HEADER_W - RIGHT_PAD).max(1.0),
+            top: rect.top(),
+            duration: duration.max(1),
+        }
+    }
+    fn x_of(&self, time: i64) -> f32 {
+        self.left + time as f32 / self.duration as f32 * self.width
+    }
+    fn time_at(&self, x: f32) -> i64 {
+        (((x - self.left) / self.width) * self.duration as f32)
+            .round()
+            .max(0.0) as i64
+    }
+}
 
 #[derive(Clone)]
 struct Placement {
@@ -38,19 +72,30 @@ fn ruler_step(duration: i64, width: f32) -> i64 {
         .unwrap_or(1000)
         .max(100)
 }
+fn ruler_label(t: i64, step: i64) -> String {
+    if step < 1000 {
+        format!("{}:{:02}.{}", t / 60000, (t / 1000) % 60, (t % 1000) / 100)
+    } else {
+        format!("{}:{:02}", t / 60000, (t / 1000) % 60)
+    }
+}
+/// Compact clip length for the clip body: "4.2s", "1:05".
+fn short_duration(ms: i64) -> String {
+    if ms < 60_000 {
+        format!("{:.1}s", ms as f32 / 1000.0)
+    } else {
+        format!("{}:{:02}", ms / 60_000, (ms / 1000) % 60)
+    }
+}
 fn placement(
     p: &Project,
     tracks: &[Track],
     clips: &[Clip],
     payload: &EditorDrag,
     pos: egui::Pos2,
-    rect: egui::Rect,
+    lanes: Lanes,
     ctx: &egui::Context,
 ) -> Option<Placement> {
-    let width = (rect.width() - 68.0).max(1.0);
-    let duration = p.canvas_length_ms().max(1000);
-    let left = rect.left() + 64.0;
-    let time_at = |x: f32| (((x - left) / width) * duration as f32).round().max(0.0) as i64;
     let (length, grab, kind, exclude, label) = match payload {
         EditorDrag::Asset(id) => {
             let a = p.assets.iter().find(|a| a.id == *id)?;
@@ -89,10 +134,10 @@ fn placement(
         }
         EditorDrag::Track(_) => return None,
     };
-    let mut start = (time_at(pos.x) - grab).max(0);
+    let mut start = (lanes.time_at(pos.x) - grab).max(0);
     let mut snap = None;
     if !ctx.input(|i| i.modifiers.shift) {
-        let threshold = (12.0 / width * duration as f32).ceil() as i64;
+        let threshold = (12.0 / lanes.width * lanes.duration as f32).ceil() as i64;
         let mut candidates = vec![
             (0, 0),
             (p.playhead_ms, p.playhead_ms),
@@ -132,7 +177,7 @@ fn placement(
             }
         }
     }
-    let top = rect.top() + RULER_HEIGHT;
+    let top = lanes.top;
     let slot = insertion_slot(pos.y, top, tracks, kind);
     let row = ((pos.y - top) / LANE_HEIGHT).floor().max(0.0) as usize;
     let within = (pos.y - top).rem_euclid(LANE_HEIGHT);
@@ -164,6 +209,242 @@ fn placement(
         kind,
         label,
     })
+}
+
+/// Everything `paint_clip` needs to know about one bar.
+struct ClipLook<'a> {
+    label: &'a str,
+    kind: TrackKind,
+    thumb: Option<egui::TextureId>,
+    selected: bool,
+    /// Track disabled for export ("hidden").
+    disabled: bool,
+    /// Audio silenced in the preview monitor only.
+    quiet: bool,
+    /// `Some(monitor_muted)` for a V+A compound: draws the attached-audio strip.
+    linked_audio: Option<bool>,
+    duration_ms: i64,
+    speed: f32,
+    /// Abuts a neighbour on that side (a split or butt edit).
+    join_left: bool,
+    join_right: bool,
+}
+
+/// Draws one clip bar. Joined sides get a tight radius and a hairline gap
+/// so two halves of a split read as separate pieces meeting at a seam,
+/// never as one bar overlapping another.
+fn paint_clip(painter: &egui::Painter, block: egui::Rect, look: &ClipLook) {
+    let (base, edge) = match look.kind {
+        TrackKind::Video => (theme::CLIP_VIDEO, theme::CLIP_VIDEO_EDGE),
+        TrackKind::Audio => (theme::CLIP_AUDIO, theme::CLIP_AUDIO_EDGE),
+    };
+    let dim = |c: Color32| {
+        if look.disabled {
+            c.gamma_multiply(0.4)
+        } else {
+            c
+        }
+    };
+    let base = if look.quiet {
+        base.gamma_multiply(0.55)
+    } else {
+        base
+    };
+    let fill = dim(if look.selected {
+        base.linear_multiply(1.18)
+    } else {
+        base
+    });
+    let r = |joined: bool| if joined { 1.5 } else { 5.0 };
+    let rounding = egui::Rounding {
+        nw: r(look.join_left),
+        sw: r(look.join_left),
+        ne: r(look.join_right),
+        se: r(look.join_right),
+    };
+    painter.rect_filled(block, rounding, fill);
+    // One-pixel top highlight: reads as a lit edge, not a second band.
+    painter.line_segment(
+        [
+            egui::pos2(block.left() + rounding.nw.max(2.0), block.top() + 1.5),
+            egui::pos2(block.right() - rounding.ne.max(2.0), block.top() + 1.5),
+        ],
+        Stroke::new(
+            1.0_f32,
+            Color32::from_white_alpha(if look.disabled { 6 } else { 22 }),
+        ),
+    );
+
+    let clip = painter.with_clip_rect(block.intersect(painter.clip_rect()));
+    let mut body = block.shrink2(egui::vec2(8.0, 5.0));
+    if let Some(muted) = look.linked_audio {
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(block.left() + 1.0, block.bottom() - 11.0),
+            egui::pos2(block.right() - 1.0, block.bottom() - 1.0),
+        );
+        let strip_fill = if muted {
+            theme::CLIP_AUDIO.gamma_multiply(0.35)
+        } else {
+            theme::CLIP_AUDIO
+        };
+        clip.rect_filled(
+            strip,
+            egui::Rounding {
+                nw: 0.0,
+                ne: 0.0,
+                sw: rounding.sw,
+                se: rounding.se,
+            },
+            dim(strip_fill),
+        );
+        clip.line_segment(
+            [strip.left_top(), strip.right_top()],
+            Stroke::new(1.0_f32, dim(theme::CLIP_AUDIO_EDGE.gamma_multiply(0.7))),
+        );
+        body.max.y = strip.top() - 3.0;
+    }
+
+    if let Some(texture) = look.thumb.filter(|_| block.width() > 120.0) {
+        let h = body.height() + 4.0;
+        let thumb = egui::Rect::from_min_size(
+            egui::pos2(block.left() + 4.0, body.center().y - h * 0.5),
+            egui::vec2(h * 16.0 / 9.0, h),
+        );
+        clip.image(
+            texture,
+            thumb,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            if look.disabled {
+                Color32::from_gray(90)
+            } else {
+                Color32::WHITE
+            },
+        );
+        clip.rect_stroke(
+            thumb,
+            2.0,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(90)),
+        );
+        body.min.x = thumb.right() + 9.0;
+    }
+
+    if block.width() > 34.0 {
+        let text = clip.with_clip_rect(
+            body.expand2(egui::vec2(0.0, 3.0))
+                .intersect(clip.clip_rect()),
+        );
+        let two_lines = body.height() >= 30.0;
+        let name_y = if two_lines {
+            body.top() + 7.0
+        } else {
+            body.center().y
+        };
+        text.text(
+            egui::pos2(body.left(), name_y),
+            Align2::LEFT_CENTER,
+            look.label,
+            theme::medium(12.0),
+            dim(theme::TEXT_PRIMARY),
+        );
+        let mut meta = short_duration(look.duration_ms);
+        if (look.speed - 1.0).abs() > 0.001 {
+            meta = format!("{meta}  ·  {}×", (look.speed * 100.0).round() / 100.0);
+        }
+        let meta_color = dim(theme::TEXT_SECONDARY.gamma_multiply(0.85));
+        if two_lines {
+            text.text(
+                egui::pos2(body.left(), body.bottom() - 6.0),
+                Align2::LEFT_CENTER,
+                meta,
+                theme::mono(10.0),
+                meta_color,
+            );
+        } else if body.width() > 190.0 {
+            text.text(
+                egui::pos2(body.right(), body.center().y),
+                Align2::RIGHT_CENTER,
+                meta,
+                theme::mono(10.0),
+                meta_color,
+            );
+        }
+    }
+
+    // Inner outline so a selection never spills over a neighbour.
+    let (width, color) = if look.selected {
+        (1.5, theme::ACCENT)
+    } else {
+        (1.0, dim(edge.gamma_multiply(0.75)))
+    };
+    painter.rect_stroke(
+        block.shrink(width * 0.5),
+        rounding,
+        Stroke::new(width, color),
+    );
+}
+
+/// Edit-point marker on a seam between two abutting clips: a pair of
+/// notches pointing at the cut, like the ones on a film splice.
+fn paint_seam(painter: &egui::Painter, x: f32, top: f32, bottom: f32) {
+    let w = 5.5;
+    let h = 7.0;
+    let color = theme::TEXT_PRIMARY.gamma_multiply(0.9);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x - w, top),
+            egui::pos2(x + w, top),
+            egui::pos2(x, top + h),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x - w, bottom),
+            egui::pos2(x, bottom - h),
+            egui::pos2(x + w, bottom),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// Playhead head: a rounded tab with a pointed tip, big enough to grab
+/// like a handle rather than aim at like a hairline.
+fn paint_playhead_head(painter: &egui::Painter, x: f32, top: f32, bottom: f32, hot: bool) {
+    let half = if hot { 7.5 } else { 6.5 };
+    let tip = 6.0;
+    let body = egui::Rect::from_min_max(
+        egui::pos2(x - half, top),
+        egui::pos2(x + half, bottom - tip),
+    );
+    painter.rect_filled(
+        body,
+        egui::Rounding {
+            nw: 3.0,
+            ne: 3.0,
+            sw: 0.0,
+            se: 0.0,
+        },
+        theme::PLAYHEAD,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            body.left_bottom(),
+            body.right_bottom(),
+            egui::pos2(x, bottom),
+        ],
+        theme::PLAYHEAD,
+        Stroke::NONE,
+    ));
+    // Grip lines: the visual cue that this is a handle.
+    for dy in [-2.5, 0.5, 3.5] {
+        let y = body.center().y + dy;
+        painter.line_segment(
+            [egui::pos2(x - 3.0, y), egui::pos2(x + 3.0, y)],
+            Stroke::new(1.0_f32, Color32::from_black_alpha(90)),
+        );
+    }
 }
 
 impl ClipperApp {
@@ -473,7 +754,9 @@ impl ClipperApp {
             }
         }
     }
-    pub(super) fn show_editor_timeline(&mut self, ui: &mut egui::Ui) {
+    /// Transport row above the Advanced timeline: go-to-start, play,
+    /// timecode, monitor volume and the Export call to action.
+    fn show_transport(&mut self, ui: &mut egui::Ui) {
         let Some(p) = self.project.as_ref() else {
             return;
         };
@@ -482,53 +765,87 @@ impl ClipperApp {
         let can_export = !p.clips.is_empty() && self.export.is_none();
         let mut toggle = false;
         let mut export = false;
+        let mut to_start = false;
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(if self.live.playing { "Pause" } else { "Play" })
-                        .min_size(egui::vec2(50.0, 28.0)),
-                )
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if crate::widgets::icon_button(
+                ui,
+                crate::widgets::Icon::SkipStart,
+                30.0,
+                false,
+                theme::ACCENT,
+            )
+            .on_hover_text("Go to start  ·  Home")
+            .clicked()
+            {
+                to_start = true;
+            }
+            if crate::widgets::play_button(ui, self.live.playing)
+                .on_hover_text("Play / pause  ·  Space")
                 .clicked()
             {
                 toggle = true;
             }
-            ui.label(
-                RichText::new(media::format_timestamp(playhead))
-                    .monospace()
-                    .size(14.0),
-            );
+            ui.add_space(8.0);
+            ui.label(crate::widgets::timecode_job(
+                &media::format_timestamp(playhead),
+                16.0,
+                theme::TEXT_PRIMARY,
+            ));
             ui.label(
                 RichText::new(format!("/ {}", media::format_timestamp(end)))
-                    .monospace()
-                    .size(11.0)
+                    .font(theme::mono(11.5))
                     .color(theme::TEXT_MUTED),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if primary_button(ui, "Export…", can_export).clicked() {
                     export = true;
                 }
-                ui.spacing_mut().slider_width = 70.0;
-                let response =
-                    ui.add(egui::Slider::new(&mut self.volume_ui, 0.0..=130.0).show_value(false));
+                ui.add_space(10.0);
+                ui.spacing_mut().slider_width = 84.0;
+                let response = ui
+                    .add(egui::Slider::new(&mut self.volume_ui, 0.0..=130.0).show_value(false))
+                    .on_hover_text(format!("Preview volume {:.0}%", self.volume_ui));
                 if response.changed() {
                     let _ = self.player.set_volume(self.volume_ui);
                 }
                 let muted = self.player.state().muted;
-                if ui
-                    .small_button(if muted { "Muted" } else { "Audio" })
-                    .clicked()
+                if crate::widgets::icon_button(
+                    ui,
+                    if muted {
+                        crate::widgets::Icon::SpeakerMuted
+                    } else {
+                        crate::widgets::Icon::Speaker
+                    },
+                    28.0,
+                    muted,
+                    theme::ACCENT_ERR,
+                )
+                .on_hover_text("Mute preview  ·  M")
+                .clicked()
                 {
                     let _ = self.player.toggle_mute();
                 }
             });
         });
-        ui.add_space(6.0);
         if toggle {
             self.toggle_play();
+        }
+        if to_start {
+            if let Some(p) = &mut self.project {
+                p.playhead_ms = 0;
+            }
+            self.live.reanchor(0);
+            ui.ctx().request_repaint();
         }
         if export {
             self.export_options_open = true;
         }
+    }
+
+    pub(super) fn show_editor_timeline(&mut self, ui: &mut egui::Ui) {
+        self.show_transport(ui);
+        ui.add_space(8.0);
         let Some(p) = self.project.as_ref() else {
             return;
         };
@@ -546,21 +863,44 @@ impl ClipperApp {
             .collect();
         let duration = p.canvas_length_ms().max(1000);
         let playhead = p.playhead_ms;
-        let mut labels: HashMap<_, _> = clips
+        let file_name = |c: &Clip| {
+            p.clip_source(c)
+                .0
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        // Compound bars show their audio as a strip, so the " · V+A"
+        // suffix the view model adds is redundant on screen.
+        let compounds: HashSet<ClipId> = compound_labels
             .iter()
-            .map(|c| {
-                (
-                    c.id,
-                    p.clip_source(c)
-                        .0
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                )
+            .filter(|(_, label)| label.ends_with("V+A"))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut labels: HashMap<_, _> = clips.iter().map(|c| (c.id, file_name(c))).collect();
+        labels.extend(
+            compound_labels
+                .into_iter()
+                .filter(|(id, _)| !compounds.contains(id)),
+        );
+        // Audio tracks each row monitors: its own (audio) or the ones
+        // folded into its compound bars (video).
+        let monitored: HashMap<TrackId, Vec<TrackId>> = tracks
+            .iter()
+            .map(|t| {
+                let ids = match t.kind {
+                    TrackKind::Audio => vec![t.id],
+                    TrackKind::Video => p.attached_audio_tracks(t.id).into_iter().collect(),
+                };
+                (t.id, ids)
             })
             .collect();
-        labels.extend(compound_labels);
+        let monitor_muted = |t: TrackId| {
+            monitored.get(&t).is_some_and(|ids| {
+                !ids.is_empty() && ids.iter().all(|id| self.live.monitor_muted.contains(id))
+            })
+        };
         let payload = egui::DragAndDrop::payload::<EditorDrag>(ui.ctx());
         let images: HashMap<_, _> = clips
             .iter()
@@ -568,7 +908,7 @@ impl ClipperApp {
             .filter_map(|c| {
                 self.thumbnails
                     .get(ui.ctx(), p.clip_source(c).0)
-                    .map(|texture| (c.id, texture))
+                    .map(|texture| (c.id, texture.id()))
             })
             .collect();
         if payload.is_none() {
@@ -577,84 +917,83 @@ impl ClipperApp {
             });
         }
         let mut seek = None;
+        let mut scrubbing = false;
         let mut select = None;
         let mut clear = false;
         let mut mute = None;
+        let mut monitor_toggle: Option<(Vec<TrackId>, bool)> = None;
         let mut drop = None;
         let mut context_action = None;
-        let height = (ui.available_height() - 30.0).max(70.0);
-        egui::ScrollArea::vertical()
+
+        // Shared surface behind ruler + lanes, filled once its extent is known.
+        let surface_bg = ui.painter().add(egui::Shape::Noop);
+        let (ruler_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), RULER_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let ruler_lanes = Lanes::new(ruler_rect, duration);
+        let step = ruler_step(duration, ruler_lanes.width);
+
+        let footer_h = 26.0;
+        // Exact budget: scroll + spacing + footer must not exceed what the
+        // panel offers, or the resizable panel grows a little every frame.
+        let height =
+            (ui.available_height() - footer_h - ui.spacing().item_spacing.y).max(LANE_HEIGHT);
+        let lane_bg = theme::BG_PANEL;
+        let empty_bg = theme::BG_HEADER;
+        let header_bg = Color32::from_rgb(23, 24, 29);
+        let scroll = egui::ScrollArea::vertical()
             .id_salt("timeline_lanes")
             .max_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let lane_h = LANE_HEIGHT;
-                let ruler = RULER_HEIGHT;
-                let header = 64.0;
-                let rows = tracks.len().max(1);
+                let rows = tracks.len();
                 let reserve = usize::from(payload.is_some() && !tracks.is_empty());
-                let total_h = (ruler + (rows + reserve) as f32 * lane_h + 12.0).max(height - 2.0);
+                let content_h = (rows + reserve).max(1) as f32 * lane_h;
+                let total_h = content_h.max(height);
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), total_h),
                     egui::Sense::hover(),
                 );
+                let lanes = Lanes::new(rect, duration);
+                let left = lanes.left;
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 4.0, theme::BG_PREVIEW);
-                let left = rect.left() + header;
-                let width = (rect.width() - header - 4.0).max(1.0);
-                let x_of = |time: i64| left + time as f32 / duration as f32 * width;
-                let time_at =
-                    |x: f32| (((x - left) / width) * duration as f32).round().max(0.0) as i64;
-                let ruler_rect = egui::Rect::from_min_max(
-                    egui::pos2(left, rect.top()),
-                    egui::pos2(rect.right(), rect.top() + ruler),
+                painter.rect_filled(rect, 0.0, empty_bg);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(rect.min, egui::pos2(left, rect.bottom())),
+                    0.0,
+                    header_bg,
                 );
+                // Background: click empty timeline to seek + deselect.
+                let background = ui.interact(
+                    egui::Rect::from_min_max(egui::pos2(left, rect.top()), rect.max),
+                    ui.id().with("timeline_background"),
+                    egui::Sense::click(),
+                );
+                if background.clicked() {
+                    seek = background
+                        .interact_pointer_pos()
+                        .map(|pos| lanes.time_at(pos.x).min(duration));
+                    clear = true;
+                }
                 let hover = ui
                     .ctx()
                     .pointer_hover_pos()
                     .filter(|pos| rect.intersect(ui.clip_rect()).contains(*pos));
                 let placement = payload.as_ref().and_then(|drag| {
-                    hover.and_then(|pos| placement(p, &tracks, &clips, drag, pos, rect, ui.ctx()))
+                    hover.and_then(|pos| placement(p, &tracks, &clips, drag, pos, lanes, ui.ctx()))
                 });
                 let gap = placement
                     .as_ref()
                     .filter(|drop| drop.target.is_none())
                     .map(|drop| drop.slot);
-                let step = ruler_step(duration, width);
-                for n in 0..=duration / step {
-                    let t = n * step;
-                    let x = x_of(t);
-                    painter.line_segment(
-                        [
-                            egui::pos2(x, rect.top() + ruler - 7.0),
-                            egui::pos2(x, rect.bottom()),
-                        ],
-                        Stroke::new(1.0_f32, Color32::from_rgb(29, 33, 40)),
-                    );
-                    let label = if step < 1000 {
-                        format!("{}:{:02}.{}", t / 60000, (t / 1000) % 60, (t % 1000) / 100)
-                    } else {
-                        format!("{}:{:02}", t / 60000, (t / 1000) % 60)
-                    };
-                    painter.text(
-                        egui::pos2(x + 4.0, rect.top() + 11.0),
-                        Align2::LEFT_CENTER,
-                        label,
-                        egui::FontId::monospace(11.0),
-                        theme::TEXT_MUTED,
-                    );
-                }
-                let ruler_response = ui.interact(
-                    ruler_rect,
-                    ui.id().with("timeline_ruler"),
-                    egui::Sense::click_and_drag(),
-                );
-                if ruler_response.clicked() || ruler_response.dragged() {
-                    seek = ruler_response
-                        .interact_pointer_pos()
-                        .map(|pos| time_at(pos.x).min(duration));
-                    self.user_dragging_seek = ruler_response.dragged();
-                }
+                // The clip being moved leaves its old spot the moment a
+                // drop position exists; only the ghost is drawn.
+                let moving = match (payload.as_deref(), &placement) {
+                    (Some(EditorDrag::Clip { id, .. }), Some(_)) => Some(*id),
+                    _ => None,
+                };
                 for (index, t) in tracks.iter().enumerate() {
                     let target_shift = if gap.is_some_and(|slot| index >= slot) {
                         lane_h
@@ -666,142 +1005,178 @@ impl ClipperApp {
                         target_shift,
                         0.10,
                     );
-                    let top = rect.top() + ruler + index as f32 * lane_h + shift;
+                    let top = rect.top() + index as f32 * lane_h + shift;
                     let row = egui::Rect::from_min_max(
                         egui::pos2(rect.left(), top),
                         egui::pos2(rect.right(), top + lane_h),
                     );
-                    painter.rect_filled(
-                        row,
-                        0.0,
-                        if index % 2 == 0 {
-                            Color32::from_rgb(18, 21, 26)
-                        } else {
-                            Color32::from_rgb(21, 25, 31)
-                        },
-                    );
+                    let lane = egui::Rect::from_min_max(egui::pos2(left, top), row.max);
+                    painter.rect_filled(lane, 0.0, lane_bg);
+                    for n in 0..=duration / step {
+                        let x = lanes.x_of(n * step);
+                        painter.line_segment(
+                            [egui::pos2(x, top), egui::pos2(x, top + lane_h)],
+                            Stroke::new(1.0_f32, theme::BORDER_SUBTLE),
+                        );
+                    }
                     painter.line_segment(
                         [row.left_bottom(), row.right_bottom()],
+                        Stroke::new(1.0_f32, theme::BG_HEADER),
+                    );
+
+                    // ── Header ──
+                    let title = egui::Rect::from_min_max(row.min, egui::pos2(left, row.bottom()));
+                    painter.rect_filled(title, 0.0, header_bg);
+                    painter.line_segment(
+                        [title.right_top(), title.right_bottom()],
                         Stroke::new(1.0_f32, theme::BORDER),
                     );
-                    let title =
-                        egui::Rect::from_min_max(row.min, egui::pos2(left - 4.0, row.bottom()));
+                    let kind_color = match t.kind {
+                        TrackKind::Video => theme::CLIP_VIDEO_EDGE,
+                        TrackKind::Audio => theme::CLIP_AUDIO_EDGE,
+                    };
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            title.left_top() + egui::vec2(0.0, 8.0),
+                            egui::vec2(3.0, lane_h - 16.0),
+                        ),
+                        egui::Rounding {
+                            ne: 2.0,
+                            se: 2.0,
+                            nw: 0.0,
+                            sw: 0.0,
+                        },
+                        if t.muted {
+                            kind_color.gamma_multiply(0.35)
+                        } else {
+                            kind_color
+                        },
+                    );
                     let title_response = ui
                         .interact(
                             title,
                             ui.id().with(("track_drag", t.id)),
                             egui::Sense::click_and_drag(),
                         )
-                        .on_hover_cursor(egui::CursorIcon::Grab);
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text("Drag to reorder · right-click for track options");
                     title_response.dnd_set_drag_payload(EditorDrag::Track(t.id));
+                    let has_monitor = monitored.get(&t.id).is_some_and(|ids| !ids.is_empty());
+                    let sub = match (t.muted, t.kind, has_monitor) {
+                        (true, ..) => "Disabled",
+                        (false, TrackKind::Audio, _) => "Audio",
+                        (false, TrackKind::Video, true) => "Video + audio",
+                        (false, TrackKind::Video, false) => "Video",
+                    };
                     painter.text(
-                        egui::pos2(title.left() + 7.0, title.center().y),
+                        egui::pos2(title.left() + 14.0, title.center().y - 7.0),
                         Align2::LEFT_CENTER,
                         &t.name,
-                        egui::FontId::monospace(12.5),
+                        theme::semibold(12.5),
                         if t.muted {
                             theme::TEXT_MUTED
                         } else {
                             theme::TEXT_PRIMARY
                         },
                     );
+                    painter.text(
+                        egui::pos2(title.left() + 14.0, title.center().y + 9.0),
+                        Align2::LEFT_CENTER,
+                        sub,
+                        theme::regular(10.5),
+                        theme::TEXT_MUTED,
+                    );
                     title_response.context_menu(|ui| {
-                        if ui
-                            .button(if t.muted {
+                        ui.set_width(220.0);
+                        if crate::widgets::menu_item(
+                            ui,
+                            if t.muted {
                                 "Enable track"
                             } else {
-                                "Mute / hide track"
-                            })
-                            .clicked()
+                                "Disable track (preview + export)"
+                            },
+                            None,
+                        )
+                        .clicked()
                         {
                             mute = Some(t.id);
                             ui.close_menu();
                         }
                     });
-                    let row_response = ui.interact(
-                        egui::Rect::from_min_max(egui::pos2(left, top), row.max),
-                        ui.id().with(("lane", t.id)),
-                        egui::Sense::click(),
-                    );
-                    if row_response.clicked() {
-                        seek = row_response
-                            .interact_pointer_pos()
-                            .map(|pos| time_at(pos.x).min(duration));
-                        clear = true;
-                    }
-                    for c in clips.iter().filter(|c| c.track_id == t.id) {
-                        let block = egui::Rect::from_min_max(
-                            egui::pos2(x_of(c.cut_start_ms), top + 5.0),
-                            egui::pos2(
-                                x_of(c.cut_end_ms()).max(x_of(c.cut_start_ms) + 4.0),
-                                top + lane_h - 5.0,
-                            ),
+                    if has_monitor {
+                        let muted = monitor_muted(t.id);
+                        let button = egui::Rect::from_center_size(
+                            egui::pos2(title.right() - 20.0, title.center().y),
+                            egui::vec2(26.0, 26.0),
                         );
-                        let color = if t.kind == TrackKind::Video {
-                            Color32::from_rgb(59, 79, 107)
-                        } else {
-                            Color32::from_rgb(44, 82, 67)
-                        };
-                        painter.rect_filled(
-                            block,
-                            3.0,
-                            if t.muted {
-                                color.linear_multiply(0.4)
+                        let response = ui
+                            .interact(
+                                button,
+                                ui.id().with(("monitor", t.id)),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(if muted {
+                                "Unmute in preview"
                             } else {
-                                color
+                                "Mute in preview — the export keeps this audio"
+                            });
+                        crate::widgets::paint_icon_button(
+                            ui,
+                            button,
+                            &response,
+                            if muted {
+                                crate::widgets::Icon::SpeakerMuted
+                            } else {
+                                crate::widgets::Icon::Speaker
+                            },
+                            muted,
+                            theme::ACCENT_ERR,
+                        );
+                        if response.clicked() {
+                            monitor_toggle = monitored.get(&t.id).map(|ids| (ids.clone(), !muted));
+                        }
+                    }
+
+                    // ── Clips ──
+                    let mut row_clips: Vec<&Clip> =
+                        clips.iter().filter(|c| c.track_id == t.id).collect();
+                    row_clips.sort_by_key(|c| c.cut_start_ms);
+                    let joined = |a: &Clip, b: &Clip| {
+                        a.cut_end_ms() == b.cut_start_ms
+                            && Some(a.id) != moving
+                            && Some(b.id) != moving
+                    };
+                    let row_muted = monitor_muted(t.id);
+                    for (i, c) in row_clips.iter().enumerate() {
+                        if Some(c.id) == moving {
+                            continue;
+                        }
+                        let join_left = i > 0 && joined(row_clips[i - 1], c);
+                        let join_right = row_clips.get(i + 1).is_some_and(|n| joined(c, n));
+                        let x0 = lanes.x_of(c.cut_start_ms) + if join_left { 1.0 } else { 0.0 };
+                        let x1 = lanes.x_of(c.cut_end_ms()) - if join_right { 1.0 } else { 0.0 };
+                        let block = egui::Rect::from_min_max(
+                            egui::pos2(x0, top + CLIP_INSET),
+                            egui::pos2(x1.max(x0 + 4.0), top + lane_h - CLIP_INSET),
+                        );
+                        paint_clip(
+                            &painter,
+                            block,
+                            &ClipLook {
+                                label: labels.get(&c.id).map(String::as_str).unwrap_or("Clip"),
+                                kind: t.kind,
+                                thumb: images.get(&c.id).copied(),
+                                selected: selected.contains(&c.id),
+                                disabled: t.muted,
+                                quiet: t.kind == TrackKind::Audio && row_muted,
+                                linked_audio: compounds.contains(&c.id).then_some(row_muted),
+                                duration_ms: c.duration_ms(),
+                                speed: c.speed,
+                                join_left,
+                                join_right,
                             },
                         );
-                        let active = selected.contains(&c.id);
-                        painter.rect_stroke(
-                            block.shrink(0.5),
-                            3.0,
-                            Stroke::new(
-                                if active { 1.8_f32 } else { 1.0 },
-                                if active {
-                                    theme::ACCENT
-                                } else {
-                                    color.gamma_multiply(1.4)
-                                },
-                            ),
-                        );
-                        if active {
-                            painter.rect_filled(
-                                egui::Rect::from_min_max(
-                                    block.min,
-                                    egui::pos2(block.left() + 3.0, block.bottom()),
-                                ),
-                                1.0,
-                                theme::ACCENT,
-                            );
-                        }
-                        let mut text_left = block.left() + 10.0;
-                        if block.width() > 100.0 {
-                            if let Some(texture) = images.get(&c.id) {
-                                let thumb = egui::Rect::from_min_size(
-                                    block.left_top() + egui::vec2(7.0, 7.0),
-                                    egui::vec2(48.0, 27.0),
-                                );
-                                painter.image(
-                                    texture.id(),
-                                    thumb,
-                                    egui::Rect::from_min_max(
-                                        egui::Pos2::ZERO,
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    Color32::WHITE,
-                                );
-                                text_left = thumb.right() + 9.0;
-                            }
-                        }
-                        if block.width() > 35.0 {
-                            painter.with_clip_rect(block.shrink(6.0)).text(
-                                egui::pos2(text_left, block.center().y),
-                                Align2::LEFT_CENTER,
-                                labels.get(&c.id).map(String::as_str).unwrap_or("Clip"),
-                                egui::FontId::proportional(13.0),
-                                theme::TEXT_PRIMARY,
-                            );
-                        }
                         let response = ui
                             .interact(
                                 block,
@@ -814,140 +1189,158 @@ impl ClipperApp {
                         }
                         let grab = ui
                             .input(|i| i.pointer.press_origin())
-                            .map(|pos| time_at(pos.x) - c.cut_start_ms)
+                            .map(|pos| lanes.time_at(pos.x) - c.cut_start_ms)
                             .unwrap_or(0);
                         response.dnd_set_drag_payload(EditorDrag::Clip {
                             id: c.id,
                             grab_ms: grab,
                         });
                         response.context_menu(|ui| {
-                            if ui.button("Split at playhead  ·  S").clicked() {
-                                if !selected.contains(&c.id) {
-                                    select = Some(c.id);
-                                }
-                                context_action = Some(ClipAction::Split);
-                                ui.close_menu();
-                            }
+                            ui.set_width(220.0);
                             let context_selection = if selected.contains(&c.id) {
                                 p.selected_clips.clone()
                             } else {
                                 [c.id].into_iter().collect()
                             };
-                            if p.can_detach_ids(&context_selection)
-                                && ui.button("Detach audio  ·  D").clicked()
+                            let mut chosen = None;
+                            if crate::widgets::menu_item(ui, "Split at playhead", Some("S"))
+                                .clicked()
                             {
-                                if !selected.contains(&c.id) {
-                                    select = Some(c.id);
-                                }
-                                context_action = Some(ClipAction::DetachSelected);
-                                ui.close_menu();
+                                chosen = Some(ClipAction::Split);
+                            }
+                            if p.can_detach_ids(&context_selection)
+                                && crate::widgets::menu_item(ui, "Detach audio", Some("D"))
+                                    .clicked()
+                            {
+                                chosen = Some(ClipAction::DetachSelected);
                             }
                             if p.can_attach_ids(&context_selection)
-                                && ui.button("Attach audio  ·  Shift+D").clicked()
+                                && crate::widgets::menu_item(ui, "Attach audio", Some("Shift+D"))
+                                    .clicked()
                             {
-                                if !selected.contains(&c.id) {
-                                    select = Some(c.id);
-                                }
-                                context_action = Some(ClipAction::AttachSelected);
-                                ui.close_menu();
+                                chosen = Some(ClipAction::AttachSelected);
                             }
-                            if ui.button("Delete  ·  Del").clicked() {
+                            crate::widgets::menu_separator(ui);
+                            if crate::widgets::menu_item(ui, "Delete", Some("Del")).clicked() {
+                                chosen = Some(ClipAction::DeleteSelected);
+                            }
+                            if let Some(action) = chosen {
                                 if !selected.contains(&c.id) {
                                     select = Some(c.id);
                                 }
-                                context_action = Some(ClipAction::DeleteSelected);
+                                context_action = Some(action);
                                 ui.close_menu();
                             }
                         });
                     }
+                    // Edit points on top of both neighbours.
+                    for pair in row_clips.windows(2).filter(|w| joined(w[0], w[1])) {
+                        paint_seam(
+                            &painter,
+                            lanes.x_of(pair[1].cut_start_ms),
+                            top + CLIP_INSET,
+                            top + lane_h - CLIP_INSET,
+                        );
+                    }
                 }
                 if tracks.is_empty() {
                     painter.text(
-                        egui::pos2(left + 16.0, rect.top() + ruler + 19.0),
+                        egui::pos2(left + 16.0, rect.top() + lane_h * 0.5),
                         Align2::LEFT_CENTER,
                         "Drop video or audio here",
-                        egui::FontId::proportional(12.0),
+                        theme::regular(12.5),
                         theme::TEXT_MUTED,
                     );
                 }
-                let x = x_of(playhead).clamp(left, rect.right());
-                painter.line_segment(
-                    [
-                        egui::pos2(x, rect.top() + 18.0),
-                        egui::pos2(x, rect.bottom()),
-                    ],
-                    Stroke::new(1.5_f32, theme::TEXT_PRIMARY),
-                );
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        egui::pos2(x - 5.0, rect.top() + 16.0),
-                        egui::pos2(x + 5.0, rect.top() + 16.0),
-                        egui::pos2(x, rect.top() + 22.0),
-                    ],
-                    theme::TEXT_PRIMARY,
-                    Stroke::NONE,
-                ));
+
+                // ── Drag feedback ──
                 if let (Some(payload), Some(pos)) = (payload.as_ref(), hover) {
                     if let Some(place) = placement {
-                        let y = rect.top()
-                            + ruler
-                            + if place.target.is_some() {
-                                tracks
-                                    .iter()
-                                    .position(|t| Some(t.id) == place.target)
-                                    .unwrap_or(0) as f32
-                                    * lane_h
-                            } else {
-                                place.slot as f32 * lane_h
-                            };
+                        let row_index = match place.target {
+                            Some(target) => tracks.iter().position(|t| t.id == target).unwrap_or(0),
+                            None => place.slot,
+                        };
+                        let y = rect.top() + row_index as f32 * lane_h;
                         if place.target.is_none() {
                             let lane = egui::Rect::from_min_size(
                                 egui::pos2(rect.left(), y),
                                 egui::vec2(rect.width(), lane_h),
                             );
-                            painter.rect_filled(lane, 2.0, Color32::from_rgb(26, 39, 56));
-                            painter.rect_stroke(
-                                lane.shrink(0.5),
-                                2.0,
-                                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.6)),
+                            painter.rect_filled(lane, 0.0, theme::ACCENT.gamma_multiply(0.07));
+                            painter.line_segment(
+                                [lane.left_top(), lane.right_top()],
+                                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.5)),
+                            );
+                            painter.line_segment(
+                                [lane.left_bottom(), lane.right_bottom()],
+                                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.5)),
                             );
                             painter.text(
-                                egui::pos2(rect.left() + header * 0.5, y + lane_h * 0.5),
-                                Align2::CENTER_CENTER,
+                                egui::pos2(rect.left() + 14.0, y + lane_h * 0.5),
+                                Align2::LEFT_CENTER,
                                 if place.kind == TrackKind::Video {
-                                    "+ V"
+                                    "+ Video track"
                                 } else {
-                                    "+ A"
+                                    "+ Audio track"
                                 },
-                                egui::FontId::monospace(12.0),
+                                theme::medium(11.5),
                                 theme::ACCENT,
                             );
                         }
+                        let x0 = lanes.x_of(place.start);
                         let ghost = egui::Rect::from_min_max(
-                            egui::pos2(x_of(place.start), y + 5.0),
+                            egui::pos2(x0, y + CLIP_INSET),
                             egui::pos2(
-                                x_of(place.start + place.length).max(x_of(place.start) + 12.0),
-                                y + lane_h - 5.0,
+                                lanes.x_of(place.start + place.length).max(x0 + 12.0),
+                                y + lane_h - CLIP_INSET,
                             ),
                         );
-                        painter.rect_filled(ghost, 3.0, Color32::from_rgb(55, 91, 133));
-                        painter.rect_stroke(
-                            ghost.shrink(0.5),
-                            3.0,
-                            Stroke::new(2.0_f32, theme::ACCENT),
-                        );
-                        painter.with_clip_rect(ghost.shrink(6.0)).text(
-                            ghost.left_center() + egui::vec2(10.0, 0.0),
-                            Align2::LEFT_CENTER,
-                            &place.label,
-                            egui::FontId::proportional(13.0),
-                            Color32::WHITE,
+                        let (thumb, linked, label) = match payload.as_ref() {
+                            EditorDrag::Clip { id, .. } => (
+                                images.get(id).copied(),
+                                compounds.contains(id).then_some(false),
+                                labels.get(id).cloned().unwrap_or(place.label.clone()),
+                            ),
+                            EditorDrag::Asset(id) => (
+                                p.assets
+                                    .iter()
+                                    .find(|a| a.id == *id && a.source.media.width > 0)
+                                    .and_then(|a| self.thumbnails.get(ui.ctx(), &a.source.path))
+                                    .map(|t| t.id()),
+                                p.assets
+                                    .iter()
+                                    .find(|a| a.id == *id)
+                                    .filter(|a| {
+                                        a.source.media.width > 0
+                                            && a.source.media.audio_stream_count > 0
+                                    })
+                                    .map(|_| false),
+                                place.label.clone(),
+                            ),
+                            EditorDrag::Track(_) => (None, None, place.label.clone()),
+                        };
+                        paint_clip(
+                            &painter,
+                            ghost,
+                            &ClipLook {
+                                label: &label,
+                                kind: place.kind,
+                                thumb,
+                                selected: true,
+                                disabled: false,
+                                quiet: false,
+                                linked_audio: linked,
+                                duration_ms: place.length,
+                                speed: 1.0,
+                                join_left: false,
+                                join_right: false,
+                            },
                         );
                         if let Some(time) = place.snap {
-                            let x = x_of(time);
+                            let x = lanes.x_of(time);
                             painter.line_segment(
-                                [egui::pos2(x, rect.top() + ruler), egui::pos2(x, y + lane_h)],
-                                Stroke::new(1.5_f32, theme::ACCENT),
+                                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                Stroke::new(1.0_f32, theme::ACCENT),
                             );
                         }
                         if ui.input(|i| i.pointer.any_released()) {
@@ -960,10 +1353,9 @@ impl ClipperApp {
                                 Some((payload.as_ref().clone(), place.start, place.target, index));
                         }
                     } else if let EditorDrag::Track(id) = payload.as_ref() {
-                        let slot = (((pos.y - rect.top() - ruler) / lane_h) + 0.5)
-                            .floor()
-                            .max(0.0) as usize;
-                        let y = rect.top() + ruler + slot.min(tracks.len()) as f32 * lane_h;
+                        let slot =
+                            (((pos.y - rect.top()) / lane_h) + 0.5).floor().max(0.0) as usize;
+                        let y = rect.top() + slot.min(tracks.len()) as f32 * lane_h;
                         painter.line_segment(
                             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                             Stroke::new(2.0_f32, theme::ACCENT),
@@ -978,7 +1370,168 @@ impl ClipperApp {
                         }
                     }
                 }
+
+                // ── Playhead line (grabbable a few px either side) ──
+                let x = lanes.x_of(playhead).clamp(left, rect.right());
+                let viewport = ui.clip_rect().intersect(rect);
+                let line_hit = egui::Rect::from_min_max(
+                    egui::pos2(x - 5.0, viewport.top()),
+                    egui::pos2(x + 5.0, viewport.bottom()),
+                );
+                let line =
+                    ui.interact(line_hit, ui.id().with("playhead_line"), egui::Sense::drag());
+                if line.hovered() || line.dragged() {
+                    ui.ctx().set_cursor_icon(if line.dragged() {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        egui::CursorIcon::Grab
+                    });
+                }
+                if line.dragged() {
+                    seek = line
+                        .interact_pointer_pos()
+                        .map(|pos| lanes.time_at(pos.x).min(duration));
+                    scrubbing = true;
+                }
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    Stroke::new(
+                        if line.hovered() || line.dragged() {
+                            2.0_f32
+                        } else {
+                            1.5
+                        },
+                        theme::PLAYHEAD,
+                    ),
+                );
+                viewport
             });
+
+        // ── Ruler (pinned above the scrolling lanes) ──
+        let lanes_view = scroll.inner;
+        let surface = ruler_rect.union(lanes_view);
+        ui.painter()
+            .set(surface_bg, egui::Shape::rect_filled(surface, 6.0, empty_bg));
+        let painter = ui.painter_at(ruler_rect);
+        painter.rect_filled(
+            ruler_rect,
+            egui::Rounding {
+                nw: 6.0,
+                ne: 6.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            theme::BG_HEADER,
+        );
+        painter.line_segment(
+            [ruler_rect.left_bottom(), ruler_rect.right_bottom()],
+            Stroke::new(1.0_f32, theme::BORDER),
+        );
+        let header = egui::Rect::from_min_max(
+            ruler_rect.min,
+            egui::pos2(ruler_lanes.left, ruler_rect.bottom()),
+        );
+        painter.line_segment(
+            [header.right_top(), header.right_bottom()],
+            Stroke::new(1.0_f32, theme::BORDER),
+        );
+        let minor = (step / 5).max(1);
+        for n in 0..=duration / minor {
+            let t = n * minor;
+            let x = ruler_lanes.x_of(t);
+            let major = t % step == 0;
+            painter.line_segment(
+                [
+                    egui::pos2(x, ruler_rect.bottom() - if major { 9.0 } else { 4.0 }),
+                    egui::pos2(x, ruler_rect.bottom()),
+                ],
+                Stroke::new(
+                    1.0_f32,
+                    if major {
+                        theme::TEXT_FAINT
+                    } else {
+                        theme::BORDER
+                    },
+                ),
+            );
+            if major {
+                painter.text(
+                    egui::pos2(x + 4.0, ruler_rect.top() + 10.0),
+                    Align2::LEFT_CENTER,
+                    ruler_label(t, step),
+                    theme::mono(10.0),
+                    theme::TEXT_MUTED,
+                );
+            }
+        }
+        // The whole ruler scrubs; the head is a fat target on top of it.
+        let ruler_hit = egui::Rect::from_min_max(
+            egui::pos2(ruler_lanes.left - 8.0, ruler_rect.top()),
+            ruler_rect.max,
+        );
+        let ruler = ui.interact(
+            ruler_hit,
+            ui.id().with("timeline_ruler"),
+            egui::Sense::click_and_drag(),
+        );
+        let ph_x = ruler_lanes
+            .x_of(playhead)
+            .clamp(ruler_lanes.left, ruler_rect.right());
+        let head_hit = egui::Rect::from_center_size(
+            egui::pos2(ph_x, ruler_rect.center().y),
+            egui::vec2(28.0, RULER_HEIGHT + 8.0),
+        );
+        let head = ui.interact(head_hit, ui.id().with("playhead_head"), egui::Sense::drag());
+        let dragging_head = head.dragged() || ruler.dragged() || scrubbing;
+        if head.hovered() || ruler.hovered() || dragging_head {
+            ui.ctx().set_cursor_icon(if dragging_head {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+        for response in [&ruler, &head] {
+            if response.clicked() || response.dragged() {
+                seek = response
+                    .interact_pointer_pos()
+                    .map(|pos| ruler_lanes.time_at(pos.x).min(duration));
+                scrubbing |= response.dragged();
+            }
+        }
+        let shown = seek.unwrap_or(playhead);
+        let ph_x = ruler_lanes
+            .x_of(shown)
+            .clamp(ruler_lanes.left, ruler_rect.right());
+        // Live readout in the header cell — the time stays visible however
+        // far the lanes are scrolled.
+        painter.text(
+            egui::pos2(header.left() + 14.0, header.center().y),
+            Align2::LEFT_CENTER,
+            media::format_timestamp(shown),
+            theme::mono(11.0),
+            if dragging_head {
+                theme::PLAYHEAD
+            } else {
+                theme::TEXT_SECONDARY
+            },
+        );
+        ui.painter_at(ruler_rect.expand2(egui::vec2(0.0, 1.0)))
+            .line_segment(
+                [
+                    egui::pos2(ph_x, ruler_rect.bottom() - 6.0),
+                    egui::pos2(ph_x, ruler_rect.bottom() + 1.0),
+                ],
+                Stroke::new(1.5_f32, theme::PLAYHEAD),
+            );
+        paint_playhead_head(
+            &ui.painter_at(ruler_rect.expand2(egui::vec2(10.0, 0.0))),
+            ph_x,
+            ruler_rect.top() + 3.0,
+            ruler_rect.bottom() - 1.0,
+            head.hovered() || dragging_head,
+        );
+        self.user_dragging_seek = scrubbing;
+
         if clear {
             if let Some(p) = &mut self.project {
                 p.selected_clips.clear();
@@ -1004,6 +1557,16 @@ impl ClipperApp {
                 p.playhead_ms = ms;
             }
             self.live.reanchor(ms);
+        }
+        if let Some((ids, muted)) = monitor_toggle {
+            for id in ids {
+                if muted {
+                    self.live.monitor_muted.insert(id);
+                } else {
+                    self.live.monitor_muted.remove(&id);
+                }
+            }
+            ui.ctx().request_repaint();
         }
         if let Some(id) = mute {
             self.push_undo();
@@ -1041,47 +1604,64 @@ impl ClipperApp {
                 p.prune_tracks();
             }
         }
-        let (footer, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+        self.show_shortcut_footer(ui, footer_h);
+        // The panel remembers the height its content used; claiming the
+        // whole rect keeps a short frame from shrinking it for good.
+        ui.expand_to_include_rect(ui.max_rect());
+    }
+
+    /// Key-cap legend under the timeline.
+    fn show_shortcut_footer(&self, ui: &mut egui::Ui, height: f32) {
+        let (footer, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::hover(),
+        );
         let painter = ui.painter().with_clip_rect(footer);
-        let mut x = footer.left();
+        let mut x = footer.left() + 2.0;
         for (key, action) in [
             ("Space", "Play"),
             ("S", "Split"),
             ("Del", "Delete"),
             ("D", "Detach"),
-            ("Shift+D", "Attach"),
-            ("Ctrl+Z", "Undo"),
+            ("Shift D", "Attach"),
+            ("Ctrl Z", "Undo"),
         ] {
-            let key_text = painter.layout_no_wrap(
-                key.into(),
-                egui::FontId::monospace(10.5),
-                theme::TEXT_PRIMARY,
-            );
+            let key_text =
+                painter.layout_no_wrap(key.into(), theme::mono(10.0), theme::TEXT_SECONDARY);
             let key_rect = egui::Rect::from_min_size(
                 egui::pos2(x, footer.center().y - 9.0),
-                key_text.size() + egui::vec2(8.0, 6.0),
+                egui::vec2(key_text.size().x + 10.0, 18.0),
             );
-            painter.rect_filled(key_rect, 3.0, theme::BG_BUTTON);
-            painter.galley(
-                key_rect.min + egui::vec2(4.0, 3.0),
-                key_text,
-                theme::TEXT_PRIMARY,
-            );
-            let label = painter.layout_no_wrap(
-                action.into(),
-                egui::FontId::proportional(11.5),
-                theme::TEXT_MUTED,
+            painter.rect_filled(key_rect, 4.0, theme::BG_STATUS);
+            painter.rect_stroke(key_rect, 4.0, Stroke::new(1.0_f32, theme::BORDER));
+            // Key-cap lip: a darker bottom edge reads as a physical key.
+            painter.line_segment(
+                [
+                    key_rect.left_bottom() + egui::vec2(3.0, -0.5),
+                    key_rect.right_bottom() + egui::vec2(-3.0, -0.5),
+                ],
+                Stroke::new(1.0_f32, theme::BG_PREVIEW),
             );
             painter.galley(
                 egui::pos2(
-                    key_rect.right() + 5.0,
+                    key_rect.left() + 5.0,
+                    key_rect.center().y - key_text.size().y * 0.5,
+                ),
+                key_text,
+                theme::TEXT_SECONDARY,
+            );
+            let label =
+                painter.layout_no_wrap(action.into(), theme::regular(11.0), theme::TEXT_MUTED);
+            let label_w = label.size().x;
+            painter.galley(
+                egui::pos2(
+                    key_rect.right() + 6.0,
                     footer.center().y - label.size().y * 0.5,
                 ),
-                label.clone(),
+                label,
                 theme::TEXT_MUTED,
             );
-            x = key_rect.right() + 5.0 + label.size().x + 16.0;
+            x = key_rect.right() + 6.0 + label_w + 18.0;
         }
     }
 }
@@ -1111,9 +1691,17 @@ mod interaction_tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 200.0));
         let drag = EditorDrag::Asset(asset);
         let hover = |x| {
-            placement(&p, &[], &[], &drag, egui::pos2(x, 60.0), rect, &ctx)
-                .unwrap()
-                .start
+            placement(
+                &p,
+                &[],
+                &[],
+                &drag,
+                egui::pos2(x, 20.0),
+                Lanes::new(rect, p.canvas_length_ms()),
+                &ctx,
+            )
+            .unwrap()
+            .start
         };
         assert_eq!(hover(300.0), 0);
         assert_eq!(hover(315.0), 0);
@@ -1134,8 +1722,8 @@ mod interaction_tests {
             &tracks,
             &clips,
             &drag,
-            egui::pos2(64.0, RULER_HEIGHT + 10.0),
-            rect,
+            egui::pos2(HEADER_W, 10.0),
+            Lanes::new(rect, p.canvas_length_ms()),
             &ctx,
         )
         .unwrap();
@@ -1144,8 +1732,8 @@ mod interaction_tests {
             &tracks,
             &clips,
             &drag,
-            egui::pos2(64.0, RULER_HEIGHT + LANE_HEIGHT - 8.0),
-            rect,
+            egui::pos2(HEADER_W, LANE_HEIGHT - 8.0),
+            Lanes::new(rect, p.canvas_length_ms()),
             &ctx,
         )
         .unwrap();

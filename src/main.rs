@@ -21,6 +21,7 @@ mod timeline;
 mod track;
 mod updater;
 mod video_fbo;
+mod widgets;
 
 use app::ClipperApp;
 
@@ -157,10 +158,63 @@ fn load_caption_fonts(ctx: &egui::Context) {
             vec![(*name).to_string()],
         );
     }
+    // Interface typography. Inter carries the UI at three weights (egui
+    // has no synthetic bold, so weight is a separate family); JetBrains
+    // Mono gives timecodes even, slashed-zero figures. Both are Latin
+    // subsets (OFL) — DejaVu stays behind them for symbol coverage.
+    let ui_fonts: &[(&str, &'static [u8])] = &[
+        (
+            theme::FONT_REGULAR,
+            include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+        ),
+        (
+            theme::FONT_MEDIUM,
+            include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+        ),
+        (
+            theme::FONT_SEMIBOLD,
+            include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+        ),
+        (
+            theme::FONT_MONO,
+            include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf"),
+        ),
+    ];
+    for (name, bytes) in ui_fonts {
+        fonts
+            .font_data
+            .insert((*name).to_string(), egui::FontData::from_static(bytes));
+    }
+    // Named weights fall back through Inter Regular → DejaVu → egui's emoji
+    // fonts so a stray glyph never renders as tofu.
+    let fallback: Vec<String> = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let chain = |first: &str| {
+        let mut list = vec![
+            first.to_string(),
+            theme::FONT_REGULAR.to_string(),
+            "DejaVu Sans".to_string(),
+        ];
+        list.extend(fallback.iter().cloned());
+        list.dedup();
+        list
+    };
+    for name in [theme::FONT_MEDIUM, theme::FONT_SEMIBOLD] {
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(name.into()), chain(name));
+    }
     fonts
         .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "DejaVu Sans".into());
+        .insert(egui::FontFamily::Proportional, chain(theme::FONT_REGULAR));
+    let mono = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    mono.insert(0, theme::FONT_MONO.into());
+    mono.insert(1, "DejaVu Sans Mono".into());
     ctx.set_fonts(fonts);
 }

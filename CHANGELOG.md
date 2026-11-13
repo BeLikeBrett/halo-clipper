@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Interface typography (Inter + JetBrains Mono), painted icons, refined
+  graphite palette, segmented mode switch, menus that unroll from their button.
+- Advanced timeline: pinned ruler with live time, large playhead grab handle,
+  clearer split seams, attached-audio strip on V+A bars, preview-only track
+  mute buttons, clips leave their old lane immediately when dragged.
+- Canvas: magnetic snapping to canvas and layer edges with guides (Alt to
+  bypass); Reset frame fits with bars when the canvas shape differs (9:16).
+- Transport: go-to-start button, Home/End shortcuts.
+
 ## 0.8.0
 
 - Replace the Layers button panel with a media bin and drag-focused timeline.
