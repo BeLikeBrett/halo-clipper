@@ -523,8 +523,7 @@ mod tests {
             composition
                 .segments
                 .iter()
-                .filter(|s| s.audio_index.is_none())
-                .next_back()
+                .rfind(|s| s.audio_index.is_none())
                 .unwrap()
                 .source,
             PathBuf::from("overlay.mp4")
@@ -540,8 +539,7 @@ mod tests {
             p.composition(false)
                 .segments
                 .iter()
-                .filter(|s| s.audio_index.is_none())
-                .next_back()
+                .rfind(|s| s.audio_index.is_none())
                 .unwrap()
                 .source,
             PathBuf::from("base.mp4")
