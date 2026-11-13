@@ -410,7 +410,8 @@ impl Drop for Player {
         // Explicit drop of render context first — its lifetime was extended
         // to 'static via transmute on top of `mpv`, so it must not outlive
         // the Mpv Arc.
-        self.render.lock().unwrap().take();
         self.event_stop.store(true, Ordering::SeqCst);
+        let _ = self.mpv.command("stop", &[]);
+        self.render.lock().unwrap().take();
     }
 }

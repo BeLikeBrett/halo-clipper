@@ -2476,7 +2476,12 @@ impl ClipperApp {
             .show(&mut child, |ui| {
                 ui.set_min_size(preview_rect.size());
                 ui.set_max_size(preview_rect.size());
-                if self.project.is_none() {
+                if self.project.is_none()
+                    || self
+                        .project
+                        .as_ref()
+                        .is_some_and(|p| p.source.as_os_str().is_empty())
+                {
                     ui.allocate_ui_with_layout(
                         preview_rect.size(),
                         egui::Layout::centered_and_justified(egui::Direction::TopDown),
