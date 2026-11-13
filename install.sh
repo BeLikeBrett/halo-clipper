@@ -53,10 +53,8 @@ esac
 
 # Build the binary if missing or stale.
 BINARY="${REPO_DIR}/target/release/${BIN_NAME}"
-if [[ ! -x "${BINARY}" ]]; then
-    echo "Building release binary (this can take a minute on first run)..."
-    (cd "${REPO_DIR}" && cargo build --release)
-fi
+echo "Building current release binary..."
+(cd "${REPO_DIR}" && cargo build --release --locked)
 
 # Clean up any install left behind by the app's previous name so two
 # entries don't show up in the launcher.

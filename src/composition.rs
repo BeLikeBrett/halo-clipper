@@ -126,7 +126,7 @@ impl Composition {
         if !audio.is_empty() {
             // A silent bed preserves leading/trailing gaps. No normalization:
             // independent layer gain remains stable when another layer ends.
-            graph.push_str(&format!(";anullsrc=r=48000:cl=stereo,atrim=duration={duration:.6}[silence];[silence]{}amix=inputs={}:normalize=0:duration=longest:dropout_transition=0,alimiter=limit=0.95:level=0:latency=1,atrim=duration={duration:.6}[aout]",audio.concat(),audio.len()+1));
+            graph.push_str(&format!(";anullsrc=r=48000:cl=stereo,atrim=duration={duration:.6}[silence];[silence]{}amix=inputs={}:normalize=0:duration=longest:dropout_transition=0,alimiter=limit=0.95:level=0:attack=0.1,atrim=duration={duration:.6}[aout]",audio.concat(),audio.len()+1));
         }
         cmd.args(["-filter_complex", &graph, "-map", "[vout]"]);
         if audio.is_empty() {

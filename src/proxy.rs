@@ -21,7 +21,7 @@
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -333,7 +333,27 @@ fn run_ffmpeg(
     log::info!("proxy started (vaapi={use_vaapi})");
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let errors = thread::spawn(move || {
+        let mut tail = std::collections::VecDeque::new();
+        let mut buffer = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            tail.extend(&buffer[..n]);
+            while tail.len() > 65536 {
+                tail.pop_front();
+            }
+        }
+        String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>()).into_owned()
+    });
     *child_slot.lock().unwrap() = Some(child);
+    if cancel.load(Ordering::SeqCst) {
+        if let Some(child) = child_slot.lock().unwrap().as_mut() {
+            let _ = child.kill();
+        }
+    }
 
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
@@ -356,12 +376,15 @@ fn run_ffmpeg(
         slot.take().and_then(|mut c| c.wait().ok())
     };
 
+    let detail = errors
+        .join()
+        .unwrap_or_else(|_| "error reader stopped".into());
     if cancel.load(Ordering::SeqCst) {
         anyhow::bail!("cancelled");
     }
     match status {
         Some(s) if s.success() => Ok(()),
-        Some(s) => anyhow::bail!("ffmpeg exited with {s}"),
+        Some(s) => anyhow::bail!("ffmpeg exited with {s}: {}", detail.trim()),
         None => anyhow::bail!("ffmpeg exited abnormally"),
     }
 }

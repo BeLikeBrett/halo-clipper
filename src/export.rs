@@ -822,7 +822,7 @@ fn run_multitrack(
     }
     cmd.arg("-i")
         .arg(source)
-        .args(["-filter_complex", filter.trim_end()])
+        .args(["-filter_complex", filter.trim_end().trim_end_matches(';')])
         .args(["-map", "[vout]"]);
     if want_audio {
         cmd.args(["-map", "[aout]"]);

@@ -230,8 +230,8 @@ pub fn install(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         // Constant script; paths travel through environment values, never script text.
-        crate::platform::command("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop'; Wait-Process -Id ([int]$env:HALO_UPDATE_PID) -Timeout 180 -ErrorAction SilentlyContinue; if (Get-Process -Id ([int]$env:HALO_UPDATE_PID) -ErrorAction SilentlyContinue) { exit 1 }; $arguments='/S /D='+$env:HALO_UPDATE_DIR; $p=Start-Process -FilePath $env:HALO_UPDATE_FILE -ArgumentList $arguments -Wait -PassThru; if ($p.ExitCode -eq 0) { Start-Process -FilePath $env:HALO_UPDATE_APP; Remove-Item -LiteralPath $env:HALO_UPDATE_FILE -ErrorAction SilentlyContinue }"#])
-            .env("HALO_UPDATE_PID",std::process::id().to_string()).env("HALO_UPDATE_FILE",path).env("HALO_UPDATE_DIR",exe.parent().context("Application has no parent folder")?).env("HALO_UPDATE_APP",&exe).spawn()?;
+        crate::platform::command("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",r#"$ErrorActionPreference='Stop'; 'Waiting for Halo Clipper to close' | Set-Content -LiteralPath $env:HALO_UPDATE_LOG; Wait-Process -Id ([int]$env:HALO_UPDATE_PID) -Timeout 180 -ErrorAction SilentlyContinue; if (Get-Process -Id ([int]$env:HALO_UPDATE_PID) -ErrorAction SilentlyContinue) { exit 1 }; $arguments='/S /D='+$env:HALO_UPDATE_DIR; $p=Start-Process -FilePath $env:HALO_UPDATE_FILE -ArgumentList $arguments -Wait -PassThru; ('Installer exit code: '+$p.ExitCode) | Add-Content -LiteralPath $env:HALO_UPDATE_LOG; if ($p.ExitCode -eq 0) { Start-Process -FilePath $env:HALO_UPDATE_APP; Remove-Item -LiteralPath $env:HALO_UPDATE_FILE -ErrorAction SilentlyContinue }"#])
+            .env("HALO_UPDATE_LOG",crate::diagnostics::log_dir().join("update-install.log")).env("HALO_UPDATE_PID",std::process::id().to_string()).env("HALO_UPDATE_FILE",path).env("HALO_UPDATE_DIR",exe.parent().context("Application has no parent folder")?).env("HALO_UPDATE_APP",&exe).spawn()?;
     }
     #[cfg(not(windows))]
     {

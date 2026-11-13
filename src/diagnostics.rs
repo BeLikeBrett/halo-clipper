@@ -125,7 +125,11 @@ pub fn export(path: &Path, context: &str) -> anyhow::Result<()> {
             report.push('\n');
         }
     }
-    for name in ["halo-clipper.previous.log", "halo-clipper.log"] {
+    for name in [
+        "halo-clipper.previous.log",
+        "halo-clipper.log",
+        "update-install.log",
+    ] {
         if let Ok(file) = std::fs::File::open(log_dir().join(name)) {
             let mut text = String::new();
             let _ = file.take(MAX_BYTES).read_to_string(&mut text);
