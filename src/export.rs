@@ -1078,6 +1078,29 @@ pub fn suggest_output(source: &Path) -> PathBuf {
     parent.join(format!("{stem}_clip.{ext}"))
 }
 
+/// Save dialogs hand back exactly what the user typed. On Windows the
+/// filter shows "All Files" and known extensions are hidden, so a typed
+/// "my clip" arrives without one and ffmpeg can't pick a muxer ("Unable
+/// to choose an output format"). Borrow the suggested extension then.
+pub fn ensure_extension(destination: PathBuf, suggested: &Path) -> PathBuf {
+    if destination.extension().is_some_and(|e| !e.is_empty()) {
+        return destination;
+    }
+    let ext = suggested
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    // "clip." has an empty extension; don't produce "clip..mp4".
+    if name.to_string_lossy().ends_with('.') {
+        name.push(ext);
+    } else {
+        name.push(".");
+        name.push(ext);
+    }
+    destination.with_file_name(name)
+}
+
 pub fn format_duration(d: Duration) -> String {
     let total = d.as_secs();
     let h = total / 3600;
@@ -1092,6 +1115,23 @@ pub fn format_duration(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_name_without_extension_gets_suggested_one() {
+        let sugg = Path::new("/v/game_clip.mkv");
+        assert_eq!(
+            ensure_extension(PathBuf::from("/v/my clip"), sugg),
+            PathBuf::from("/v/my clip.mkv")
+        );
+        assert_eq!(
+            ensure_extension(PathBuf::from("/v/my clip."), sugg),
+            PathBuf::from("/v/my clip.mkv")
+        );
+        assert_eq!(
+            ensure_extension(PathBuf::from("/v/keep.mp4"), sugg),
+            PathBuf::from("/v/keep.mp4")
+        );
+    }
+
     use super::*;
 
     // ---- build_video_post_chain ---------------------------------------

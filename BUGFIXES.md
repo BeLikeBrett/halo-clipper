@@ -5,6 +5,60 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-13 — Windows: app did nothing when launched; export/UI gaps on Windows
+
+Found by installing the CI-built `Halo-Clipper-Setup.exe` (0.10.4) on a clean
+Windows 10 22H2 VM (`/satassd/winiso/clipper-test.qcow2`, an overlay over
+`win10.qcow2`).
+
+### Symptom
+
+- Finish → "Open Halo Clipper", the desktop shortcut, and running the exe
+  all did nothing: no window, no message, process gone in ~2 s.
+- With the window working: typing an export name without ".mp4" failed
+  with ffmpeg "Unable to choose an output format".
+- "Open Folder" after an export did nothing.
+- On a 1024x768 / 1366x768 screen the 1280x800 window and the Export
+  Options dialog ran off the bottom; Begin Export was unreachable.
+
+### Root cause
+
+- The log said `egui_glow requires opengl 2.0+`: the VM's Basic Display
+  Adapter only has GDI OpenGL 1.1. `run_native` returned Err, `main`
+  returned it, and a `windows_subsystem = "windows"` exe has no console,
+  so the user saw nothing. Same for real users without a vendor GPU
+  driver or on Remote Desktop.
+- `rfd` returns exactly what was typed; the Windows dialog filter was "All
+  Files", so nothing appended an extension.
+- Open Folder spawned `xdg-open` unconditionally.
+- The export modal used a fixed height with no scroll area.
+- CI only runs `--self-check` on Windows, which never creates a window, so
+  none of this was covered.
+
+### Fix
+
+- `platform::show_startup_error` shows a MessageBox (and logs) when
+  `run_native` fails, with an OpenGL/driver hint when relevant.
+- `export::ensure_extension` appends the suggested extension when the
+  chosen path has none; the dialog also gets a "<EXT> video" filter.
+- `platform::reveal_in_file_manager`: `explorer.exe /select,"<file>"` on
+  Windows, `xdg-open <dir>` elsewhere.
+- Export modal height is capped to the window and its body is a
+  `ScrollArea`; `fit_window_to_monitor` maximizes on the first frame if the
+  window doesn't fit the monitor.
+
+### Verification
+
+On the VM: no-GL launch shows the error box; with Mesa llvmpipe
+(`opengl32.dll` + `libgallium_wgl.dll` next to the exe and
+`GALLIUM_DRIVER=llvmpipe` — without that env var Mesa picks its D3D12
+backend, which dies with exit 0x80070057 in a VM without D3D12) the app
+opens maximized, plays, exports via Discord and Auto, a typed
+"typed_name" saves as typed_name.mp4, and Open Folder selects it in
+Explorer. Unit test `typed_name_without_extension_gets_suggested_one`.
+
+---
+
 ## 2026-11-13 — Shortcuts stopped after clicking Play or Split
 
 ### Symptom

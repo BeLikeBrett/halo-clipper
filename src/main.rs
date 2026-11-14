@@ -82,7 +82,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Halo Clipper",
         native_options,
         Box::new(move |cc| {
@@ -108,7 +108,11 @@ fn main() -> eframe::Result<()> {
                 }
             }
         }),
-    )
+    );
+    if let Err(error) = &result {
+        platform::show_startup_error(&error.to_string());
+    }
+    result
 }
 
 /// Embedded application icon. `include_bytes!` baked in at compile

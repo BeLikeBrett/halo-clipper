@@ -41,6 +41,84 @@ pub fn init() {
     }
 }
 
+/// Opens the folder holding `file`. On Windows, Explorer also selects the
+/// file; elsewhere the parent directory goes to the desktop's opener.
+pub fn reveal_in_file_manager(file: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `/select,` must be one argument with the path glued on; raw_arg
+        // stops Rust from quoting the whole thing, which Explorer rejects.
+        let _ = Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{}\"", file.display()))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    if let Some(parent) = file.parent() {
+        let _ = command("xdg-open").arg(parent).spawn();
+    }
+}
+
+/// Tells the user why the app is closing. The Windows build is a GUI
+/// subsystem exe with no console, so without this a startup failure (for
+/// example a GPU driver without OpenGL 2.0, or a Remote Desktop session)
+/// looks like "double-clicked it and nothing happened".
+pub fn show_startup_error(error: &str) {
+    let lower = error.to_ascii_lowercase();
+    let hint = if lower.contains("opengl") || lower.contains("wgl") || lower.contains("glutin") {
+        "Your graphics driver doesn't provide OpenGL 2.0 or newer, which Halo Clipper \
+         needs to draw its window.\n\n\
+         - Install the latest driver from NVIDIA, AMD or Intel (the generic \
+         \"Microsoft Basic Display Adapter\" driver is not enough).\n\
+         - Remote Desktop and some virtual machines don't provide OpenGL; run \
+         Halo Clipper on the PC itself."
+    } else {
+        "Something went wrong while starting up."
+    };
+    let log = crate::diagnostics::log_dir().join("halo-clipper.log");
+    let message = format!(
+        "Halo Clipper couldn't start.\n\n{hint}\n\nDetails: {error}\n\nLog: {}",
+        log.display()
+    );
+    log::error!("Startup failed: {error}");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(
+                hwnd: *mut std::ffi::c_void,
+                text: *const u16,
+                caption: *const u16,
+                kind: u32,
+            ) -> i32;
+        }
+        const MB_OK: u32 = 0x0;
+        const MB_ICONERROR: u32 = 0x10;
+        let wide = |s: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(Some(0))
+                .collect()
+        };
+        let text = wide(&message);
+        let caption = wide("Halo Clipper");
+        // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the
+        // call; a null owner window is allowed.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{message}");
+}
+
 /// Swaps the window's icons for the multi-size icon embedded in the
 /// executable (resource 1, see `build.rs`). winit only accepts a single
 /// RGBA image and lets Windows scale it, which smears the 16 px title-bar

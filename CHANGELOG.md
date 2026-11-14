@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.5
+
+- Windows: if the app can't start (for example a graphics driver without
+  OpenGL 2.0, or a Remote Desktop session), show an error box explaining why
+  instead of closing silently.
+- Windows: a typed export name without an extension (e.g. "my clip") no longer
+  fails with "Unable to choose an output format"; the save dialog now offers an
+  MP4 filter and the extension is added automatically.
+- Windows: "Open Folder" after an export now opens Explorer with the file
+  selected (it called the Linux-only xdg-open before).
+- Small screens: the window starts maximized when 1280x800 doesn't fit (1366x768
+  laptops), and the Export Options dialog scrolls so Begin Export stays visible.
+- Discord export card now says Free 20 MB, matching the tier buttons.
+
 ## 0.10.4
 
 - Correct the Windows native import library to reference the bundled libmpv-2.dll.

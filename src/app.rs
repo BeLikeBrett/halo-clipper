@@ -598,6 +598,8 @@ pub struct ClipperApp {
     /// Edge-trigger state so mpv's `lavfi-complex` and `mute` properties
     /// are only updated when the desired state actually changes.
     last_lavfi_complex: String,
+    /// Set once the startup window has been checked against the monitor.
+    window_fit_checked: bool,
     last_audio_track_muted: bool,
     /// Edge-trigger state for `mpv.speed` — only push a property change
     /// when the V1 clip under the playhead changes its speed setting.
@@ -617,7 +619,7 @@ pub struct ClipperApp {
     settings_open: bool,
     /// User-selected Discord target file size, in MB. Tier chips set it
     /// to the matching upload cap; the slider allows anything between
-    /// the free tier's 10 MB and Nitro's headroom-adjusted 475 MB.
+    /// the free tier's 20 MB and Nitro's headroom-adjusted 475 MB.
     /// Persists for the session; not saved to disk.
     discord_target_mb: u32,
 }
@@ -684,6 +686,7 @@ impl ClipperApp {
             redo_stack: Vec::new(),
             export_options_open: false,
             last_lavfi_complex: String::new(),
+            window_fit_checked: false,
             last_audio_track_muted: false,
             last_clip_speed: 1.0,
             clip_drag_session: None,
@@ -1356,7 +1359,17 @@ impl ClipperApp {
         let Some(project) = &self.project else { return };
 
         let suggested = export::suggest_output(&project.source);
+        let suggested_ext = suggested
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_string();
         let Some(destination) = rfd::FileDialog::new()
+            .add_filter(
+                format!("{} video", suggested_ext.to_uppercase()),
+                &[suggested_ext.as_str()],
+            )
+            .add_filter("All files", &["*"])
             .set_file_name(
                 suggested
                     .file_name()
@@ -1372,6 +1385,7 @@ impl ClipperApp {
         else {
             return;
         };
+        let destination = export::ensure_extension(destination, &suggested);
 
         let same_file = |source: &std::path::Path| {
             source == destination
@@ -1694,6 +1708,7 @@ impl ClipperApp {
 
 impl eframe::App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.fit_window_to_monitor(ctx);
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -2977,6 +2992,28 @@ impl ClipperApp {
         }
     }
 
+    /// The default 1280x800 window is taller than a 1366x768 laptop
+    /// screen, which pushed the timeline and Export button off the bottom.
+    /// Once the monitor size is known, maximize if the window doesn't fit.
+    fn fit_window_to_monitor(&mut self, ctx: &egui::Context) {
+        if self.window_fit_checked {
+            return;
+        }
+        let (monitor, outer) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.monitor_size, vp.outer_rect)
+        });
+        let Some(monitor) = monitor else {
+            return; // not reported yet; try again next frame
+        };
+        self.window_fit_checked = true;
+        let outer = outer.map(|r| r.size()).unwrap_or(egui::vec2(1280.0, 830.0));
+        // Leave room for the taskbar / panels.
+        if outer.x > monitor.x || outer.y > monitor.y - 40.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+
     /// Pre-export options modal. Two top-level modes — **Auto**
     /// (decides copy vs re-encode based on what was modified) and
     /// **Custom** (resolution / codec / bitrate / advanced unlock).
@@ -2992,12 +3029,18 @@ impl ClipperApp {
         let mut begin = false;
         let mut cancel = false;
         let mut next_mode = self.export_mode;
-        let modal_height = match self.export_mode {
+        let preferred_height: f32 = match self.export_mode {
             ExportMode::Custom if self.custom_encode.advanced_unlocked => 840.0,
             ExportMode::Custom => 680.0,
             ExportMode::Discord => 620.0,
-            ExportMode::Auto => 430.0,
+            ExportMode::Auto => 450.0,
         };
+        // Never taller than the window: on 768 px laptop screens the footer
+        // (Begin Export) used to sit below the bottom edge, unreachable.
+        // The body scrolls instead; header and footer stay pinned.
+        let modal_height = preferred_height
+            .min(screen.height() - 2.0 * 28.0 - 24.0)
+            .max(200.0);
 
         let _ = self.project.as_ref();
 
@@ -3029,6 +3072,14 @@ impl ClipperApp {
                 );
                 ui.add_space(20.0);
 
+                // Footer = spacing + separator + spacing + 34 px buttons.
+                const FOOTER_HEIGHT: f32 = 14.0 + 1.0 + 14.0 + 34.0 + 6.0;
+                let body_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("export_options_body")
+                    .max_height(body_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 // Top-level Auto / Discord Nitro / Custom selector.
                 // 84px tall rows with 14pt strong titles + 13pt body —
                 // sized for "obvious to click, comfortable to read"
@@ -3045,7 +3096,7 @@ impl ClipperApp {
                         ExportMode::Discord,
                         "Discord",
                         "Size-targeted encode that fits under a Discord upload \
-                         cap — pick your tier (Free 10 MB / Nitro Basic 50 MB / \
+                         cap — pick your tier (Free 20 MB / Nitro Basic 50 MB / \
                          Nitro 500 MB) or dial in any size.",
                     ),
                     (
@@ -3146,6 +3197,7 @@ impl ClipperApp {
                     }
                     ExportMode::Auto => {}
                 }
+                    });
 
                 ui.add_space(14.0);
                 ui.separator();
@@ -3960,9 +4012,7 @@ impl ClipperApp {
             });
 
         if open_folder {
-            if let Some(parent) = progress.destination.parent() {
-                let _ = crate::platform::command("xdg-open").arg(parent).spawn();
-            }
+            crate::platform::reveal_in_file_manager(&progress.destination);
         }
 
         if cancel {
