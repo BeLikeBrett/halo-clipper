@@ -1039,7 +1039,7 @@ impl ClipperApp {
         let mut remove = None;
         let mut focus = None;
         let active_simple = self.project.as_ref().and_then(|p| p.simple.focus);
-        if assets.is_empty() && advanced {
+        if assets.is_empty() && advanced && !self.file_hover {
             ui.add_space(18.0);
             ui.label(
                 RichText::new("Import video or audio, then drag it onto the timeline.")

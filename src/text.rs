@@ -400,6 +400,17 @@ impl Look {
         dy: 0.0,
         reveal: Reveal::All,
     };
+
+    /// True when nothing of the text would be drawn, e.g. the first frame
+    /// of a Fade, Pop, Type or Words intro.
+    pub fn is_blank(&self) -> bool {
+        self.alpha < 0.02
+            || match &self.reveal {
+                Reveal::All => false,
+                Reveal::Chars { shown, .. } => *shown == 0,
+                Reveal::Words(progress) => progress.iter().all(|p| *p < 0.02),
+            }
+    }
     pub fn is_visible(&self) -> bool {
         self.alpha > 0.0 && self.scale > 0.0
     }
@@ -570,6 +581,21 @@ pub fn word_pop(progress: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Type shows its first letter on frame one, so it is never blank.
+    #[test]
+    fn intros_start_blank_and_settle() {
+        for intro in [Intro::Fade, Intro::Pop, Intro::Slide, Intro::Words] {
+            let t = item(intro, Outro::None);
+            assert!(look_at(&t, t.start_ms).is_blank(), "{intro:?}");
+            assert!(
+                !look_at(&t, (t.start_ms + t.end_ms) / 2).is_blank(),
+                "{intro:?}"
+            );
+        }
+        let t = item(Intro::None, Outro::None);
+        assert!(!look_at(&t, t.start_ms).is_blank());
+    }
 
     fn item(intro: Intro, outro: Outro) -> TextItem {
         let mut t = TextItem::new(TextId(1), crate::track::TrackId(0), 1_000, 5_000);

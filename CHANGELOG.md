@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.9
+
+- Panel sizes (Media, Edit, timeline height) are remembered between
+  sessions; Settings → Reset panel sizes restores the defaults.
+- Switching the output shape (e.g. Original → Reels / TikTok) fits every
+  video to the new shape; one undo step.
+- Text no longer vanishes when deselected with the playhead on its first
+  frame (the intro's empty frame); paused previews show it settled.
+- The Media hint hides while a file is dragged over the window.
+- Linux: the app icon shows in GTK launchers at small sizes again.
+
 ## 0.10.8
 
 - Edit panel split into tabs: Text / Look / Animate for text, Frame /

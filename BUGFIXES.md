@@ -5,6 +5,38 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-15 — Text vanished when deselected at its start; broken launcher icon
+
+### Symptom
+
+- With the playhead on a text's first frame (e.g. 0:00), the text showed
+  while selected and vanished when clicking off it.
+- Halo Clipper showed a "missing image" icon in brett-launcher (GTK3).
+
+### Root cause
+
+- Selected text previews settled (`Look::STILL`) while paused; unselected
+  text used `look_at`, and the default Pop intro (also Fade, Slide, Words)
+  is fully transparent on its first frame.
+- GTK picks `scalable/apps/halo-clipper.svg` at 32 px. The SVG opened with a
+  long comment before `<svg`, so gdk-pixbuf/glycin's format sniffing didn't
+  recognise it ("Couldn't recognize the image file format"). PNG sizes worked.
+
+### Fix
+
+- `Look::is_blank`; while paused, a blank look shows settled (`canvas_texts`,
+  which also drives hit-testing, so the text can be grabbed there).
+- Moved the comment inside the `<svg>` element; reinstalled the user icon and
+  refreshed its icon cache.
+
+### Verification
+
+- `text::tests::intros_start_blank_and_settle`; headless sway: deselected text
+  at 0:00 stays visible.
+- GTK3 `IconTheme.lookup_icon("halo-clipper", 32)` loads the SVG (failed before).
+
+---
+
 ## 2026-11-15 — Linux: file drops did nothing on Wayland; Shift+Enter finished text
 
 ### Symptom

@@ -24,6 +24,19 @@ pub enum ProxyQuality {
     AllIntra,
 }
 
+/// Panel sizes the user dragged. `None` keeps the built-in default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PanelLayout {
+    #[serde(default)]
+    pub media_width: Option<f32>,
+    #[serde(default)]
+    pub edit_width: Option<f32>,
+    /// Height added to (or taken from) the Advanced timeline's fitted
+    /// height, so the preference survives lanes being added or removed.
+    #[serde(default)]
+    pub timeline_extra: Option<f32>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_update_check")]
@@ -38,6 +51,9 @@ pub struct Settings {
     /// opts into all-intra frame-exact scrubbing.
     #[serde(default)]
     pub proxy_quality: ProxyQuality,
+    /// Remembered panel sizes; written as soon as a resize ends.
+    #[serde(default)]
+    pub layout: PanelLayout,
 }
 
 fn default_update_check() -> bool {
@@ -49,6 +65,7 @@ impl Default for Settings {
             auto_clear_cache_on_close: false,
             proxy_quality: ProxyQuality::default(),
             check_updates_on_startup: true,
+            layout: PanelLayout::default(),
         }
     }
 }
@@ -114,6 +131,14 @@ impl Settings {
                 Self::default()
             }
         }
+    }
+
+    /// Writes only the layout, keeping whatever else is on disk, so a
+    /// panel resize never commits unsaved edits in the Settings modal.
+    pub fn save_layout(layout: PanelLayout) -> anyhow::Result<()> {
+        let mut on_disk = Self::load();
+        on_disk.layout = layout;
+        on_disk.save()
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

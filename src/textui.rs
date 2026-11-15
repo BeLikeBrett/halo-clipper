@@ -137,10 +137,15 @@ impl ClipperApp {
                 if t.contains(p.playhead_ms) {
                     // While paused the selected layer shows settled, so it
                     // is never edited on a half-faded or half-typed frame.
-                    let look = if selected && !playing {
+                    // A paused frame where the intro hasn't drawn anything
+                    // yet (the playhead parked on the text's first frame)
+                    // shows it settled too, so it can still be seen and
+                    // grabbed.
+                    let look = text::look_at(t, p.playhead_ms);
+                    let look = if !playing && (selected || look.is_blank()) {
                         Look::STILL
                     } else {
-                        text::look_at(t, p.playhead_ms)
+                        look
                     };
                     Some((t.clone(), look, false))
                 } else if selected && !playing {

@@ -74,6 +74,25 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## Remembered layout, aspect refit, intro first frame (2026-11-15)
+
+- Panel sizes are saved in `config.json` (`layout`) as soon as a resize
+  ends: Media width, Edit width, and the timeline's offset from its fitted
+  height (so lanes being added or removed keep the user's extra room). A
+  resize is a size change while the pointer is held; window clamping never
+  counts. Saving writes only `layout`, never unsaved Settings edits.
+  Settings → Layout → Reset panel sizes clears it.
+- The timeline panel id changes with its row count; on a change the stored
+  egui panel state for the new id is dropped so it starts from fitted + offset.
+- Changing the output shape fits every video clip (Fit to screen rules), in
+  the same undo step as the shape change.
+- While paused, text whose intro hasn't drawn anything yet (Fade, Pop, Slide,
+  Words on their first frame) shows settled, like selected text, so it can
+  be seen and grabbed. Playback and export still animate from blank.
+- `assets/icon.svg`: the comment sits inside `<svg>`. Before the root element
+  it pushed `<svg` past the format sniffer, so GTK failed to load the
+  scalable icon (used at 32 px in launchers) and showed a broken image.
+
 ## Inspector tabs, app menu, slim sliders (2026-11-15)
 
 - The edit panel is split into tabs (`widgets::tab_bar`: a sliding accent

@@ -211,6 +211,27 @@ impl ClipperApp {
         (a.min - b.min).length() < 0.5 && (a.max - b.max).length() < 0.5
     }
 
+    /// Fits every video clip to the current canvas, without its own undo
+    /// step (the caller's change owns it).
+    fn fit_all_videos(&mut self) {
+        let Some(p) = self.project.as_ref() else {
+            return;
+        };
+        let fitted: Vec<(ClipId, Transform)> = p
+            .clips
+            .iter()
+            .filter(|c| p.is_video(c.id))
+            .filter_map(|c| Some((c.id, self.fitted_transform(c.id)?)))
+            .collect();
+        if let Some(p) = self.project.as_mut() {
+            for (id, transform) in fitted {
+                if let Some(clip) = p.clips.iter_mut().find(|c| c.id == id) {
+                    clip.transform = transform;
+                }
+            }
+        }
+    }
+
     /// Centers the clip: fills the canvas when the shapes match, fits it
     /// whole with bars when they don't (gameplay in 9:16). One undo step.
     pub(super) fn fit_to_screen(&mut self, id: ClipId) {
@@ -382,6 +403,11 @@ impl ClipperApp {
             self.canvas_ui.color_editing = editing;
             if let Some(p) = &mut self.project {
                 p.canvas = settings;
+            }
+            if settings.aspect != previous.aspect {
+                // A new shape starts every video fitted (whole, with bars
+                // when the shapes differ); part of the same undo step.
+                self.fit_all_videos();
             }
         }
         if !editing {

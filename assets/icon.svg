@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Halo Clipper app icon.
-     Family DNA from the HaloOS logo (Catppuccin Mocha, tilted halo ring,
-     rosewater→mauve→blue gradient) fused with editor language: a play mark
-     wearing the halo, above a timeline with a cut and the playhead parked
-     exactly on the cut point. -->
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Halo Clipper app icon.
+       Family DNA from the HaloOS logo (Catppuccin Mocha, tilted halo ring,
+       rosewater→mauve→blue gradient) fused with editor language: a play mark
+       wearing the halo, above a timeline with a cut and the playhead parked
+       exactly on the cut point. -->
   <defs>
     <!-- Background: near-flat vertical fade for depth without noise -->
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">

@@ -35,7 +35,7 @@ use crate::export::{self, EncodeMode, ExportHandle, ExportPhase, ExportPlan};
 use crate::media::{self, MediaInfo};
 use crate::player::Player;
 use crate::proxy;
-use crate::settings::{ProxyQuality, Settings};
+use crate::settings::{PanelLayout, ProxyQuality, Settings};
 use crate::text::{TextId, TextItem};
 use crate::theme;
 use crate::timeline::{self, TimelineState};
@@ -696,6 +696,8 @@ pub struct ClipperApp {
     /// Persistent user preferences (auto-clear-cache, etc). Loaded once
     /// at startup, mutated in the Settings modal, saved on close.
     settings: Settings,
+    /// Tracks panel sizes frame to frame to notice user resizes.
+    layout_watch: LayoutWatch,
     /// True while the File → Settings modal is open.
     settings_open: bool,
     /// User-selected Discord target file size, in MB. Tier chips set it
@@ -781,6 +783,7 @@ impl ClipperApp {
             clip_drag_session: None,
             proxy_handle: None,
             settings,
+            layout_watch: LayoutWatch::default(),
             settings_open: false,
             discord_target_mb: encode::DiscordNitro::MAX_TARGET_MB,
             discord_codec_choice: encode::CodecChoice::default(),
@@ -2098,11 +2101,18 @@ impl eframe::App for ClipperApp {
                 .fill(theme::BG_PANEL)
                 .inner_margin(Margin::symmetric(12.0, 8.0)),
         );
+        let fitted = fit_rows as f32 * 54.0 + 134.0;
+        if self.layout_watch.timeline_id != Some(panel_id) {
+            // A new row count: start from the fitted height plus the
+            // user's offset, not a size this id remembered from earlier.
+            ctx.data_mut(|d| d.remove::<egui::containers::panel::PanelState>(panel_id));
+        }
         if advanced {
             let max = (ctx.available_rect().height() - 150.0).max(160.0);
+            let extra = self.settings.layout.timeline_extra.unwrap_or(0.0);
             panel = panel
                 .resizable(true)
-                .default_height((fit_rows as f32 * 54.0 + 134.0).min(max))
+                .default_height((fitted + extra).clamp(150.0, max))
                 .height_range(150.0..=max);
         } else {
             panel = panel
@@ -2118,9 +2128,9 @@ impl eframe::App for ClipperApp {
         });
 
         // Left: media list
-        egui::SidePanel::left("media_panel")
+        egui::SidePanel::left(MEDIA_PANEL)
             .resizable(true)
-            .default_width(200.0)
+            .default_width(self.settings.layout.media_width.unwrap_or(200.0))
             .width_range(170.0..=300.0)
             .frame(
                 Frame::none()
@@ -2134,13 +2144,14 @@ impl eframe::App for ClipperApp {
         // Right: Edit panel. Shows whenever a clip is selected in
         // Advanced mode — click a clip to edit it, click empty lane (or
         // switch modes) and it goes away. No open/close ceremony.
-        if self.project.as_ref().is_some_and(|p| {
+        let edit_shown = self.project.as_ref().is_some_and(|p| {
             p.mode == EditMode::MultiTrack
                 && (!p.selected_clips.is_empty() || p.selected_text.is_some())
-        }) {
-            egui::SidePanel::right("edit_panel")
+        });
+        if edit_shown {
+            egui::SidePanel::right(EDIT_PANEL)
                 .resizable(true)
-                .default_width(300.0)
+                .default_width(self.settings.layout.edit_width.unwrap_or(300.0))
                 .min_width(284.0)
                 .frame(
                     Frame::none()
@@ -2169,6 +2180,8 @@ impl eframe::App for ClipperApp {
                         });
                 });
         }
+
+        self.remember_layout(ctx, panel_id, advanced.then_some(fitted), edit_shown);
 
         // Central: preview top-right, rest empty (room for future tracks/effects)
         egui::CentralPanel::default()
@@ -3170,6 +3183,24 @@ impl ClipperApp {
                         }
                     }
                 });
+
+                ui.add_space(18.0);
+                ui.label(
+                    RichText::new("Layout")
+                        .size(15.0)
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Panel sizes you drag are remembered.")
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(8.0);
+                let custom = self.settings.layout != PanelLayout::default();
+                if secondary_button(ui, "Reset panel sizes", custom).clicked() {
+                    self.reset_layout(ui.ctx());
+                }
 
                 ui.add_space(18.0);
                 ui.separator();
@@ -5011,5 +5042,92 @@ mod text_layer_tests {
         assert_eq!(composition.texts.len(), 1);
         assert_eq!(composition.texts[0].id, id);
         assert_eq!(composition.duration_ms, 8_000);
+    }
+}
+
+const MEDIA_PANEL: &str = "media_panel";
+const EDIT_PANEL: &str = "edit_panel";
+
+/// Last frame's panel sizes (media width, edit width, timeline offset
+/// from its fitted height) and which of them moved under a held pointer.
+#[derive(Default)]
+struct LayoutWatch {
+    last: [Option<f32>; 3],
+    moved: [bool; 3],
+    timeline_id: Option<egui::Id>,
+}
+
+fn panel_size(ctx: &egui::Context, id: egui::Id) -> Option<egui::Vec2> {
+    egui::containers::panel::PanelState::load(ctx, id).map(|s| s.size())
+}
+
+impl ClipperApp {
+    /// Notices panel resizes (a size change while the pointer is held)
+    /// and saves the new sizes once the pointer is released.
+    fn remember_layout(
+        &mut self,
+        ctx: &egui::Context,
+        timeline_id: egui::Id,
+        fitted: Option<f32>,
+        edit_shown: bool,
+    ) {
+        let watch = &mut self.layout_watch;
+        if watch.timeline_id != Some(timeline_id) {
+            // Rows changed (or the mode): not a user resize.
+            watch.last[2] = None;
+            watch.timeline_id = Some(timeline_id);
+        }
+        let now = [
+            panel_size(ctx, egui::Id::new(MEDIA_PANEL)).map(|s| s.x),
+            edit_shown
+                .then(|| panel_size(ctx, egui::Id::new(EDIT_PANEL)).map(|s| s.x))
+                .flatten(),
+            fitted.and_then(|f| panel_size(ctx, timeline_id).map(|s| s.y - f)),
+        ];
+        let held = ctx.input(|i| i.pointer.any_down());
+        if held {
+            for ((moved, last), now) in watch.moved.iter_mut().zip(watch.last).zip(now) {
+                if let (Some(a), Some(b)) = (last, now) {
+                    *moved |= (a - b).abs() > 0.5;
+                }
+            }
+        }
+        watch.last = now;
+        if held || !watch.moved.iter().any(|m| *m) {
+            return;
+        }
+        let layout = &mut self.settings.layout;
+        let slots = [
+            &mut layout.media_width,
+            &mut layout.edit_width,
+            &mut layout.timeline_extra,
+        ];
+        for (i, slot) in slots.into_iter().enumerate() {
+            if std::mem::take(&mut watch.moved[i]) {
+                if let Some(v) = now[i] {
+                    *slot = Some(v.round());
+                }
+            }
+        }
+        if let Err(e) = Settings::save_layout(self.settings.layout) {
+            log::warn!("saving panel layout failed: {e:#}");
+        }
+    }
+
+    /// Back to the built-in panel sizes, now and on the next start.
+    fn reset_layout(&mut self, ctx: &egui::Context) {
+        self.settings.layout = PanelLayout::default();
+        let ids = [egui::Id::new(MEDIA_PANEL), egui::Id::new(EDIT_PANEL)]
+            .into_iter()
+            .chain(self.layout_watch.timeline_id);
+        ctx.data_mut(|d| {
+            for id in ids {
+                d.remove::<egui::containers::panel::PanelState>(id);
+            }
+        });
+        self.layout_watch = LayoutWatch::default();
+        if let Err(e) = Settings::save_layout(self.settings.layout) {
+            log::warn!("saving panel layout failed: {e:#}");
+        }
     }
 }
