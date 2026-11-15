@@ -3280,179 +3280,96 @@ impl ClipperApp {
         let mut begin = false;
         let mut cancel = false;
         let mut next_mode = self.export_mode;
-        let preferred_height: f32 = match self.export_mode {
-            ExportMode::Custom if self.custom_encode.advanced_unlocked => 840.0,
-            ExportMode::Custom => 680.0,
-            ExportMode::Discord => 620.0,
-            ExportMode::Auto => 450.0,
-        };
-        // Never taller than the window: on 768 px laptop screens the footer
-        // (Begin Export) used to sit below the bottom edge, unreachable.
-        // The body scrolls instead; header and footer stay pinned.
-        let modal_height = preferred_height
-            .min(screen.height() - 2.0 * 28.0 - 24.0)
-            .max(200.0);
-
-        let _ = self.project.as_ref();
+        // The window sizes to its content (no reserved empty space) and the
+        // body scrolls only when the screen is too short for it.
+        const MODAL_WIDTH: f32 = 540.0;
+        const MARGIN: f32 = 22.0;
+        // Header (title + mode switch + description) and footer heights.
+        const HEADER_HEIGHT: f32 = 26.0 + 12.0 + 30.0 + 8.0 + 18.0 + 12.0;
+        const FOOTER_HEIGHT: f32 = 12.0 + 1.0 + 12.0 + 34.0 + 6.0;
+        // A fixed top edge (where a typical ~640 px modal would start), so
+        // switching modes grows the window downward instead of moving the
+        // mode switch out from under the pointer.
+        let top = ((screen.height() - 640.0) / 2.0).max(24.0);
+        let max_body =
+            (screen.height() - top - 24.0 - 2.0 * MARGIN - HEADER_HEIGHT - FOOTER_HEIGHT)
+                .max(120.0);
 
         egui::Window::new("export_options_modal")
             .title_bar(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .anchor(Align2::CENTER_TOP, [0.0, top])
             .collapsible(false)
             .resizable(false)
-            .fixed_size([640.0, modal_height])
+            .min_width(MODAL_WIDTH)
+            .max_width(MODAL_WIDTH)
             .frame(
                 Frame::window(&ctx.style())
                     .fill(theme::BG_MODAL)
                     .rounding(Rounding::same(12.0))
                     .stroke(Stroke::new(1.0_f32, theme::BORDER))
-                    .inner_margin(Margin::same(28.0)),
+                    .inner_margin(Margin::same(MARGIN)),
             )
             .show(ctx, |ui| {
+                ui.set_width(MODAL_WIDTH);
                 ui.label(
-                    RichText::new("Export Options")
-                        .size(24.0)
-                        .strong()
+                    RichText::new("Export")
+                        .font(theme::semibold(20.0))
                         .color(theme::TEXT_PRIMARY),
                 );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Auto picks the simplest pipeline that preserves quality. Custom unlocks codec, resolution, bitrate.")
-                        .size(13.0)
-                        .color(theme::TEXT_MUTED),
-                );
-                ui.add_space(20.0);
-
-                // Footer = spacing + separator + spacing + 34 px buttons.
-                const FOOTER_HEIGHT: f32 = 14.0 + 1.0 + 14.0 + 34.0 + 6.0;
-                let body_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("export_options_body")
-                    .max_height(body_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                // Top-level Auto / Discord Nitro / Custom selector.
-                // 84px tall rows with 14pt strong titles + 13pt body —
-                // sized for "obvious to click, comfortable to read"
-                // (Resolve's preset cards are similar dimensions).
-                for (mode, title, desc) in [
+                ui.add_space(12.0);
+                let modes = [
                     (
                         ExportMode::Auto,
                         "Auto",
-                        "Stream-copies when the In mark is keyframe-aligned and \
-                         nothing was modified. Otherwise re-encodes at libx264 \
-                         CRF 18 to preserve source quality.",
+                        "Keeps source quality; copies without re-encoding when nothing changed.",
                     ),
                     (
                         ExportMode::Discord,
                         "Discord",
-                        "Size-targeted encode that fits under a Discord upload \
-                         cap — pick your tier (Free 20 MB / Nitro Basic 50 MB / \
-                         Nitro 500 MB) or dial in any size.",
+                        "Fits under a Discord upload limit.",
                     ),
                     (
                         ExportMode::Custom,
                         "Custom",
-                        "Pick resolution, codec, quality-or-bitrate, and frame \
-                         rate. Toggle Advanced for encoder preset and audio \
-                         codec/bitrate.",
+                        "Choose resolution, codec, quality and frame rate.",
                     ),
-                ] {
-                    let selected = next_mode == mode;
-                    let row = ui.allocate_response(
-                        egui::vec2(ui.available_width(), 84.0),
-                        egui::Sense::click(),
-                    );
-
-                    // Subtle selected state — let the border + radio dot
-                    // carry the "this is picked" signal so the body text
-                    // stays readable on near-normal background contrast.
-                    let bg = if selected {
-                        theme::ACCENT.linear_multiply(0.08)
-                    } else if row.hovered() {
-                        theme::BG_BUTTON_HOVER
-                    } else {
-                        theme::BG_BUTTON
-                    };
-                    let stroke = if selected {
-                        Stroke::new(2.0_f32, theme::ACCENT)
-                    } else if row.hovered() {
-                        Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.5))
-                    } else {
-                        Stroke::new(1.0_f32, theme::BORDER)
-                    };
-                    ui.painter()
-                        .rect(row.rect, Rounding::same(8.0), bg, stroke);
-
-                    // Radio indicator on the left edge.
-                    let indicator_x = row.rect.left() + 22.0;
-                    let indicator_y = row.rect.center().y;
-                    let indicator_radius = 7.0;
-                    ui.painter().circle_stroke(
-                        egui::pos2(indicator_x, indicator_y),
-                        indicator_radius,
-                        Stroke::new(1.5_f32, if selected { theme::ACCENT } else { theme::BORDER }),
-                    );
-                    if selected {
-                        ui.painter().circle_filled(
-                            egui::pos2(indicator_x, indicator_y),
-                            indicator_radius - 3.0,
-                            theme::ACCENT,
-                        );
-                    }
-
-                    // Paint text via the painter (not child.label) so the
-                    // labels can't intercept the pointer and switch the
-                    // cursor to an I-beam. The whole 640×84 card stays a
-                    // single click target.
-                    let text_left = row.rect.left() + 44.0;
-                    let title_pos = egui::pos2(text_left, row.rect.top() + 14.0);
-                    ui.painter().text(
-                        title_pos,
-                        egui::Align2::LEFT_TOP,
-                        title,
-                        egui::FontId::new(15.0, egui::FontFamily::Proportional),
-                        theme::TEXT_PRIMARY,
-                    );
-                    // Description wraps to fit the row width.
-                    let desc_pos = egui::pos2(text_left, row.rect.top() + 38.0);
-                    let desc_wrap_width = row.rect.right() - 16.0 - text_left;
-                    let desc_galley = ui.painter().layout(
-                        desc.to_string(),
-                        egui::FontId::new(12.5, egui::FontFamily::Proportional),
-                        theme::TEXT_MUTED,
-                        desc_wrap_width,
-                    );
-                    ui.painter().galley(desc_pos, desc_galley, theme::TEXT_MUTED);
-
-                    if row.clicked() {
-                        next_mode = mode;
-                    }
-                    row.on_hover_cursor(egui::CursorIcon::PointingHand);
-                    ui.add_space(10.0);
+                ];
+                let options: Vec<(&str, &str)> = modes.iter().map(|m| (m.1, "")).collect();
+                let selected = modes.iter().position(|m| m.0 == next_mode).unwrap_or(0);
+                if let Some(i) = crate::widgets::segmented_fill(
+                    ui,
+                    "export_mode",
+                    &options,
+                    selected,
+                    MODAL_WIDTH,
+                ) {
+                    next_mode = modes[i].0;
                 }
+                ui.add_space(8.0);
+                let blurb = modes
+                    .iter()
+                    .find(|m| m.0 == next_mode)
+                    .map(|m| m.2)
+                    .unwrap_or_default();
+                ui.label(RichText::new(blurb).size(12.5).color(theme::TEXT_MUTED));
+                ui.add_space(12.0);
 
-                // Per-mode sub-panel.
-                match next_mode {
-                    ExportMode::Discord => {
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.add_space(12.0);
-                        self.show_discord_nitro_panel(ui);
-                    }
-                    ExportMode::Custom => {
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.add_space(12.0);
-                        self.show_custom_encode_panel(ui);
-                    }
-                    ExportMode::Auto => {}
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("export_options_body")
+                    .max_height(max_body)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // Per-mode sub-panel.
+                        match next_mode {
+                            ExportMode::Discord => self.show_discord_nitro_panel(ui),
+                            ExportMode::Custom => self.show_custom_encode_panel(ui),
+                            ExportMode::Auto => {}
+                        }
                     });
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
                 ui.separator();
-                ui.add_space(14.0);
+                ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
                     let cancel_btn = egui::Button::new(
@@ -3462,20 +3379,18 @@ impl ClipperApp {
                     )
                     .rounding(Rounding::same(6.0))
                     .min_size(egui::vec2(110.0, 34.0));
-                    if ui.add(cancel_btn)
+                    if ui
+                        .add(cancel_btn)
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
                         cancel = true;
                     }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if primary_button(ui, "Begin Export", true).clicked() {
-                                begin = true;
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Begin Export", true).clicked() {
+                            begin = true;
+                        }
+                    });
                 });
             });
 
@@ -3499,18 +3414,9 @@ impl ClipperApp {
         };
         let duration_ms = self.cut_duration_ms_for_export(project);
 
-        // ── Tier presets + target-size slider ──
-        // One chip per Discord subscription tier; the slider covers
-        // everything in between for people who want a specific size.
-        ui.label(
-            RichText::new("Target file size")
-                .size(13.0)
-                .strong()
-                .color(theme::TEXT_PRIMARY),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        // ── Target size: tier chips beside the label, slider under ──
+        let width = ui.available_width();
+        export_row(ui, "Target size", |ui| {
             for (label, mb) in encode::DiscordNitro::TIERS {
                 let active = self.discord_target_mb == *mb;
                 if speed_preset_chip(ui, label, active).clicked() {
@@ -3520,7 +3426,9 @@ impl ClipperApp {
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().slider_width = 380.0;
+            // Under the chips, spanning the rest of the row with its value box.
+            ui.add_space(96.0 + ui.spacing().item_spacing.x - 4.0);
+            ui.spacing_mut().slider_width = (width - 96.0 - 90.0).max(120.0);
             ui.add(
                 crate::widgets::Slim::new(
                     &mut self.discord_target_mb,
@@ -3528,35 +3436,18 @@ impl ClipperApp {
                 )
                 .step_by(5.0)
                 .suffix(" MB"),
-            );
-        });
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Pick the tier matching where you'll upload, or drag the \
-                 slider — the encoder picks resolution + bitrate to fit.",
             )
-            .size(11.5)
-            .color(theme::TEXT_MUTED),
-        );
-        ui.add_space(14.0);
+            .on_hover_text("Pick your tier, or drag for any size; resolution and bitrate follow.");
+        });
+        ui.add_space(12.0);
 
-        // ── Codec row: Auto, or pin a family ──
-        // Auto is right almost always, but "almost" is why this row
-        // exists: someone posting to a server full of phone clients may
-        // want H.264 regardless of what the size math prefers, and
-        // someone who knows their audience may want AV1 anyway.
+        // ── Codec: Auto, or pin a family ──
+        // Auto is right almost always; someone posting to a server full of
+        // phone clients may want H.264 regardless, someone who knows their
+        // audience may want AV1 anyway.
         let av1_available =
             encode::DiscordNitro::best_av1(self.detected_gpu, &self.available_codecs).is_some();
-        ui.label(
-            RichText::new("Codec")
-                .size(13.0)
-                .strong()
-                .color(theme::TEXT_PRIMARY),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        export_row(ui, "Codec", |ui| {
             for choice in encode::CodecChoice::ALL {
                 let active = self.discord_codec_choice == *choice;
                 let selectable = *choice != encode::CodecChoice::Av1 || av1_available;
@@ -3608,90 +3499,98 @@ impl ClipperApp {
         // actually have — "≈ 55 MB" reads as a ballpark, which it is.
         let est_mb_rounded = ((plan.est_mb() / 5.0).round() * 5.0).max(5.0) as i64;
 
-        let rows: [(&str, String); 5] = [
-            (
-                "Cut duration",
-                format!(
-                    "{}:{:02}",
-                    duration_ms / 60_000,
-                    (duration_ms % 60_000) / 1000,
-                ),
-            ),
-            (
-                "Bitrate budget",
-                format!(
-                    "{:.1} Mbps video + {} kbps audio{}",
-                    video_kbps as f64 / 1000.0,
-                    audio_kbps,
-                    if cap_dominates { "  (capped)" } else { "" },
-                ),
-            ),
-            (
-                "Resolution",
-                format!("{} ({}×{})", resolution.label(), dims.0, dims.1),
-            ),
-            ("Codec", plan.codec.display().to_string()),
-            (
-                "Approx. output size",
-                format!("≈ {est_mb_rounded} MB  ±10%"),
-            ),
-        ];
-
-        egui::Grid::new("discord_nitro_stats")
-            .num_columns(2)
-            .spacing([20.0, 10.0])
+        let length = format!(
+            "{}:{:02}",
+            duration_ms / 60_000,
+            (duration_ms % 60_000) / 1000
+        );
+        let bitrate = format!(
+            "{:.1} Mbps + {} kbps audio{}",
+            video_kbps as f64 / 1000.0,
+            audio_kbps,
+            if cap_dominates { " (capped)" } else { "" },
+        );
+        // A compact summary card: what will come out, in two columns.
+        Frame::none()
+            .fill(theme::BG_BUTTON)
+            .rounding(Rounding::same(8.0))
+            .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+            .inner_margin(Margin::symmetric(14.0, 12.0))
             .show(ui, |ui| {
-                for (label, value) in rows {
-                    ui.label(RichText::new(label).size(12.5).color(theme::TEXT_MUTED));
-                    ui.label(
-                        RichText::new(value)
-                            .size(13.5)
-                            .color(theme::TEXT_PRIMARY)
-                            .monospace(),
-                    );
-                    ui.end_row();
-                }
+                ui.set_width(ui.available_width());
+                let fact = |ui: &mut egui::Ui, label: &str, value: String| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new(label).size(11.0).color(theme::TEXT_MUTED));
+                        ui.label(
+                            RichText::new(value)
+                                .font(theme::mono(12.5))
+                                .color(theme::TEXT_PRIMARY),
+                        );
+                    });
+                };
+                egui::Grid::new("discord_nitro_stats")
+                    .num_columns(2)
+                    .min_col_width((ui.available_width() - 16.0) / 2.0)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        fact(ui, "Size", format!("≈ {est_mb_rounded} MB"));
+                        fact(ui, "Length", length);
+                        ui.end_row();
+                        fact(
+                            ui,
+                            "Resolution",
+                            format!("{} ({}×{})", resolution.label(), dims.0, dims.1),
+                        );
+                        fact(ui, "Codec", plan.codec.display().to_string());
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(bitrate)
+                        .font(theme::mono(11.0))
+                        .color(theme::TEXT_MUTED),
+                )
+                .on_hover_text(format!(
+                    "Constant bitrate aiming near {est_mb_rounded} MB (±10% in practice)."
+                ));
             });
 
-        ui.add_space(10.0);
-        // Pick the most useful explanatory note based on the current state.
-        // Cap-warning takes priority — it explains the gap between slider
-        // and actual output, which is the most common "huh?" moment.
-        let note = if cap_dominates {
-            format!(
-                "Bitrate capped at {} Mbps — at {} s the encoder can't usefully \
-                 consume the full {} MB target. Output will land near {} MB.",
+        // One note at most: a warning when the bitrate is capped or thin,
+        // otherwise why this codec (the AV1 switch changes encode time and
+        // playback compatibility, so it shouldn't happen silently).
+        let warning = if cap_dominates {
+            Some(format!(
+                "Bitrate capped at {} Mbps: a {} s clip can't use the full {} MB, \
+                 so it lands near {} MB.",
                 encode::DiscordNitro::MAX_BITRATE_KBPS / 1000,
                 duration_ms / 1000,
                 self.discord_target_mb,
                 est_mb_rounded,
-            )
+            ))
         } else if video_kbps + audio_kbps < 500 {
-            "Long clip at this target — bitrate is very low, picture may look soft.".into()
-        } else {
-            format!(
-                "CBR encode aiming to land near {} MB (±10% in practice).",
-                est_mb_rounded,
+            Some(
+                "Long clip at this size: the bitrate is very low, so the picture may look soft."
+                    .into(),
             )
-        };
-        let note_color = if cap_dominates || video_kbps + audio_kbps < 500 {
-            theme::ACCENT_ERR.linear_multiply(0.85)
         } else {
-            theme::TEXT_MUTED
+            None
         };
-        ui.label(RichText::new(note).size(12.5).color(note_color));
-        ui.add_space(6.0);
-        // Why this codec — the AV1 switch changes encode time and
-        // playback compatibility, so it shouldn't happen silently.
-        ui.label(
-            RichText::new(plan.codec_note())
-                .size(12.5)
-                .color(if plan.codec.is_av1() {
+        ui.add_space(8.0);
+        match warning {
+            Some(text) => ui.label(
+                RichText::new(text)
+                    .size(12.0)
+                    .color(theme::ACCENT_ERR.linear_multiply(0.85)),
+            ),
+            None => ui.label(RichText::new(plan.codec_note()).size(12.0).color(
+                if plan.codec.is_av1() {
                     theme::ACCENT.linear_multiply(0.85)
                 } else {
                     theme::TEXT_MUTED
-                }),
-        );
+                },
+            )),
+        };
     }
 
     /// The body of the Custom export panel. Headline controls:
@@ -4867,6 +4766,23 @@ fn paint_progress_bar(ui: &mut egui::Ui, fraction: f32, indeterminate: bool) {
 /// Active chip uses the primary palette so the user can see at a glance
 /// which preset matches the current speed. Inactive chips are flat
 /// buttons that brighten on hover.
+/// An export setting on one line: a fixed-width label column, then its
+/// controls left to right, so stacked rows line up.
+fn export_row(ui: &mut egui::Ui, label: &str, controls: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 26.0), egui::Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            label,
+            theme::medium(13.0),
+            theme::TEXT_PRIMARY,
+        );
+        ui.spacing_mut().item_spacing.x = 6.0;
+        controls(ui);
+    });
+}
+
 fn speed_preset_chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let font_id = egui::FontId::new(12.5, egui::FontFamily::Proportional);
     let galley =

@@ -5,6 +5,35 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-15 — Half-screen window: video painted under the Edit panel
+
+### Symptom
+
+At ~900 px wide (half a 1440p screen) with a clip selected, the preview video
+extended under the Edit panel, the selection frame was cut at the panel edge,
+and toolbar buttons (Background, Add text) were clipped.
+
+### Root cause
+
+- The preview toolbar was a non-wrapping `ui.horizontal` wider than the
+  central panel; egui grows the parent's max rect to include overflowing
+  children, so `available_rect_before_wrap()` for the canvas was wider than
+  the panel.
+- The GL compositor scissored to the callback's own rect (the canvas), not
+  egui's clip rect, so the oversized video wasn't clipped to the panel.
+
+### Fix
+
+Toolbar wraps and caps dropdown widths at the panel; canvas rect intersects
+the panel rect; compositor scissor = canvas ∩ clip rect.
+
+### Verification
+
+Headless sway at 912×940 and 700×900: toolbar wraps, video and selection stay
+inside the preview, Edit panel intact.
+
+---
+
 ## 2026-11-15 — Text vanished when deselected at its start; broken launcher icon
 
 ### Symptom

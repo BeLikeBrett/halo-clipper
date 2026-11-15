@@ -617,7 +617,7 @@ pub fn dropdown_button(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgba_premultiplied(
         mix(a.r(), b.r()),
@@ -1176,6 +1176,41 @@ pub fn timecode_job(text: &str, size: f32, color: Color32) -> egui::text::Layout
     job.append(&text[..split], 0.0, format(theme::TEXT_FAINT));
     job.append(&text[split..], 0.0, format(color));
     job
+}
+
+/// Selection on a timeline item: a soft-white ring with a dark hairline
+/// inside it (reads on blue, teal and purple alike), and a small grip on
+/// each end where the item trims. Drawn inside `rect`, so it never spills
+/// over a neighbour.
+pub fn paint_selection(painter: &egui::Painter, rect: Rect, rounding: impl Into<egui::Rounding>) {
+    let rounding = rounding.into();
+    let inner = egui::Rounding {
+        nw: (rounding.nw - 2.0).max(0.0),
+        ne: (rounding.ne - 2.0).max(0.0),
+        sw: (rounding.sw - 2.0).max(0.0),
+        se: (rounding.se - 2.0).max(0.0),
+    };
+    painter.rect_stroke(
+        rect.shrink(2.5),
+        inner,
+        Stroke::new(1.0_f32, Color32::from_black_alpha(80)),
+    );
+    painter.rect_stroke(
+        rect.shrink(1.0),
+        rounding,
+        Stroke::new(2.0_f32, theme::PLAYHEAD),
+    );
+    if rect.width() < 28.0 || rect.height() < 22.0 {
+        return;
+    }
+    let h = (rect.height() - 16.0).min(18.0);
+    for x in [rect.left() + 2.5, rect.right() - 2.5] {
+        painter.rect_filled(
+            Rect::from_center_size(egui::pos2(x, rect.center().y), vec2(4.0, h)),
+            2.0,
+            theme::PLAYHEAD,
+        );
+    }
 }
 
 #[cfg(test)]

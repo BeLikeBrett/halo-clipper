@@ -1533,7 +1533,7 @@ fn paint_text_bar(
     disabled: bool,
 ) {
     let fill = if selected {
-        theme::CLIP_TEXT_EDGE.gamma_multiply(0.8)
+        widgets::lerp_color(theme::CLIP_TEXT, theme::CLIP_TEXT_EDGE, 0.28)
     } else if hot {
         theme::CLIP_TEXT.gamma_multiply(1.25)
     } else {
@@ -1541,15 +1541,13 @@ fn paint_text_bar(
     };
     let fade = if disabled { 0.4 } else { 1.0 };
     painter.rect_filled(bar, 5.0, fill.gamma_multiply(fade));
-    painter.rect_stroke(
-        bar.shrink(if selected { 1.0 } else { 0.5 }),
-        5.0,
-        if selected {
-            Stroke::new(2.0_f32, theme::ACCENT)
-        } else {
-            Stroke::new(1.0_f32, theme::CLIP_TEXT_EDGE.gamma_multiply(fade))
-        },
-    );
+    if !selected {
+        painter.rect_stroke(
+            bar.shrink(0.5),
+            5.0,
+            Stroke::new(1.0_f32, theme::CLIP_TEXT_EDGE.gamma_multiply(fade)),
+        );
+    }
     let clip = painter.with_clip_rect(
         bar.shrink2(egui::vec2(6.0, 0.0))
             .intersect(painter.clip_rect()),
@@ -1580,6 +1578,9 @@ fn paint_text_bar(
         theme::medium(12.0),
         color.gamma_multiply(fade),
     );
+    if selected {
+        widgets::paint_selection(painter, bar, 5.0);
+    }
 }
 
 /// Draws the bars of one text lane (`lane` = its time area) and handles

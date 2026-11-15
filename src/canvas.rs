@@ -276,8 +276,12 @@ impl ClipperApp {
                 self.canvas_ui.picker.set_rgb(rgb);
             }
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        // The panel's own area: a toolbar wider than a narrow window must
+        // never stretch the canvas past it (it used to slide under the Edit
+        // panel). The toolbar wraps instead.
+        let panel = ui.max_rect();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             let moved = focused.is_some_and(|id| !self.frame_is_fitted(id));
             if crate::widgets::fit_button(ui, moved, None).clicked() {
                 reset = focused;
@@ -288,7 +292,7 @@ impl ClipperApp {
                 ui,
                 "canvas_aspect",
                 &mut self.canvas_ui.aspect_open,
-                egui::vec2(196.0, 28.0),
+                egui::vec2(196.0_f32.min(panel.width()), 28.0),
                 220.0,
                 |painter, rect, color| {
                     painter.text(
@@ -321,7 +325,7 @@ impl ClipperApp {
                 ui,
                 "canvas_background",
                 &mut self.canvas_ui.background_open,
-                egui::vec2(150.0, 28.0),
+                egui::vec2(150.0_f32.min(panel.width()), 28.0),
                 256.0,
                 |painter, rect, color| {
                     let swatch = egui::Rect::from_center_size(
@@ -385,9 +389,19 @@ impl ClipperApp {
             {
                 add_text = true;
             }
+            // The output size only when it fits on the toolbar's row.
+            let size_text = format!("{} × {}", media.width, media.height);
+            let size_w = ui
+                .painter()
+                .layout_no_wrap(size_text.clone(), theme::mono(11.5), Color32::WHITE)
+                .size()
+                .x;
+            if ui.available_width() < size_w + 12.0 {
+                return;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format!("{} × {}", media.width, media.height))
+                    RichText::new(size_text)
                         .font(theme::mono(11.5))
                         .color(theme::TEXT_MUTED),
                 )
@@ -417,7 +431,7 @@ impl ClipperApp {
             self.add_text_layer();
         }
         ui.add_space(8.0);
-        let available = ui.available_rect_before_wrap();
+        let available = ui.available_rect_before_wrap().intersect(panel);
         let aspect = media.width.max(1) as f32 / media.height.max(1) as f32;
         let w = available.width().min(available.height() * aspect).max(1.0);
         let h = w / aspect;

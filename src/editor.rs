@@ -606,8 +606,9 @@ fn paint_clip(painter: &egui::Painter, block: egui::Rect, look: &ClipLook) {
     } else {
         base
     };
+    // Selected: lifted toward the item's own edge color, so the hue stays.
     let fill = dim(if look.selected {
-        base.linear_multiply(1.18)
+        crate::widgets::lerp_color(base, edge, 0.28)
     } else {
         base
     });
@@ -730,16 +731,15 @@ fn paint_clip(painter: &egui::Painter, block: egui::Rect, look: &ClipLook) {
     }
 
     // Inner outline so a selection never spills over a neighbour.
-    let (width, color) = if look.selected {
-        (1.5, theme::ACCENT)
+    if look.selected {
+        crate::widgets::paint_selection(painter, block, rounding);
     } else {
-        (1.0, dim(edge.gamma_multiply(0.75)))
-    };
-    painter.rect_stroke(
-        block.shrink(width * 0.5),
-        rounding,
-        Stroke::new(width, color),
-    );
+        painter.rect_stroke(
+            block.shrink(0.5),
+            rounding,
+            Stroke::new(1.0_f32, dim(edge.gamma_multiply(0.75))),
+        );
+    }
 }
 
 /// Edit-point marker on a seam between two abutting clips: a pair of

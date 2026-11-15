@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.10
+
+- Narrow windows (e.g. half a screen): the preview toolbar wraps instead of
+  stretching the layout, and the video can no longer paint under the Edit
+  panel.
+- Clearer selection on the timeline: a soft-white ring with trim grips on
+  each end; the clip keeps its own color.
+- Export window is much shorter: Auto / Discord / Custom is a switch, the
+  Discord settings sit on aligned rows, and the result is one summary card.
+
 ## 0.10.9
 
 - Panel sizes (Media, Edit, timeline height) are remembered between

@@ -74,6 +74,26 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## Narrow windows, selection ring, compact export (2026-11-15)
+
+- The preview toolbar is `horizontal_wrapped`; its dropdowns cap at the
+  panel width and the output-size label shows only when it fits. The canvas
+  is laid out inside the central panel's own rect (`ui.max_rect()` captured
+  before the toolbar), never a rect widened by overflowing widgets.
+- The video compositor scissors to the canvas rect intersected with egui's
+  clip rect (`info.clip_rect_in_pixels()`), so GL layers can't draw over
+  neighbouring panels even if a layout bug oversizes the canvas.
+- Selected timeline items (`widgets::paint_selection`): 2 px soft-white ring
+  (theme::PLAYHEAD) with a dark hairline inside it and 4 px grips at both
+  ends, drawn inside the item; fill lifts 28% toward the item's edge color.
+  Same on clips and text bars.
+- Export modal: 540 px wide, sizes to its content, top edge pinned so mode
+  switches grow it downward. Mode is a `segmented_fill` switch with a
+  one-line description. Discord: label column (`export_row`) with tier and
+  codec chips, slider under the chips, a summary card (Size, Length,
+  Resolution, Codec, bitrate line) and at most one note (warning, else the
+  codec note).
+
 ## Remembered layout, aspect refit, intro first frame (2026-11-15)
 
 - Panel sizes are saved in `config.json` (`layout`) as soon as a resize

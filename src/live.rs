@@ -737,7 +737,16 @@ unsafe fn paint_layers(
 ) {
     let gl = painter.gl();
     let vp = info.viewport_in_pixels();
-    if vp.width_px <= 0 || vp.height_px <= 0 {
+    // Draw only where egui lets this callback draw: the canvas rect cut to
+    // the panel's clip, so the video never spills over neighbouring panels.
+    let clip = info.clip_rect_in_pixels();
+    let (sx, sy) = (
+        vp.left_px.max(clip.left_px),
+        vp.from_bottom_px.max(clip.from_bottom_px),
+    );
+    let sw = (vp.left_px + vp.width_px).min(clip.left_px + clip.width_px) - sx;
+    let sh = (vp.from_bottom_px + vp.height_px).min(clip.from_bottom_px + clip.height_px) - sy;
+    if sw <= 0 || sh <= 0 {
         return;
     }
     let draw = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
@@ -812,7 +821,7 @@ unsafe fn paint_layers(
     gl.get_parameter_f32_slice(glow::COLOR_CLEAR_VALUE, &mut clear_color);
     gl.bind_framebuffer(glow::FRAMEBUFFER, video_fbo::fbo_from_raw(draw));
     gl.enable(glow::SCISSOR_TEST);
-    gl.scissor(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
+    gl.scissor(sx, sy, sw, sh);
     gl.clear_color(
         rgb[0] as f32 / 255.0,
         rgb[1] as f32 / 255.0,
@@ -861,7 +870,7 @@ unsafe fn paint_layers(
         let Some(fbo) = fbo.as_ref() else { continue };
         gl.bind_framebuffer(glow::FRAMEBUFFER, video_fbo::fbo_from_raw(draw));
         gl.enable(glow::SCISSOR_TEST);
-        gl.scissor(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
+        gl.scissor(sx, sy, sw, sh);
         gl.viewport(
             vp.left_px + ((rect.left() - canvas.left()) * pixels).round() as i32,
             vp.from_bottom_px + ((canvas.bottom() - rect.bottom()) * pixels).round() as i32,
