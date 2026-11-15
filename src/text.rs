@@ -279,23 +279,6 @@ pub const STYLE_PRESETS: [(&str, TextStyle); 6] = [
     ),
 ];
 
-impl TextStyle {
-    /// Applies a preset's look, keeping the chosen font and alignment.
-    pub fn with_preset(self, preset: &TextStyle) -> Self {
-        Self {
-            font: self.font,
-            align: self.align,
-            ..*preset
-        }
-    }
-    /// Index of the preset this style matches (ignoring font/alignment).
-    pub fn preset_index(&self) -> Option<usize> {
-        STYLE_PRESETS
-            .iter()
-            .position(|(_, p)| self.with_preset(p) == *self)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextItem {
     pub id: TextId,
@@ -699,19 +682,5 @@ mod tests {
         t.end_ms = t.start_ms + 300;
         // Mid-point is fully visible even though Normal pace is 320 ms.
         assert_eq!(look_at(&t, t.start_ms + 150).alpha, 1.0);
-    }
-
-    #[test]
-    fn presets_round_trip_through_preset_index() {
-        for (i, (_, preset)) in STYLE_PRESETS.iter().enumerate() {
-            let mut style = TextStyle {
-                font: TextFont::Anton,
-                align: Align::Left,
-                ..TextStyle::default()
-            };
-            style = style.with_preset(preset);
-            assert_eq!(style.preset_index(), Some(i));
-            assert_eq!(style.font, TextFont::Anton);
-        }
     }
 }

@@ -171,16 +171,39 @@ pub fn paint_drop_zone(painter: &egui::Painter, rect: egui::Rect, fade: f32, lab
     );
     let Some(label) = label else { return };
     let galley = painter.layout_no_wrap(label.to_owned(), theme::medium(12.5), theme::TEXT_PRIMARY);
-    let pill =
-        egui::Rect::from_center_size(rect.center(), egui::vec2(galley.size().x + 52.0, 36.0));
-    painter.rect_filled(pill, 18.0, theme::BG_MODAL.gamma_multiply(fade));
-    painter.rect_stroke(
-        pill,
-        18.0,
-        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.35 * fade)),
-    );
+    // A pill when it fits; in a narrow zone (the Media column) a round
+    // badge with the label centered under it, so nothing pokes out.
+    let stacked = galley.size().x + 52.0 > rect.width() - 20.0;
+    let (c, text_pos) = if stacked {
+        let badge = rect.center() - egui::vec2(0.0, 14.0);
+        painter.circle_filled(badge, 22.0, theme::BG_MODAL.gamma_multiply(fade));
+        painter.circle_stroke(
+            badge,
+            22.0,
+            Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.35 * fade)),
+        );
+        (
+            badge,
+            egui::pos2(
+                rect.center().x - galley.size().x * 0.5,
+                badge.y + 22.0 + 10.0,
+            ),
+        )
+    } else {
+        let pill =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(galley.size().x + 52.0, 36.0));
+        painter.rect_filled(pill, 18.0, theme::BG_MODAL.gamma_multiply(fade));
+        painter.rect_stroke(
+            pill,
+            18.0,
+            Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.35 * fade)),
+        );
+        (
+            egui::pos2(pill.left() + 22.0, pill.center().y),
+            egui::pos2(pill.left() + 38.0, pill.center().y - galley.size().y * 0.5),
+        )
+    };
     // Arrow into a tray.
-    let c = egui::pos2(pill.left() + 22.0, pill.center().y);
     let stroke = Stroke::new(1.6_f32, theme::ACCENT.gamma_multiply(fade));
     painter.line_segment(
         [c + egui::vec2(0.0, -7.0), c + egui::vec2(0.0, 2.0)],
@@ -203,11 +226,7 @@ pub fn paint_drop_zone(painter: &egui::Painter, rect: egui::Rect, fade: f32, lab
         ],
         stroke,
     ));
-    painter.galley(
-        egui::pos2(pill.left() + 38.0, pill.center().y - galley.size().y * 0.5),
-        galley,
-        theme::TEXT_PRIMARY.gamma_multiply(fade),
-    );
+    painter.galley(text_pos, galley, theme::TEXT_PRIMARY.gamma_multiply(fade));
 }
 
 /// Paints an icon button over an already-allocated rect (for buttons that
@@ -431,21 +450,81 @@ pub fn drop_panel(
     open && (chosen || clicked_elsewhere || escape)
 }
 
-/// A menu-bar button whose panel unrolls out of the button itself.
-///
-/// `add_contents` returns `true` when an item was chosen (closes the menu).
-pub fn menu_bar_button(
+/// The app menu in the top-left corner: the Halo ring and the app name as
+/// one button. `badge` adds a small accent dot (an update is ready).
+pub fn app_menu_button(
     ui: &mut Ui,
-    label: &str,
+    badge: bool,
     min_popup_width: f32,
     add_contents: impl FnOnce(&mut Ui) -> bool,
 ) {
-    let id = ui.id().with(("menu_bar", label));
+    let galley = ui.painter().layout_no_wrap(
+        "Halo Clipper".to_owned(),
+        theme::semibold(13.5),
+        theme::TEXT_PRIMARY,
+    );
+    let size = vec2(10.0 + 18.0 + 9.0 + galley.size().x + 22.0, 34.0);
+    menu_trigger(
+        ui,
+        "app_menu",
+        size,
+        move |painter, rect, color| {
+            let ring = pos2(rect.left() + 10.0 + 9.0, rect.center().y);
+            paint_logo(painter, ring);
+            if badge {
+                let dot = ring + vec2(7.0, -7.0);
+                painter.circle_filled(dot, 3.5, theme::ACCENT);
+                painter.circle_stroke(dot, 3.5, Stroke::new(1.5_f32, theme::BG_HEADER));
+            }
+            let text_left = ring.x + 9.0 + 9.0;
+            let text_right = text_left + galley.size().x;
+            painter.galley(
+                pos2(text_left, rect.center().y - galley.size().y * 0.5),
+                galley,
+                color,
+            );
+            // Small chevron: this opens a menu.
+            let c = pos2(text_right + 10.0, rect.center().y + 1.5);
+            let stroke = Stroke::new(1.4_f32, color.gamma_multiply(0.7));
+            painter.line_segment([c + vec2(-3.5, -2.5), c], stroke);
+            painter.line_segment([c, c + vec2(3.5, -2.5)], stroke);
+        },
+        min_popup_width,
+        add_contents,
+    );
+}
+
+/// The Halo ring: a faint circle with a bright arc.
+pub fn paint_logo(painter: &egui::Painter, c: Pos2) {
+    painter.circle_stroke(
+        c,
+        7.5,
+        Stroke::new(2.0_f32, theme::ACCENT.gamma_multiply(0.35)),
+    );
+    let arc: Vec<_> = (0..=14)
+        .map(|i| {
+            let a = -2.4 + 1.9 * i as f32 / 14.0;
+            c + vec2(a.cos(), a.sin()) * 7.5
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        arc,
+        PathStroke::new(2.0_f32, theme::ACCENT),
+    ));
+}
+
+/// A menu-bar trigger of `size` whose face `paint` draws; opens a drop
+/// panel with `add_contents` (true = an item was chosen, close it).
+fn menu_trigger(
+    ui: &mut Ui,
+    key: &str,
+    size: egui::Vec2,
+    paint: impl FnOnce(&egui::Painter, Rect, Color32),
+    min_popup_width: f32,
+    add_contents: impl FnOnce(&mut Ui) -> bool,
+) {
+    let id = ui.id().with(("menu_bar", key));
     let ctx = ui.ctx().clone();
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), theme::medium(12.5), theme::TEXT_PRIMARY);
-    let size = vec2(galley.size().x + 22.0, 28.0);
     let (rect, response) = ui.allocate_exact_size(size, CLICK);
     let open_now = ctx.data(|d| d.get_temp::<Id>(open_menu_id())) == Some(id);
 
@@ -470,9 +549,9 @@ pub fn menu_bar_button(
     let t = reveal(&ctx, id, open);
     let (fill, rounding) = trigger_style(t, response.hovered(), Color32::TRANSPARENT);
     ui.painter().rect_filled(rect, rounding, fill);
-    ui.painter().galley(
-        rect.center() - galley.size() * 0.5,
-        galley,
+    paint(
+        ui.painter(),
+        rect,
         if open || response.hovered() {
             theme::TEXT_PRIMARY
         } else {
@@ -621,6 +700,223 @@ pub fn menu_separator(ui: &mut Ui) {
 
 /// Two-or-more option switch in one recessed track; the highlight slides
 /// between options. Returns the index clicked this frame, if any.
+/// Tabs across a panel: equal-width labels over a hairline, the active one
+/// bright with an accent underline that slides between tabs.
+pub fn tab_bar(
+    ui: &mut Ui,
+    id: &str,
+    labels: &[&str],
+    selected: usize,
+    width: f32,
+) -> Option<usize> {
+    let count = labels.len().max(1);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
+    let cell = width / count as f32;
+    let selected = selected.min(count - 1);
+    let t = ui
+        .ctx()
+        .animate_value_with_time(ui.id().with(("tab_bar", id)), selected as f32, 0.14);
+    let painter = ui.painter();
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0_f32, theme::BORDER),
+    );
+    let under = Rect::from_min_size(
+        pos2(rect.left() + t * cell + 10.0, rect.bottom() - 2.0),
+        vec2(cell - 20.0, 2.0),
+    );
+    painter.rect_filled(under, 1.0, theme::ACCENT);
+    let mut clicked = None;
+    for (i, label) in labels.iter().enumerate() {
+        let tab = Rect::from_min_size(
+            pos2(rect.left() + i as f32 * cell, rect.top()),
+            vec2(cell, rect.height()),
+        );
+        let response = ui
+            .interact(tab, ui.id().with(("tab", id, i)), CLICK)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let lit = 1.0 - (t - i as f32).abs().min(1.0);
+        let base = if response.hovered() {
+            theme::TEXT_SECONDARY
+        } else {
+            theme::TEXT_MUTED
+        };
+        ui.painter().text(
+            tab.center() - vec2(0.0, 1.0),
+            Align2::CENTER_CENTER,
+            *label,
+            theme::semibold(12.5),
+            lerp_color(base, theme::TEXT_PRIMARY, lit),
+        );
+        if response.clicked() && i != selected {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}
+
+/// A slim slider: thin rail, accent fill up to a small white knob, and an
+/// editable value box. Drop-in for the subset of `egui::Slider` the app
+/// uses (egui sizes its knob from the row height, which made it huge).
+pub struct Slim<'a> {
+    get_set: Box<dyn 'a + FnMut(Option<f64>) -> f64>,
+    range: std::ops::RangeInclusive<f64>,
+    integer: bool,
+    logarithmic: bool,
+    step: Option<f64>,
+    decimals: Option<usize>,
+    suffix: String,
+    text: String,
+    show_value: bool,
+}
+
+impl<'a> Slim<'a> {
+    pub fn new<Num: egui::emath::Numeric>(
+        value: &'a mut Num,
+        range: std::ops::RangeInclusive<Num>,
+    ) -> Self {
+        Self {
+            get_set: Box::new(move |v| {
+                if let Some(v) = v {
+                    *value = Num::from_f64(v);
+                }
+                value.to_f64()
+            }),
+            range: range.start().to_f64()..=range.end().to_f64(),
+            integer: Num::INTEGRAL,
+            logarithmic: false,
+            step: None,
+            decimals: None,
+            suffix: String::new(),
+            text: String::new(),
+            show_value: true,
+        }
+    }
+    pub fn logarithmic(mut self, on: bool) -> Self {
+        self.logarithmic = on;
+        self
+    }
+    pub fn step_by(mut self, step: f64) -> Self {
+        self.step = Some(step);
+        self
+    }
+    pub fn fixed_decimals(mut self, decimals: usize) -> Self {
+        self.decimals = Some(decimals);
+        self
+    }
+    pub fn suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.suffix = suffix.into();
+        self
+    }
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+    pub fn show_value(mut self, on: bool) -> Self {
+        self.show_value = on;
+        self
+    }
+
+    /// Value at rail fraction `t` (0..1).
+    fn value_at(&self, t: f64) -> f64 {
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        let v = if self.logarithmic && lo > 0.0 && hi > lo {
+            (lo.ln() + (hi.ln() - lo.ln()) * t).exp()
+        } else {
+            lo + (hi - lo) * t
+        };
+        let v = match self.step {
+            Some(step) if step > 0.0 => lo + ((v - lo) / step).round() * step,
+            _ => v,
+        };
+        let v = if self.integer { v.round() } else { v };
+        v.clamp(lo.min(hi), hi.max(lo))
+    }
+    /// Rail fraction (0..1) of value `v`.
+    fn fraction(&self, v: f64) -> f64 {
+        let (lo, hi) = (*self.range.start(), *self.range.end());
+        let t = if self.logarithmic && lo > 0.0 && hi > lo {
+            (v.max(lo).ln() - lo.ln()) / (hi.ln() - lo.ln())
+        } else if hi != lo {
+            (v - lo) / (hi - lo)
+        } else {
+            0.0
+        };
+        t.clamp(0.0, 1.0)
+    }
+}
+
+impl egui::Widget for Slim<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        // One row, like egui's slider (it follows the parent's direction).
+        ui.horizontal(|ui| self.contents(ui)).inner
+    }
+}
+
+impl Slim<'_> {
+    fn contents(mut self, ui: &mut Ui) -> Response {
+        let size = vec2(ui.spacing().slider_width, ui.spacing().interact_size.y);
+        let (rect, mut response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        let knob_r = 7.0;
+        let left = rect.left() + knob_r;
+        let span = (rect.width() - knob_r * 2.0).max(1.0);
+        if let Some(pos) = response.interact_pointer_pos() {
+            let t = ((pos.x - left) / span).clamp(0.0, 1.0) as f64;
+            let next = self.value_at(t);
+            if (next - (self.get_set)(None)).abs() > f64::EPSILON {
+                (self.get_set)(Some(next));
+                response.mark_changed();
+            }
+        }
+        let value = (self.get_set)(None);
+        let x = left + span * self.fraction(value) as f32;
+        let y = rect.center().y;
+        let hot = response.hovered() || response.dragged();
+        let painter = ui.painter();
+        let rail = Rect::from_min_max(pos2(left, y - 2.0), pos2(left + span, y + 2.0));
+        painter.rect_filled(rail, 2.0, Color32::from_rgb(46, 50, 60));
+        painter.rect_filled(
+            Rect::from_min_max(rail.min, pos2(x, rail.max.y)),
+            2.0,
+            theme::ACCENT,
+        );
+        let knob = pos2(x, y);
+        let r = if hot { knob_r + 0.5 } else { knob_r - 0.5 };
+        painter.circle_filled(
+            knob + vec2(0.0, 1.0),
+            r + 1.0,
+            Color32::from_black_alpha(90),
+        );
+        painter.circle_filled(knob, r, theme::PLAYHEAD);
+        if response.dragged() {
+            painter.circle_stroke(
+                knob,
+                r + 3.0,
+                Stroke::new(3.0_f32, theme::ACCENT.gamma_multiply(0.25)),
+            );
+        }
+        let mut response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if self.show_value {
+            let range = self.range.clone();
+            let speed = (range.end() - range.start()).abs() / 300.0;
+            let decimals = self.decimals.or(self.integer.then_some(0));
+            let suffix = std::mem::take(&mut self.suffix);
+            let mut drag = egui::DragValue::from_get_set(|v| (self.get_set)(v))
+                .range(range)
+                .speed(speed)
+                .suffix(suffix);
+            if let Some(d) = decimals {
+                drag = drag.fixed_decimals(d);
+            }
+            response = response.union(ui.add(drag));
+        }
+        if !self.text.is_empty() {
+            ui.label(egui::RichText::new(&self.text).color(theme::TEXT_SECONDARY));
+        }
+        response
+    }
+}
+
 /// "Fit to screen": lit (accent) when the selected video has been moved
 /// or resized off its fitted frame, dimmed and inert when it already fits.
 /// `width` stretches it (the clip panel); `None` sizes it to its label.
@@ -694,7 +990,7 @@ pub fn fit_button(ui: &mut Ui, moved: bool, width: Option<f32>) -> egui::Respons
 }
 
 /// The Simple Clip / Advanced switch: a large pill whose lit half slides
-/// to the active mode, each half with a small glyph of what it does.
+/// to the active mode.
 pub fn mode_switch(ui: &mut Ui, options: [(&str, &str); 2], selected: usize) -> Option<usize> {
     let half = vec2(148.0, 36.0);
     let pad = 3.0;
@@ -736,57 +1032,13 @@ pub fn mode_switch(ui: &mut Ui, options: [(&str, &str); 2], selected: usize) -> 
         let galley = ui
             .painter()
             .layout_no_wrap((*label).to_owned(), theme::semibold(14.0), color);
-        let glyph_w = 18.0;
-        let content = glyph_w + 8.0 + galley.size().x;
-        let left = rect.center().x - content * 0.5;
-        let glyph = egui::Rect::from_center_size(
-            egui::pos2(left + glyph_w * 0.5, rect.center().y),
-            vec2(glyph_w, 14.0),
-        );
-        paint_mode_glyph(ui.painter(), glyph, i, color);
-        ui.painter().galley(
-            egui::pos2(
-                left + glyph_w + 8.0,
-                rect.center().y - galley.size().y * 0.5,
-            ),
-            galley,
-            color,
-        );
+        ui.painter()
+            .galley(rect.center() - galley.size() * 0.5, galley, color);
         if response.clicked() && i != selected {
             clicked = Some(i);
         }
     }
     clicked
-}
-
-/// Simple: one clip between In/Out brackets. Advanced: stacked layers.
-fn paint_mode_glyph(painter: &egui::Painter, rect: egui::Rect, mode: usize, color: Color32) {
-    let stroke = Stroke::new(1.6_f32, color);
-    if mode == 0 {
-        let bar = egui::Rect::from_center_size(rect.center(), vec2(rect.width() - 8.0, 6.0));
-        painter.rect_filled(bar, 2.0, color.gamma_multiply(0.85));
-        for (x, dir) in [(rect.left() + 1.0, 1.0), (rect.right() - 1.0, -1.0)] {
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                stroke,
-            );
-            for y in [rect.top(), rect.bottom()] {
-                painter.line_segment([egui::pos2(x, y), egui::pos2(x + 3.0 * dir, y)], stroke);
-            }
-        }
-    } else {
-        for (row, (inset, width)) in [(0.0, 0.7), (4.0, 0.75), (2.0, 0.6)]
-            .into_iter()
-            .enumerate()
-        {
-            let y = rect.top() + 1.0 + row as f32 * 5.0;
-            let bar = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + inset, y),
-                vec2(rect.width() * width, 3.4),
-            );
-            painter.rect_filled(bar, 1.5, color.gamma_multiply(0.95 - row as f32 * 0.2));
-        }
-    }
 }
 
 pub fn segmented(

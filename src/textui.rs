@@ -7,7 +7,7 @@
 //! layer's look, size or animation state changes.
 
 use super::*;
-use crate::text::{self, Align, Intro, Look, Outro, Shadow, TextFont, STYLE_PRESETS};
+use crate::text::{self, Align, Intro, Look, Outro, Shadow, TextFont};
 use crate::{picker, widgets};
 use canvas::{snap_move, SnapTargets};
 
@@ -38,6 +38,8 @@ struct TextDrag {
 
 #[derive(Default)]
 pub(super) struct TextUi {
+    /// Inspector tab: 0 Text, 1 Look, 2 Animate.
+    tab: usize,
     textures: HashMap<TextId, (u64, egui::TextureHandle)>,
     drag: Option<TextDrag>,
     /// An inspector edit is in progress (pointer held / field focused), so
@@ -572,232 +574,239 @@ impl ClipperApp {
                 }
             });
         });
-        ui.add_space(10.0);
-
-        // Content. The same text can also be typed straight on the preview.
-        let field_id = ui.id().with(("text_field", id));
-        let field = ui.add(
-            egui::TextEdit::multiline(&mut item.text)
-                .id(field_id)
-                .hint_text("Type your text…")
-                .font(theme::medium(14.0))
-                .margin(egui::vec2(10.0, 8.0))
-                .desired_rows(2)
-                .desired_width(width),
-        );
-        if std::mem::take(&mut self.text_ui.focus_field) {
-            field.request_focus();
-        }
         ui.add_space(4.0);
-        ui.label(
-            RichText::new("Tip: double-click the text on the preview to type there.")
-                .font(theme::regular(11.0))
-                .color(theme::TEXT_FAINT),
-        );
-
-        divider(ui);
-        section(ui, "Style");
-        let current = item.style.preset_index();
-        chip_grid(ui, 3, STYLE_PRESETS.len(), |ui, i, cell| {
-            let (name, preset) = &STYLE_PRESETS[i];
-            if style_chip(ui, name, preset, current == Some(i), cell).clicked() {
-                item.style = item.style.with_preset(preset);
-            }
-        });
-
-        divider(ui);
-        section(ui, "Font");
-        let font_face = egui::FontId::new(
-            15.0,
-            egui::FontFamily::Name(item.style.font.egui_family().into()),
-        );
-        let mut chosen_font = None;
-        widgets::dropdown_button(
+        if let Some(tab) = widgets::tab_bar(
             ui,
-            "text_font",
-            &mut self.text_ui.font_menu_open,
-            egui::vec2(width, 34.0),
+            "text_tabs",
+            &["Text", "Look", "Animate"],
+            self.text_ui.tab,
             width,
-            |painter, rect, color| {
-                painter.text(
-                    rect.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    item.style.font.label(),
-                    font_face.clone(),
-                    color,
-                );
-            },
-            |ui| {
-                let mut picked = false;
-                for font in TextFont::ALL {
-                    if font_row(ui, font, font == item.style.font).clicked() {
-                        chosen_font = Some(font);
-                        picked = true;
+        ) {
+            self.text_ui.tab = tab;
+            self.text_ui.picker = None;
+            self.text_ui.font_menu_open = false;
+        }
+        ui.add_space(14.0);
+        let mut field_focus = false;
+
+        if self.text_ui.tab == 0 {
+            // Content. The same text can also be typed straight on the preview.
+            let field_id = ui.id().with(("text_field", id));
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut item.text)
+                    .id(field_id)
+                    .hint_text("Type your text…")
+                    .font(theme::medium(14.0))
+                    .margin(egui::vec2(10.0, 8.0))
+                    .desired_rows(2)
+                    .desired_width(width),
+            );
+            if std::mem::take(&mut self.text_ui.focus_field) {
+                field.request_focus();
+            }
+            field_focus = field.has_focus();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Tip: double-click the text on the preview to type there.")
+                    .font(theme::regular(11.0))
+                    .color(theme::TEXT_FAINT),
+            );
+
+            divider(ui);
+            section(ui, "Font");
+            let font_face = egui::FontId::new(
+                15.0,
+                egui::FontFamily::Name(item.style.font.egui_family().into()),
+            );
+            let mut chosen_font = None;
+            widgets::dropdown_button(
+                ui,
+                "text_font",
+                &mut self.text_ui.font_menu_open,
+                egui::vec2(width, 34.0),
+                width,
+                |painter, rect, color| {
+                    painter.text(
+                        rect.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        item.style.font.label(),
+                        font_face.clone(),
+                        color,
+                    );
+                },
+                |ui| {
+                    let mut picked = false;
+                    for font in TextFont::ALL {
+                        if font_row(ui, font, font == item.style.font).clicked() {
+                            chosen_font = Some(font);
+                            picked = true;
+                        }
                     }
-                }
-                picked
-            },
-        );
-        if let Some(font) = chosen_font {
-            item.style.font = font;
-        }
-        ui.add_space(8.0);
-        let align = match item.style.align {
-            Align::Left => 0,
-            Align::Center => 1,
-            Align::Right => 2,
-        };
-        if let Some(i) = widgets::segmented_fill(
-            ui,
-            "text_align",
-            &[
-                ("Left", "Align left"),
-                ("Center", "Center"),
-                ("Right", "Align right"),
-            ],
-            align,
-            width,
-        ) {
-            item.style.align = [Align::Left, Align::Center, Align::Right][i];
-        }
-
-        // Color: fill, then the optional outline and box, each with the
-        // same control (swatches, solid/gradient, stops, direction).
-        divider(ui);
-        let picker = &mut self.text_ui.picker;
-        paint_header(ui, "Color", &mut item.style.gradient, item.style.color);
-        fill_editor(
-            ui,
-            Paint::Text,
-            &mut item.style.color,
-            &mut item.style.gradient,
-            picker,
-            width,
-        );
-
-        divider(ui);
-        let outline = OUTLINES
-            .iter()
-            .enumerate()
-            .min_by(|a, b| {
-                (a.1 - item.style.outline)
-                    .abs()
-                    .total_cmp(&(b.1 - item.style.outline).abs())
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        if let Some(i) = header_choice(
-            ui,
-            "Outline",
-            "text_outline",
-            &[("Off", ""), ("Thin", ""), ("Bold", "")],
-            outline,
-        ) {
-            item.style.outline = OUTLINES[i];
-        }
-        if item.style.outline > 0.0 {
+                    picked
+                },
+            );
+            if let Some(font) = chosen_font {
+                item.style.font = font;
+            }
             ui.add_space(8.0);
-            gradient_switch(
-                ui,
-                "outline_kind",
-                &mut item.style.outline_gradient,
-                item.style.outline_color,
-                width,
-            );
-            fill_editor(
-                ui,
-                Paint::Outline,
-                &mut item.style.outline_color,
-                &mut item.style.outline_gradient,
-                picker,
-                width,
-            );
-        }
-
-        divider(ui);
-        let shadow = match item.style.shadow {
-            Shadow::None => 0,
-            Shadow::Soft => 1,
-            Shadow::Glow => 2,
-        };
-        if let Some(i) = header_choice(
-            ui,
-            "Shadow",
-            "text_shadow",
-            &[
-                ("Off", ""),
-                ("Soft", "Drop shadow"),
-                ("Glow", "Neon halo in the text color"),
-            ],
-            shadow,
-        ) {
-            item.style.shadow = [Shadow::None, Shadow::Soft, Shadow::Glow][i];
-        }
-
-        divider(ui);
-        let boxed = match item.style.background {
-            None => 0,
-            Some(([r, ..], _)) if r < 128 => 1,
-            Some(_) => 2,
-        };
-        if let Some(i) = header_choice(
-            ui,
-            "Box",
-            "text_box",
-            &[("Off", ""), ("Dark", ""), ("Light", "")],
-            boxed,
-        ) {
-            item.style.background = match i {
-                0 => None,
-                1 => Some(([0, 0, 0], 0.72)),
-                _ => Some(([255, 255, 255], 1.0)),
+            let align = match item.style.align {
+                Align::Left => 0,
+                Align::Center => 1,
+                Align::Right => 2,
             };
-        }
-        if let Some((rgb, opacity)) = &mut item.style.background {
-            ui.add_space(8.0);
-            gradient_switch(ui, "box_kind", &mut item.style.box_gradient, *rgb, width);
-            fill_editor(
+            if let Some(i) = widgets::segmented_fill(
                 ui,
-                Paint::Box,
-                rgb,
-                &mut item.style.box_gradient,
-                picker,
+                "text_align",
+                &[
+                    ("Left", "Align left"),
+                    ("Center", "Center"),
+                    ("Right", "Align right"),
+                ],
+                align,
                 width,
-            );
-            ui.add_space(6.0);
-            let mut percent = *opacity * 100.0;
-            if labeled_slider(ui, "Opacity", &mut percent, 0.0..=100.0, "%", width) {
-                *opacity = percent / 100.0;
+            ) {
+                item.style.align = [Align::Left, Align::Center, Align::Right][i];
             }
         }
 
-        // Animation.
-        divider(ui);
-        section(ui, "Animate in");
-        chip_grid(ui, 3, Intro::ALL.len(), |ui, i, cell| {
-            let intro = Intro::ALL[i];
-            if chip(ui, intro.label(), item.intro == intro, cell).clicked() {
-                item.intro = intro;
+        if self.text_ui.tab == 1 {
+            // Color: fill, then the optional outline and box, each with the
+            // same control (swatches, solid/gradient, stops, direction).
+            let picker = &mut self.text_ui.picker;
+            paint_header(ui, "Color", &mut item.style.gradient, item.style.color);
+            fill_editor(
+                ui,
+                Paint::Text,
+                &mut item.style.color,
+                &mut item.style.gradient,
+                picker,
+                width,
+            );
+
+            divider(ui);
+            let outline = OUTLINES
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    (a.1 - item.style.outline)
+                        .abs()
+                        .total_cmp(&(b.1 - item.style.outline).abs())
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if let Some(i) = header_choice(
+                ui,
+                "Outline",
+                "text_outline",
+                &[("Off", ""), ("Thin", ""), ("Bold", "")],
+                outline,
+            ) {
+                item.style.outline = OUTLINES[i];
             }
-        });
-        if item.intro != Intro::None {
-            duration_control(ui, "Length", &mut item.intro_ms);
+            if item.style.outline > 0.0 {
+                ui.add_space(8.0);
+                gradient_switch(
+                    ui,
+                    "outline_kind",
+                    &mut item.style.outline_gradient,
+                    item.style.outline_color,
+                    width,
+                );
+                fill_editor(
+                    ui,
+                    Paint::Outline,
+                    &mut item.style.outline_color,
+                    &mut item.style.outline_gradient,
+                    picker,
+                    width,
+                );
+            }
+
+            divider(ui);
+            let shadow = match item.style.shadow {
+                Shadow::None => 0,
+                Shadow::Soft => 1,
+                Shadow::Glow => 2,
+            };
+            if let Some(i) = header_choice(
+                ui,
+                "Shadow",
+                "text_shadow",
+                &[
+                    ("Off", ""),
+                    ("Soft", "Drop shadow"),
+                    ("Glow", "Neon halo in the text color"),
+                ],
+                shadow,
+            ) {
+                item.style.shadow = [Shadow::None, Shadow::Soft, Shadow::Glow][i];
+            }
+
+            divider(ui);
+            let boxed = match item.style.background {
+                None => 0,
+                Some(([r, ..], _)) if r < 128 => 1,
+                Some(_) => 2,
+            };
+            if let Some(i) = header_choice(
+                ui,
+                "Box",
+                "text_box",
+                &[("Off", ""), ("Dark", ""), ("Light", "")],
+                boxed,
+            ) {
+                item.style.background = match i {
+                    0 => None,
+                    1 => Some(([0, 0, 0], 0.72)),
+                    _ => Some(([255, 255, 255], 1.0)),
+                };
+            }
+            if let Some((rgb, opacity)) = &mut item.style.background {
+                ui.add_space(8.0);
+                gradient_switch(ui, "box_kind", &mut item.style.box_gradient, *rgb, width);
+                fill_editor(
+                    ui,
+                    Paint::Box,
+                    rgb,
+                    &mut item.style.box_gradient,
+                    picker,
+                    width,
+                );
+                ui.add_space(6.0);
+                let mut percent = *opacity * 100.0;
+                if labeled_slider(ui, "Opacity", &mut percent, 0.0..=100.0, "%", width) {
+                    *opacity = percent / 100.0;
+                }
+            }
         }
-        ui.add_space(10.0);
-        section(ui, "Animate out");
-        let per_row = if width >= 4.0 * 56.0 { 4 } else { 2 };
-        chip_grid(ui, per_row, Outro::ALL.len(), |ui, i, cell| {
-            let outro = Outro::ALL[i];
-            if chip(ui, outro.label(), item.outro == outro, cell).clicked() {
-                item.outro = outro;
+
+        if self.text_ui.tab == 2 {
+            section(ui, "Animate in");
+            chip_grid(ui, 3, Intro::ALL.len(), |ui, i, cell| {
+                let intro = Intro::ALL[i];
+                if chip(ui, intro.label(), item.intro == intro, cell).clicked() {
+                    item.intro = intro;
+                }
+            });
+            if item.intro != Intro::None {
+                duration_control(ui, "Length", &mut item.intro_ms);
             }
-        });
-        if item.outro != Outro::None {
-            duration_control(ui, "Length", &mut item.outro_ms);
+            ui.add_space(10.0);
+            section(ui, "Animate out");
+            let per_row = if width >= 4.0 * 56.0 { 4 } else { 2 };
+            chip_grid(ui, per_row, Outro::ALL.len(), |ui, i, cell| {
+                let outro = Outro::ALL[i];
+                if chip(ui, outro.label(), item.outro == outro, cell).clicked() {
+                    item.outro = outro;
+                }
+            });
+            if item.outro != Outro::None {
+                duration_control(ui, "Length", &mut item.outro_ms);
+            }
         }
 
         // Commit: one undo step per gesture (drag, typing burst, click).
-        let busy = ui.input(|i| i.pointer.any_down()) || field.has_focus();
+        let busy = ui.input(|i| i.pointer.any_down()) || field_focus;
         if item != before {
             if !self.text_ui.editing {
                 self.push_undo();
@@ -1195,6 +1204,28 @@ fn direction_tile(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Label on the left; value box and a slider filling the rest.
+pub(super) fn slider_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    slider: widgets::Slim<'_>,
+    width: f32,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .font(theme::regular(12.0))
+                .color(theme::TEXT_MUTED),
+        );
+        ui.spacing_mut().slider_width = (width - 140.0).max(60.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(slider)
+        })
+        .inner
+    })
+    .inner
+}
+
 /// Label, a slider filling the row, and the value.
 pub(super) fn labeled_slider(
     ui: &mut egui::Ui,
@@ -1213,7 +1244,7 @@ pub(super) fn labeled_slider(
         ui.spacing_mut().slider_width = (width - 140.0).max(60.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
-                egui::Slider::new(value, range)
+                crate::widgets::Slim::new(value, range)
                     .fixed_decimals(0)
                     .suffix(suffix),
             )
@@ -1280,105 +1311,6 @@ pub(super) fn chip(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> 
             theme::TEXT_SECONDARY
         },
     );
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// A style preset tile: a miniature "Aa" in the preset's colors.
-fn style_chip(
-    ui: &mut egui::Ui,
-    name: &str,
-    style: &text::TextStyle,
-    active: bool,
-    width: f32,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 52.0), widgets::CLICK);
-    let painter = ui.painter();
-    painter.rect_filled(rect, 7.0, Color32::from_rgb(44, 50, 62));
-    let sample_center = rect.center() - egui::vec2(0.0, 7.0);
-    let font = egui::FontId::new(
-        17.0,
-        egui::FontFamily::Name(TextFont::Montserrat.egui_family().into()),
-    );
-    let rgb = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
-    if let Some((bg, alpha)) = style.background {
-        let galley = painter.layout_no_wrap("Aa".into(), font.clone(), Color32::WHITE);
-        painter.rect_filled(
-            egui::Rect::from_center_size(sample_center, galley.size() + egui::vec2(12.0, 2.0)),
-            4.0,
-            rgb(bg).gamma_multiply(alpha),
-        );
-    }
-    match style.shadow {
-        Shadow::Glow => {
-            for r in [2.0, 1.0] {
-                for (dx, dy) in [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
-                    painter.text(
-                        sample_center + egui::vec2(dx, dy),
-                        egui::Align2::CENTER_CENTER,
-                        "Aa",
-                        font.clone(),
-                        rgb(style.color).gamma_multiply(0.35),
-                    );
-                }
-            }
-        }
-        Shadow::Soft => {
-            painter.text(
-                sample_center + egui::vec2(0.0, 1.5),
-                egui::Align2::CENTER_CENTER,
-                "Aa",
-                font.clone(),
-                Color32::from_black_alpha(150),
-            );
-        }
-        Shadow::None => {}
-    }
-    if style.outline > 0.0 {
-        for (dx, dy) in [
-            (-1.2, 0.0),
-            (1.2, 0.0),
-            (0.0, -1.2),
-            (0.0, 1.2),
-            (-0.9, -0.9),
-            (0.9, 0.9),
-            (-0.9, 0.9),
-            (0.9, -0.9),
-        ] {
-            painter.text(
-                sample_center + egui::vec2(dx, dy),
-                egui::Align2::CENTER_CENTER,
-                "Aa",
-                font.clone(),
-                rgb(style.outline_color),
-            );
-        }
-    }
-    painter.text(
-        sample_center,
-        egui::Align2::CENTER_CENTER,
-        "Aa",
-        font,
-        rgb(style.color),
-    );
-    painter.text(
-        rect.center_bottom() - egui::vec2(0.0, 8.0),
-        egui::Align2::CENTER_CENTER,
-        name,
-        theme::regular(10.5),
-        if active {
-            theme::TEXT_PRIMARY
-        } else {
-            theme::TEXT_MUTED
-        },
-    );
-    let edge = if active {
-        Stroke::new(1.5_f32, theme::ACCENT)
-    } else if response.hovered() {
-        Stroke::new(1.0_f32, theme::TEXT_FAINT)
-    } else {
-        Stroke::new(1.0_f32, theme::BORDER)
-    };
-    painter.rect_stroke(rect.shrink(0.5), 7.0, edge);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1949,7 +1881,7 @@ pub(super) fn duration_control(ui: &mut egui::Ui, label: &str, ms: &mut f32) {
             ui.spacing_mut().slider_width = (width - 140.0).max(60.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
-                    egui::Slider::new(&mut seconds, 0.05..=5.0)
+                    crate::widgets::Slim::new(&mut seconds, 0.05..=5.0)
                         .logarithmic(true)
                         .fixed_decimals(2)
                         .suffix(" s"),

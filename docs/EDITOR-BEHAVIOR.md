@@ -74,6 +74,27 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## Inspector tabs, app menu, slim sliders (2026-11-15)
+
+- The edit panel is split into tabs (`widgets::tab_bar`: a sliding accent
+  underline, no extra click layers). Text: Text (field, Font, Align) · Look
+  (Color, Outline, Shadow, Box) · Animate (in/out). Video clips: Frame (Fit to
+  screen, Zoom, Opacity) · Animate · Playback (Detach/Attach audio, Gain,
+  Speed). Audio-only clips show Playback with no tab bar.
+- Text style presets are gone from the UI (`STYLE_PRESETS[1]` still seeds the
+  default style).
+- Sliders are `widgets::Slim`: a 4 px rail with an accent fill and a small
+  white knob (ring while dragging) beside an editable value box. egui's stock
+  slider sizes its knob from the row height, which looked oversized.
+- Top bar: the Halo logo + name in the left corner is one menu (Open Video…,
+  Settings…, Help & updates… / Install update…, Quit, with an update dot).
+  The Simple Clip / Advanced switch is text only.
+- Fit to screen is the first preview toolbar button, before the aspect menu.
+- Files dropped from outside onto an empty timeline stick to 00:00 until the
+  pointer moves more than 28 px sideways.
+- The Media drop highlight stays inside the list under the Media / Import
+  header; narrow cards stack the badge above the label.
+
 ## Lane drags, Wayland drops, frame fitting (2026-11-15, 0.10.7)
 
 - One rule set for every vertical drag (clips, media from the bin, text
@@ -106,8 +127,8 @@ isolated configuration/cache directories.
   the actual gradient running that way.
 - Inline text: Shift+Enter adds a line (egui's `consume_key` matched Enter
   with Shift held too, so it used to finish editing).
-- Top bar: File and Help in the left corner, a large Simple Clip / Advanced
-  switch with a sliding highlight in the center, the name on the right.
+- Top bar: a large Simple Clip / Advanced switch with a sliding highlight in
+  the center (menus: see the section above).
 
 ## Layers, audio sync and cut playback (2026-11-15)
 
@@ -118,9 +139,8 @@ isolated configuration/cache directories.
   preview to type in a bubble under it. Enter finishes, Shift+Enter adds a
   line, clicking away closes it; one editing session is one undo step. The
   selection frame hugs the drawn glyphs and outline (or the box when on).
-- Text inspector: Style, Font, Align, Color (Solid/Gradient), Outline, Shadow,
-  Box, Animate in/out. Gradients are edited on a stop bar with draggable
-  handles, four direction arrows and a swap button. No named gradient presets.
+- Text inspector: Font, Align, Color (Solid/Gradient), Outline, Shadow, Box,
+  Animate in/out (now in tabs, see above). No named gradient presets.
 - Clip panel: Frame (Fit to screen, Zoom, Opacity) and Animation (Start of
   clip / End of clip chips, a Preview pill, Length, and Strength where it
   applies).
@@ -220,9 +240,9 @@ isolated configuration/cache directories.
   Alt bypasses snapping. Drag a corner or scroll over selected text to resize.
   Position changes reuse the texture; rasterization happens only for a change
   in text, style, size, canvas size, or animation state. No mpv filter rebuilds.
-- The inspector has eleven bundled font choices, six style presets, swatches
-  and custom color, alignment, outline, shadow, and box controls. Position has
-  no numeric sliders. Presets preserve the chosen font and alignment.
+- The inspector has eleven bundled font choices, swatches and custom color,
+  alignment, outline, shadow, and box controls. Position has no numeric
+  sliders.
 - Intros: None, Fade, Pop, Rise, Type, Words. Outros: None, Fade, Pop, Drop.
   Separate In/Out time sliders control duration (50 ms–5 seconds), including
   the complete Type/Words reveal. Short layers cap each transition at half

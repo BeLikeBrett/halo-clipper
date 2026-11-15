@@ -617,6 +617,8 @@ pub struct ClipperApp {
     canvas_drag: Option<canvas::CanvasDrag>,
     canvas_ui: canvas::CanvasUi,
     clip_animation_editing: bool,
+    /// Edit panel tab for video clips: 0 Frame, 1 Animate, 2 Playback.
+    clip_tab: usize,
     text_ui: textui::TextUi,
     status: String,
     export_mode: ExportMode,
@@ -746,6 +748,7 @@ impl ClipperApp {
             canvas_drag: None,
             canvas_ui: Default::default(),
             clip_animation_editing: false,
+            clip_tab: 0,
             text_ui: Default::default(),
             status: String::new(),
             export_mode: ExportMode::Auto,
@@ -2008,19 +2011,14 @@ impl eframe::App for ClipperApp {
                         let mut want_settings = false;
                         let mut want_support = false;
                         let mut want_quit = false;
-                        crate::widgets::menu_bar_button(ui, "File", 210.0, |ui| {
-                            want_open =
-                                crate::widgets::menu_item(ui, "Open Video…", None).clicked();
-                            crate::widgets::menu_separator(ui);
-                            want_settings =
-                                crate::widgets::menu_item(ui, "Settings…", None).clicked();
-                            crate::widgets::menu_separator(ui);
-                            want_quit = crate::widgets::menu_item(ui, "Quit", None).clicked();
-                            want_open || want_settings || want_quit
-                        });
+                        // One app menu behind the logo: everything File and Help held.
                         let update =
                             matches!(self.updater.state, crate::updater::State::Available(_));
-                        crate::widgets::menu_bar_button(ui, "Help", 210.0, |ui| {
+                        crate::widgets::app_menu_button(ui, update, 220.0, |ui| {
+                            want_open =
+                                crate::widgets::menu_item(ui, "Open Video…", None).clicked();
+                            want_settings =
+                                crate::widgets::menu_item(ui, "Settings…", None).clicked();
                             want_support = crate::widgets::menu_item(
                                 ui,
                                 if update {
@@ -2031,13 +2029,10 @@ impl eframe::App for ClipperApp {
                                 None,
                             )
                             .clicked();
-                            want_support
+                            crate::widgets::menu_separator(ui);
+                            want_quit = crate::widgets::menu_item(ui, "Quit", None).clicked();
+                            want_open || want_settings || want_support || want_quit
                         });
-                        if update {
-                            // A quiet badge instead of renaming the menu.
-                            let dot = ui.min_rect().right_top() + egui::vec2(-6.0, 7.0);
-                            ui.painter().circle_filled(dot, 3.5, theme::ACCENT);
-                        }
                         if want_open {
                             self.open_file();
                         }
@@ -2077,11 +2072,6 @@ impl eframe::App for ClipperApp {
                                 EditMode::MultiTrack
                             });
                         }
-                        // The name sits in the right corner; menus own the left.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(4.0);
-                            paint_brand(ui);
-                        });
                     },
                 );
             });
@@ -2317,11 +2307,34 @@ impl ClipperApp {
                 }
             });
         });
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        self.show_quick_properties(ui);
+        ui.add_space(2.0);
+        // Video clips: Frame / Animate / Playback tabs. Audio-only clips
+        // only have Playback, so no tabs.
+        let video = self
+            .edited_clip()
+            .is_some_and(|c| self.project.as_ref().is_some_and(|p| p.is_video(c.id)));
+        let tab = if video {
+            let width = ui.available_width() - 2.0;
+            if let Some(tab) = crate::widgets::tab_bar(
+                ui,
+                "clip_tabs",
+                &["Frame", "Animate", "Playback"],
+                self.clip_tab,
+                width,
+            ) {
+                self.clip_tab = tab;
+            }
+            ui.add_space(14.0);
+            self.clip_tab
+        } else {
+            ui.add_space(8.0);
+            2
+        };
+        match tab {
+            0 => self.show_clip_frame(ui),
+            1 => self.show_clip_animation(ui),
+            _ => self.show_link_action(ui),
+        }
 
         // Snapshot all data we need before touching `self.project` mutably.
         // The intermediate block scopes the borrow so the writes later
@@ -2387,19 +2400,17 @@ impl ClipperApp {
         };
 
         // ─────────── Audio gain ───────────
-        if !snap.audio_clip_ids.is_empty() {
-            ui.label(
-                RichText::new("Audio")
-                    .size(13.5)
-                    .strong()
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.add_space(6.0);
+        if tab == 2 && !snap.audio_clip_ids.is_empty() {
+            textui::section(ui, "Audio");
+            let row_w = ui.available_width() - 2.0;
             let mut gain = snap.initial_gain;
-            let resp = ui.add(
-                egui::Slider::new(&mut gain, 0.0..=2.0)
+            let resp = textui::slider_row(
+                ui,
+                "Gain",
+                crate::widgets::Slim::new(&mut gain, 0.0..=2.0)
                     .step_by(0.01)
-                    .text("Gain"),
+                    .fixed_decimals(2),
+                row_w,
             );
             if resp.drag_started() || (resp.changed() && !resp.dragged()) {
                 self.push_undo();
@@ -2435,42 +2446,45 @@ impl ClipperApp {
         }
 
         // ─────────── Speed ───────────
-        ui.label(
-            RichText::new("Speed")
-                .size(13.5)
-                .strong()
-                .color(theme::TEXT_PRIMARY),
-        );
-        ui.add_space(6.0);
-        let mut speed = snap.initial_speed;
-        let speed_resp = ui.add(
-            egui::Slider::new(&mut speed, 0.25..=4.0)
-                .step_by(0.05)
-                .text(if snap.speed_target_clip_ids.len() > 1 {
-                    "× (all linked)"
-                } else {
-                    "×"
-                }),
-        );
-        if speed_resp.drag_started() || (speed_resp.changed() && !speed_resp.dragged()) {
-            self.push_undo();
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (preset, label) in [(0.5_f32, "0.5×"), (1.0, "1×"), (2.0, "2×"), (4.0, "4×")] {
-                let active = (speed - preset).abs() < 0.001;
-                if speed_preset_chip(ui, label, active).clicked() {
-                    self.push_undo();
-                    speed = preset;
-                }
+        if tab == 2 {
+            textui::section(ui, "Speed");
+            let row_w = ui.available_width() - 2.0;
+            let mut speed = snap.initial_speed;
+            let speed_resp = textui::slider_row(
+                ui,
+                "Rate",
+                crate::widgets::Slim::new(&mut speed, 0.25..=4.0)
+                    .step_by(0.05)
+                    .fixed_decimals(2)
+                    .suffix("×"),
+                row_w,
+            )
+            .on_hover_text(if snap.speed_target_clip_ids.len() > 1 {
+                "Applies to the linked audio too, so they stay in sync"
+            } else {
+                "Playback speed of this clip"
+            });
+            if speed_resp.drag_started() || (speed_resp.changed() && !speed_resp.dragged()) {
+                self.push_undo();
             }
-        });
-        if (speed - snap.initial_speed).abs() > 0.0001 {
-            if let Some(p) = self.project.as_mut() {
-                for cid in &snap.speed_target_clip_ids {
-                    if let Some(c) = p.clips.iter_mut().find(|c| c.id == *cid) {
-                        c.speed = speed.clamp(0.25, 4.0);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (preset, label) in [(0.5_f32, "0.5×"), (1.0, "1×"), (2.0, "2×"), (4.0, "4×")]
+                {
+                    let active = (speed - preset).abs() < 0.001;
+                    if speed_preset_chip(ui, label, active).clicked() {
+                        self.push_undo();
+                        speed = preset;
+                    }
+                }
+            });
+            if (speed - snap.initial_speed).abs() > 0.0001 {
+                if let Some(p) = self.project.as_mut() {
+                    for cid in &snap.speed_target_clip_ids {
+                        if let Some(c) = p.clips.iter_mut().find(|c| c.id == *cid) {
+                            c.speed = speed.clamp(0.25, 4.0);
+                        }
                     }
                 }
             }
@@ -2619,7 +2633,10 @@ impl ClipperApp {
             let vol_response = ui
                 .scope(|ui| {
                     ui.spacing_mut().slider_width = 160.0;
-                    ui.add(egui::Slider::new(&mut self.volume_ui, 0.0..=130.0).show_value(false))
+                    ui.add(
+                        crate::widgets::Slim::new(&mut self.volume_ui, 0.0..=130.0)
+                            .show_value(false),
+                    )
                 })
                 .inner;
             if vol_response.changed() {
@@ -3474,7 +3491,7 @@ impl ClipperApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().slider_width = 380.0;
             ui.add(
-                egui::Slider::new(
+                crate::widgets::Slim::new(
                     &mut self.discord_target_mb,
                     encode::DiscordNitro::MIN_TARGET_MB..=encode::DiscordNitro::MAX_TARGET_MB,
                 )
@@ -3807,7 +3824,7 @@ impl ClipperApp {
                             .small(),
                     );
                     ui.add(
-                        egui::Slider::new(&mut self.custom_encode.quality, range)
+                        crate::widgets::Slim::new(&mut self.custom_encode.quality, range)
                             .text("lower = better"),
                     );
                 });
@@ -3829,8 +3846,11 @@ impl ClipperApp {
                             .small(),
                     );
                     ui.add(
-                        egui::Slider::new(&mut self.custom_encode.video_bitrate_kbps, 500..=50_000)
-                            .logarithmic(true),
+                        crate::widgets::Slim::new(
+                            &mut self.custom_encode.video_bitrate_kbps,
+                            500..=50_000,
+                        )
+                        .logarithmic(true),
                     );
                 });
                 // Rough size estimate so the slider means something.
@@ -3950,7 +3970,7 @@ impl ClipperApp {
                         .small(),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.custom_encode.audio_bitrate_kbps, 64..=320)
+                    crate::widgets::Slim::new(&mut self.custom_encode.audio_bitrate_kbps, 64..=320)
                         .step_by(32.0),
                 );
             });
@@ -4629,34 +4649,6 @@ fn show_multitrack_info(ui: &mut egui::Ui, project: &Project, cut_duration: i64)
 
 /// App mark + name for the top bar: a ring (the "halo") with a bright arc,
 /// painted so it stays crisp at any scale.
-/// Logo ring + name. Laid out right to left (it sits in the bar's right
-/// corner), so the name is added first.
-fn paint_brand(ui: &mut egui::Ui) {
-    ui.label(
-        RichText::new("Halo Clipper")
-            .font(theme::semibold(13.5))
-            .color(theme::TEXT_SECONDARY),
-    );
-    ui.add_space(6.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 28.0), egui::Sense::hover());
-    let c = rect.center();
-    ui.painter().circle_stroke(
-        c,
-        7.5,
-        Stroke::new(2.0_f32, theme::ACCENT.gamma_multiply(0.35)),
-    );
-    let arc: Vec<_> = (0..=14)
-        .map(|i| {
-            let a = -2.4 + 1.9 * i as f32 / 14.0;
-            c + egui::vec2(a.cos(), a.sin()) * 7.5
-        })
-        .collect();
-    ui.painter().add(egui::Shape::line(
-        arc,
-        egui::epaint::PathStroke::new(2.0_f32, theme::ACCENT),
-    ));
-}
-
 /// Primary call-to-action button. Uses the muted-teal `BTN_PRIMARY`
 /// palette instead of the high-contrast `ACCENT` so it draws the eye
 /// without glaring. One source of truth for every primary CTA

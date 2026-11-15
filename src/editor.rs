@@ -207,6 +207,8 @@ pub(super) struct TimelineDropZone {
     area: egui::Rect,
     lanes: Lanes,
     rows_top: f32,
+    /// Drop at 0:00 whatever the pointer's time (see `left_lock` above).
+    left_lock: bool,
     /// Index in `Project::tracks` of each visible row.
     real: Vec<usize>,
     /// Video lanes among the visible rows (by row), for dropping onto one.
@@ -225,13 +227,16 @@ impl TimelineDropZone {
         }
         let raw = self.lanes.time_at(pos.x.max(self.lanes.left));
         let reach = (12.0 / self.lanes.width * self.lanes.span as f32) as i64;
-        let start = self
-            .snaps
-            .iter()
-            .copied()
-            .filter(|s| (s - raw).abs() <= reach)
-            .min_by_key(|s| (s - raw).abs())
-            .unwrap_or(raw);
+        let start = if self.left_lock {
+            0
+        } else {
+            self.snaps
+                .iter()
+                .copied()
+                .filter(|s| (s - raw).abs() <= reach)
+                .min_by_key(|s| (s - raw).abs())
+                .unwrap_or(raw)
+        };
         let rel = ((pos.y - self.rows_top) / LANE_HEIGHT).max(0.0);
         let row = rel.floor() as usize;
         if (0.25..0.75).contains(&(rel - row as f32)) {
@@ -802,17 +807,19 @@ fn paint_playhead_head(painter: &egui::Painter, x: f32, top: f32, bottom: f32, h
 }
 
 impl ClipperApp {
-    pub(super) fn show_quick_properties(&mut self, ui: &mut egui::Ui) {
-        let Some(p) = &self.project else { return };
-        let Some(c) = p
-            .selected_clips
+    /// The clip the Edit panel shows (lowest id of the selection).
+    pub(super) fn edited_clip(&self) -> Option<Clip> {
+        let p = self.project.as_ref()?;
+        p.selected_clips
             .iter()
             .min()
             .and_then(|id| track::clip_by_id(&p.clips, *id))
             .copied()
-        else {
-            return;
-        };
+    }
+
+    /// Detach / Attach audio for the selection, when either applies.
+    pub(super) fn show_link_action(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &self.project else { return };
         let action = if p.can_attach_ids(&p.selected_clips) {
             Some(("Attach Audio", ClipAction::AttachSelected))
         } else if p.can_detach_ids(&p.selected_clips) {
@@ -824,14 +831,15 @@ impl ClipperApp {
             if ui.button(label).on_hover_text("Collapse or expose audio without changing its edits. D detaches; Shift+D attaches.").clicked() { self.apply_clip_action(action); }
             ui.add_space(8.0);
         }
-        if !self.project.as_ref().is_some_and(|p| p.is_video(c.id)) {
-            return;
-        }
+    }
+
+    /// Frame tab: Fit to screen, zoom, opacity.
+    pub(super) fn show_clip_frame(&mut self, ui: &mut egui::Ui) {
+        let Some(c) = self.edited_clip() else { return };
         let width = ui.available_width() - 2.0;
         ui.set_max_width(width);
         let mut transform = c.transform;
         let previous = transform;
-        textui::section(ui, "Frame");
         if crate::widgets::fit_button(ui, !self.frame_is_fitted(c.id), Some(width)).clicked() {
             self.fit_to_screen(c.id);
             return;
@@ -848,7 +856,7 @@ impl ClipperApp {
                 ui.spacing_mut().slider_width = (width - 140.0).max(60.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add(
-                        egui::Slider::new(&mut zoom, 3.0..=800.0)
+                        crate::widgets::Slim::new(&mut zoom, 3.0..=800.0)
                             .logarithmic(true)
                             .fixed_decimals(0)
                             .suffix("%"),
@@ -877,12 +885,18 @@ impl ClipperApp {
                 clip.transform = transform;
             }
             self.clip_animation_editing = ui.input(|i| i.pointer.any_down());
+        } else if !ui.input(|i| i.pointer.any_down()) {
+            self.clip_animation_editing = false;
         }
+    }
 
-        textui::divider(ui);
+    /// Animate tab: start / end of clip effects with previews.
+    pub(super) fn show_clip_animation(&mut self, ui: &mut egui::Ui) {
+        let Some(c) = self.edited_clip() else { return };
+        let width = ui.available_width() - 2.0;
+        ui.set_max_width(width);
         let mut animation = c.animation;
         let mut preview = None;
-        textui::section(ui, "Animation");
         for (label, effect, ms) in [
             ("In", &mut animation.intro, &mut animation.in_ms),
             ("Out", &mut animation.outro, &mut animation.out_ms),
@@ -980,19 +994,6 @@ impl ClipperApp {
         let fade = ui
             .ctx()
             .animate_bool_with_time(ui.id().with("file_drop_media"), to_media, 0.12);
-        if fade > 0.0 {
-            let rect = ui.max_rect().shrink(3.0);
-            // Foreground, so the bin's own rows don't paint over it.
-            let layer = egui::LayerId::new(egui::Order::Foreground, ui.id().with("drop_layer"));
-            crate::widgets::paint_drop_zone(
-                &ui.ctx()
-                    .layer_painter(layer)
-                    .with_clip_rect(rect.expand(1.0)),
-                rect,
-                fade,
-                Some("Drop to add to Media"),
-            );
-        }
         let advanced = self
             .project
             .as_ref()
@@ -1011,6 +1012,24 @@ impl ClipperApp {
         });
         ui.add_space(8.0);
         ui.separator();
+        // The drop card covers the list only, under the Media / Import row.
+        if fade > 0.0 {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), ui.cursor().top() + 2.0),
+                ui.max_rect().max,
+            )
+            .shrink(3.0);
+            // Foreground, so the bin's own rows don't paint over it.
+            let layer = egui::LayerId::new(egui::Order::Foreground, ui.id().with("drop_layer"));
+            crate::widgets::paint_drop_zone(
+                &ui.ctx()
+                    .layer_painter(layer)
+                    .with_clip_rect(rect.expand(1.0)),
+                rect,
+                fade,
+                Some("Drop to add to Media"),
+            );
+        }
         ui.add_space(8.0);
         let assets = self
             .project
@@ -1291,7 +1310,10 @@ impl ClipperApp {
                 ui.add_space(10.0);
                 ui.spacing_mut().slider_width = 84.0;
                 let response = ui
-                    .add(egui::Slider::new(&mut self.volume_ui, 0.0..=130.0).show_value(false))
+                    .add(
+                        crate::widgets::Slim::new(&mut self.volume_ui, 0.0..=130.0)
+                            .show_value(false),
+                    )
                     .on_hover_text(format!("Preview volume {:.0}%", self.volume_ui));
                 if response.changed() {
                     let _ = self.player.set_volume(self.volume_ui);
@@ -1492,6 +1514,7 @@ impl ClipperApp {
             .chain(clips.iter().flat_map(|c| [c.cut_start_ms, c.cut_end_ms()]))
             .collect();
         let mut band_actions = Vec::new();
+        let file_hover = self.file_hover;
         let band_drag = &mut self.text_ui.band_drag;
         let lane_bg = theme::BG_PANEL;
         let empty_bg = theme::BG_HEADER;
@@ -1880,7 +1903,7 @@ impl ClipperApp {
                         );
                     }
                 }
-                if tracks.is_empty() {
+                if tracks.is_empty() && !file_hover {
                     painter.text(
                         egui::pos2(left + 16.0, rect.top() + lane_h * 0.5),
                         Align2::LEFT_CENTER,
@@ -2046,9 +2069,31 @@ impl ClipperApp {
 
         // ── Ruler (pinned above the scrolling lanes) ──
         let (lanes_view, rows_top) = scroll.inner;
+        // On an empty timeline a file drag sticks to 0:00 until the pointer
+        // moves deliberately sideways (as media from the bin does).
+        let lock_id = ui.id().with("file_drop_left_lock");
+        let over = self
+            .file_hover
+            .then_some(self.file_hover_pos)
+            .flatten()
+            .filter(|pos| lanes_view.contains(*pos));
+        let left_lock = match over {
+            Some(pos) if clips.is_empty() => ui.data_mut(|d| {
+                let lock = d.get_temp_mut_or_insert_with(lock_id, || (pos.x, true));
+                if (pos.x - lock.0).abs() > 28.0 {
+                    lock.1 = false;
+                }
+                lock.1
+            }),
+            _ => {
+                ui.data_mut(|d| d.remove::<(f32, bool)>(lock_id));
+                false
+            }
+        };
         // External file drags: remember the lanes for the drop, and show
         // where the files would land.
         let zone = TimelineDropZone {
+            left_lock,
             area: lanes_view,
             lanes: Lanes::window(lanes_view, view.start, span),
             rows_top,

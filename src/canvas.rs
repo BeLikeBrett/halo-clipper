@@ -257,6 +257,10 @@ impl ClipperApp {
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            let moved = focused.is_some_and(|id| !self.frame_is_fitted(id));
+            if crate::widgets::fit_button(ui, moved, None).clicked() {
+                reset = focused;
+            }
             let aspect_label = settings.aspect.label();
             let picked_aspect = &mut settings.aspect;
             widgets::dropdown_button(
@@ -351,10 +355,6 @@ impl ClipperApp {
                 },
             );
 
-            let moved = focused.is_some_and(|id| !self.frame_is_fitted(id));
-            if crate::widgets::fit_button(ui, moved, None).clicked() {
-                reset = focused;
-            }
             if ui
                 .button("Add text")
                 .on_hover_text(

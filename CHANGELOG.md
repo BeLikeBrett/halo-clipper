@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.8
+
+- Edit panel split into tabs: Text / Look / Animate for text, Frame /
+  Animate / Playback for video clips.
+- Cleaner sliders: thin rail, small knob.
+- Halo logo menu in the top-left holds Open Video, Settings, Help & updates
+  and Quit; plain-text Simple Clip / Advanced switch.
+- Fit to screen is now first in the preview toolbar.
+- Files dropped on an empty timeline start at the very beginning.
+- The Media drop highlight stays inside the list.
+- Text style presets removed.
+
 ## 0.10.7
 
 - Linux: dragging files into the app now works on Wayland desktops (niri,
