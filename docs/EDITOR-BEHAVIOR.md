@@ -74,6 +74,13 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## New text length (2026-11-15)
+
+A new text layer lasts 10 s from the playhead so it is easy to grab on the
+timeline. It stops at the end of the clips (no blank seconds added to the
+export) but is never shorter than 3 s; placed past all clips it gets the full
+10 s.
+
 ## Narrow windows, selection ring, compact export (2026-11-15)
 
 - The preview toolbar is `horizontal_wrapped`; its dropdowns cap at the

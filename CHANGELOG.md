@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.11
+
+- New text layers last 10 seconds (up to the end of your clips) instead of
+  3, so they're big enough on the timeline to grab and resize.
+
 ## 0.10.10
 
 - Narrow windows (e.g. half a screen): the preview toolbar wraps instead of

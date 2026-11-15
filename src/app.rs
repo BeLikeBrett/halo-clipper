@@ -290,8 +290,17 @@ impl Project {
     fn add_text(&mut self, lane: Option<TrackId>) -> TextId {
         let id = self.id_gen.next_text();
         let start = self.playhead_ms.max(0);
-        let track = self.text_lane_for(start, start + 3_000, lane);
-        let mut item = TextItem::new(id, track, start, start + 3_000);
+        // Long enough to grab, but never past the end of the clips on its
+        // own (that would add blank seconds to the export); never shorter
+        // than MIN_NEW_TEXT_MS either. Past all clips it gets the full length.
+        let clips_end = track::project_cut_duration(&self.clips);
+        let end = if clips_end > start {
+            (start + NEW_TEXT_MS).min(clips_end.max(start + MIN_NEW_TEXT_MS))
+        } else {
+            start + NEW_TEXT_MS
+        };
+        let track = self.text_lane_for(start, end, lane);
+        let mut item = TextItem::new(id, track, start, end);
         // Inherit the look of the previous layer so a run of captions
         // stays consistent without re-styling each one.
         if let Some(last) = self.texts.last() {
@@ -479,6 +488,10 @@ impl UndoSnapshot {
 }
 
 const UNDO_LIMIT: usize = 200;
+/// How long a newly added text layer lasts: long enough to grab and trim.
+const NEW_TEXT_MS: i64 = 10_000;
+/// Shortest a new text layer gets when the clips end soon after the playhead.
+const MIN_NEW_TEXT_MS: i64 = 3_000;
 
 /// Top-level export mode picked in the modal.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4898,7 +4911,11 @@ mod text_layer_tests {
             "text and clip selection are exclusive"
         );
         let t = p.text(first).unwrap();
-        assert_eq!((t.start_ms, t.end_ms), (1_500, 4_500));
+        assert_eq!(
+            (t.start_ms, t.end_ms),
+            (1_500, 6_000),
+            "runs to the end of the 6 s clip"
+        );
 
         let moved = p.text_mut(first).unwrap();
         moved.x = 0.2;
@@ -4929,7 +4946,7 @@ mod text_layer_tests {
         let r = p.text(right).unwrap();
         assert_eq!(
             (r.start_ms, r.end_ms, r.text.as_str()),
-            (1_000, 3_000, "Hello")
+            (1_000, 6_000, "Hello")
         );
     }
 
@@ -4946,6 +4963,15 @@ mod text_layer_tests {
         after.apply(&mut p);
         assert_eq!(p.text(id).unwrap().text, "Hi");
         assert_eq!(p.selected_text, Some(id));
+    }
+
+    #[test]
+    fn new_text_lasts_ten_seconds_past_the_clips() {
+        let mut p = project();
+        p.playhead_ms = 7_000;
+        let id = p.add_text(None);
+        let t = p.text(id).unwrap();
+        assert_eq!((t.start_ms, t.end_ms), (7_000, 7_000 + NEW_TEXT_MS));
     }
 
     #[test]
