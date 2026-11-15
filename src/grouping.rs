@@ -287,7 +287,7 @@ impl Project {
         let tracks = self
             .tracks
             .iter()
-            .filter(|t| clips.iter().any(|c| c.track_id == t.id))
+            .filter(|t| t.kind == TrackKind::Text || clips.iter().any(|c| c.track_id == t.id))
             .cloned()
             .collect();
         (tracks, clips, labels)

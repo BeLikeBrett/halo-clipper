@@ -45,10 +45,16 @@ pub(super) struct TextUi {
     editing: bool,
     inspector_id: Option<TextId>,
     focus_field: bool,
-    picker: Option<picker::PickerState>,
+    picker: Option<OpenPicker>,
     wheel: Option<(TextId, f64)>,
     font_menu_open: bool,
     pub(super) band_drag: Option<BandDrag>,
+    /// Layer being typed into on the preview itself.
+    inline: Option<TextId>,
+    /// Give the inline field keyboard focus next frame.
+    inline_focus: bool,
+    /// The inline session already took its undo snapshot.
+    inline_dirty: bool,
 }
 
 /// Screen-space center of a layer on `canvas`.
@@ -62,10 +68,15 @@ fn center(item: &TextItem, canvas: egui::Rect) -> egui::Pos2 {
 /// Screen rect of the visible block (glyphs + box), for hit-testing and
 /// the selection frame. `ppp` converts canvas points to pixels.
 fn block_rect(item: &TextItem, canvas: egui::Rect, ppp: f32) -> egui::Rect {
-    let (w, h) = crate::textrender::block_size(item, canvas.width() * ppp, canvas.height() * ppp);
+    let (l, t, r, b) =
+        crate::textrender::ink_bounds(item, canvas.width() * ppp, canvas.height() * ppp);
+    let c = center(item, canvas);
+    let rect = egui::Rect::from_min_max(c + egui::vec2(l, t) / ppp, c + egui::vec2(r, b) / ppp);
+    // A little air around the letters; tiny text stays grabbable.
+    let rect = rect.expand(3.0);
     egui::Rect::from_center_size(
-        center(item, canvas),
-        egui::vec2((w / ppp).max(24.0), (h / ppp).max(20.0)),
+        rect.center(),
+        egui::vec2(rect.width().max(24.0), rect.height().max(20.0)),
     )
 }
 
@@ -82,6 +93,11 @@ impl ClipperApp {
     /// Adds a text layer at the playhead (one undo step), selects it and
     /// puts the cursor in its text field.
     pub(super) fn add_text_layer(&mut self) {
+        self.add_text_layer_on(None);
+    }
+
+    /// `add_text_layer` on a given text lane when it has room.
+    pub(super) fn add_text_layer_on(&mut self, lane: Option<TrackId>) {
         if self.project.is_none() {
             return;
         }
@@ -89,9 +105,12 @@ impl ClipperApp {
         self.text_ui.editing = false;
         self.push_undo();
         if let Some(p) = &mut self.project {
-            p.add_text();
+            let id = p.add_text(lane);
+            // Type straight onto the preview.
+            self.text_ui.inline = Some(id);
+            self.text_ui.inline_focus = true;
+            self.text_ui.inline_dirty = true;
         }
-        self.text_ui.focus_field = true;
     }
 
     pub(super) fn text_dragging(&self) -> bool {
@@ -106,8 +125,11 @@ impl ClipperApp {
             return Vec::new();
         };
         let playing = self.live.playing;
+        let disabled: HashSet<TrackId> =
+            p.tracks.iter().filter(|t| t.muted).map(|t| t.id).collect();
         p.texts
             .iter()
+            .filter(|t| !disabled.contains(&t.track))
             .filter_map(|t| {
                 let selected = p.selected_text == Some(t.id);
                 if t.contains(p.playhead_ms) {
@@ -152,14 +174,18 @@ impl ClipperApp {
                     egui::Sense::click_and_drag(),
                 )
                 .on_hover_cursor(egui::CursorIcon::Move);
+            // Clicking text that's already selected, or double-clicking
+            // any text, types into it right on the preview.
+            if (response.clicked() && selected == Some(item.id)) || response.double_clicked() {
+                self.text_ui.inline = Some(item.id);
+                self.text_ui.inline_focus = true;
+                self.text_ui.inline_dirty = false;
+            }
             if response.clicked() || response.drag_started() {
                 took = true;
                 if let Some(p) = &mut self.project {
                     p.select_text(Some(item.id));
                 }
-            }
-            if response.double_clicked() {
-                self.text_ui.focus_field = true;
             }
             if response.drag_started() {
                 start = Some(TextDrag {
@@ -270,8 +296,16 @@ impl ClipperApp {
                     moved = snapped;
                     self.canvas_ui.guides = guides;
                 }
-                update.0 = ((moved.center().x - canvas.left()) / canvas.width()).clamp(0.0, 1.0);
-                update.1 = ((moved.center().y - canvas.top()) / canvas.height()).clamp(0.0, 1.0);
+                // The frame hugs the ink, which needn't be centered on the
+                // layer's anchor; keep that offset while moving.
+                let anchor = egui::pos2(
+                    canvas.left() + x0 * canvas.width(),
+                    canvas.top() + y0 * canvas.height(),
+                );
+                let offset = drag.rect.center() - anchor;
+                let c = moved.center() - offset;
+                update.0 = ((c.x - canvas.left()) / canvas.width()).clamp(0.0, 1.0);
+                update.1 = ((c.y - canvas.top()) / canvas.height()).clamp(0.0, 1.0);
             }
             if let Some(t) = self.project.as_mut().and_then(|p| p.text_mut(drag.id)) {
                 (t.x, t.y, t.size) = update;
@@ -285,18 +319,153 @@ impl ClipperApp {
         took || self.text_ui.drag.is_some()
     }
 
-    /// Paints text layers over the composited video, plus the selection
-    /// frame of the selected layer.
-    pub(super) fn paint_canvas_texts(&mut self, ui: &egui::Ui, canvas: egui::Rect) {
+    /// The floating field for typing into a text layer on the preview. It
+    /// sits just under the text (above it near the bottom edge) so the
+    /// styled result stays visible while typing. Enter finishes,
+    /// Shift+Enter adds a line, Esc or clicking away closes it.
+    pub(super) fn show_inline_text_editor(&mut self, ui: &mut egui::Ui, canvas: egui::Rect) {
+        let Some(id) = self.text_ui.inline else {
+            return;
+        };
+        let selected = self.project.as_ref().and_then(|p| p.selected_text);
+        let Some(item) = self
+            .project
+            .as_ref()
+            .and_then(|p| p.text(id))
+            .filter(|_| selected == Some(id))
+            .cloned()
+        else {
+            self.text_ui.inline = None;
+            return;
+        };
+        let ppp = ui.ctx().pixels_per_point();
+        let block = block_rect(&item, canvas, ppp);
+        let width = block
+            .width()
+            .clamp(220.0, (canvas.width() - 16.0).max(220.0));
+        let field_id = ui.id().with(("inline_text", id));
+        let height = 64.0;
+        let below = block.bottom() + 10.0 + height < canvas.bottom();
+        let pos = egui::pos2(
+            (block.center().x - width * 0.5).clamp(
+                canvas.left() + 8.0,
+                (canvas.right() - 8.0 - width).max(canvas.left() + 8.0),
+            ),
+            if below {
+                block.bottom() + 10.0
+            } else {
+                (block.top() - 10.0 - height).max(canvas.top() + 4.0)
+            },
+        );
+        let finish = ui.ctx().memory(|m| m.has_focus(field_id))
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let mut text = item.text.clone();
+        let response = egui::Area::new(ui.id().with("inline_text_area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(theme::BG_MODAL)
+                    .stroke(Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.7)))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .shadow(egui::Shadow {
+                        offset: egui::vec2(0.0, 4.0),
+                        blur: 16.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(110),
+                    })
+                    .show(ui, |ui| {
+                        let field = ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .id(field_id)
+                                .frame(false)
+                                .hint_text("Type your text…")
+                                .font(theme::medium(15.0))
+                                .text_color(theme::TEXT_PRIMARY)
+                                .desired_rows(1)
+                                .desired_width(width - 20.0)
+                                .return_key(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::SHIFT,
+                                    egui::Key::Enter,
+                                )),
+                        );
+                        ui.label(
+                            RichText::new("Enter to finish · Shift+Enter for a new line")
+                                .font(theme::regular(10.5))
+                                .color(theme::TEXT_FAINT),
+                        );
+                        field
+                    })
+                    .inner
+            })
+            .inner;
+        if std::mem::take(&mut self.text_ui.inline_focus) {
+            response.request_focus();
+        }
+        if text != item.text {
+            if !self.text_ui.inline_dirty {
+                self.push_undo();
+                self.text_ui.inline_dirty = true;
+            }
+            if let Some(t) = self.project.as_mut().and_then(|p| p.text_mut(id)) {
+                t.text = text;
+            }
+        }
+        if finish || (response.lost_focus() && !self.text_ui.inline_focus) {
+            self.text_ui.inline = None;
+            self.text_ui.inline_dirty = false;
+            response.surrender_focus();
+        }
+    }
+
+    /// Paints video and text in lane order (deepest first), so a text lane
+    /// placed under a video lane is covered by it, as in the export. Then
+    /// the selection frame of the selected text.
+    pub(super) fn paint_canvas_layers(
+        &mut self,
+        ui: &egui::Ui,
+        canvas: egui::Rect,
+        background: crate::framing::Background,
+    ) {
         let ppp = ui.ctx().pixels_per_point();
         let (w, h) = (canvas.width() * ppp, canvas.height() * ppp);
         let selected = self.project.as_ref().and_then(|p| p.selected_text);
         let painter = ui.painter().with_clip_rect(canvas);
-        let shown = self.canvas_texts();
+        let mut shown = self.canvas_texts();
         let live: HashSet<TextId> = shown.iter().map(|(t, _, _)| t.id).collect();
         self.text_ui.textures.retain(|id, _| live.contains(id));
+        let depth_of: HashMap<TrackId, usize> = self
+            .project
+            .as_ref()
+            .map(|p| {
+                p.tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (t.id, i))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let depth = |item: &TextItem| depth_of.get(&item.track).copied().unwrap_or(0);
+        // Bottom to top; ties keep list order.
+        shown.sort_by_key(|(t, _, _)| std::cmp::Reverse(depth(t)));
+        let frames: Vec<usize> = self.live.frames.iter().map(|f| f.depth).collect();
+        let mut painted = 0;
+        let mut first = true;
 
         for (item, look, ghost) in &shown {
+            // Video lanes below this text go first.
+            let below = painted
+                + frames[painted..]
+                    .iter()
+                    .take_while(|d| **d > depth(item))
+                    .count();
+            if first || below > painted {
+                self.live
+                    .paint_range(ui, canvas, background, painted..below, first);
+                painted = below;
+                first = false;
+            }
             let key = render_key(item, look, w, h);
             let fresh = self
                 .text_ui
@@ -338,6 +507,11 @@ impl ClipperApp {
             );
         }
 
+        if first || painted < frames.len() {
+            self.live
+                .paint_range(ui, canvas, background, painted..frames.len(), first);
+        }
+
         if let Some((item, _, _)) = shown.iter().find(|(t, _, _)| Some(t.id) == selected) {
             let rect = block_rect(item, canvas, ppp);
             let frame = ui.painter().with_clip_rect(canvas.expand(6.0));
@@ -370,6 +544,9 @@ impl ClipperApp {
         }
         let mut item = before.clone();
         let mut close = false;
+        // Everything below sizes to the panel; nothing may push it wider.
+        let width = ui.available_width() - 2.0;
+        ui.set_max_width(width);
 
         ui.horizontal(|ui| {
             ui.label(
@@ -378,48 +555,53 @@ impl ClipperApp {
                     .color(theme::TEXT_PRIMARY),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("✕").size(14.0).color(theme::TEXT_MUTED))
-                            .frame(false),
-                    )
-                    .on_hover_text("Deselect")
-                    .clicked()
-                {
+                let close_button = widgets::icon_button(
+                    ui,
+                    widgets::Icon::Close,
+                    24.0,
+                    false,
+                    theme::TEXT_PRIMARY,
+                )
+                .on_hover_text("Deselect");
+                if close_button.clicked() {
                     close = true;
                 }
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
-        // Content.
+        // Content. The same text can also be typed straight on the preview.
         let field_id = ui.id().with(("text_field", id));
         let field = ui.add(
             egui::TextEdit::multiline(&mut item.text)
                 .id(field_id)
                 .hint_text("Type your text…")
                 .font(theme::medium(14.0))
+                .margin(egui::vec2(10.0, 8.0))
                 .desired_rows(2)
-                .desired_width(f32::INFINITY),
+                .desired_width(width),
         );
         if std::mem::take(&mut self.text_ui.focus_field) {
             field.request_focus();
         }
-        ui.add_space(14.0);
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Tip: double-click the text on the preview to type there.")
+                .font(theme::regular(11.0))
+                .color(theme::TEXT_FAINT),
+        );
 
-        // Style presets.
+        divider(ui);
         section(ui, "Style");
         let current = item.style.preset_index();
-        chip_grid(ui, 3, STYLE_PRESETS.len(), |ui, i, width| {
+        chip_grid(ui, 3, STYLE_PRESETS.len(), |ui, i, cell| {
             let (name, preset) = &STYLE_PRESETS[i];
-            let response = style_chip(ui, name, preset, current == Some(i), width);
-            if response.clicked() {
+            if style_chip(ui, name, preset, current == Some(i), cell).clicked() {
                 item.style = item.style.with_preset(preset);
             }
         });
-        ui.add_space(12.0);
 
-        // Font, shown in its own face.
+        divider(ui);
         section(ui, "Font");
         let font_face = egui::FontId::new(
             15.0,
@@ -430,8 +612,8 @@ impl ClipperApp {
             ui,
             "text_font",
             &mut self.text_ui.font_menu_open,
-            egui::vec2(ui.available_width(), 32.0),
-            ui.available_width(),
+            egui::vec2(width, 34.0),
+            width,
             |painter, rect, color| {
                 painter.text(
                     rect.left_center(),
@@ -455,178 +637,159 @@ impl ClipperApp {
         if let Some(font) = chosen_font {
             item.style.font = font;
         }
-        ui.add_space(12.0);
+        ui.add_space(8.0);
+        let align = match item.style.align {
+            Align::Left => 0,
+            Align::Center => 1,
+            Align::Right => 2,
+        };
+        if let Some(i) = widgets::segmented_fill(
+            ui,
+            "text_align",
+            &[
+                ("Left", "Align left"),
+                ("Center", "Center"),
+                ("Right", "Align right"),
+            ],
+            align,
+            width,
+        ) {
+            item.style.align = [Align::Left, Align::Center, Align::Right][i];
+        }
 
-        // Color.
-        section(ui, "Color");
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(3.0, 4.0);
-            for rgb in SWATCHES {
-                if swatch(ui, rgb, item.style.color == rgb).clicked() {
-                    item.style.color = rgb;
-                    self.text_ui.picker = None;
-                }
-            }
-            let custom = !SWATCHES.contains(&item.style.color);
-            if custom_swatch(
-                ui,
-                item.style.color,
-                custom || self.text_ui.picker.is_some(),
-            )
-            .clicked()
-            {
-                self.text_ui.picker = match self.text_ui.picker {
-                    Some(_) => None,
-                    None => Some(picker::PickerState::new(item.style.color)),
-                };
-            }
-        });
-        if let Some(state) = &mut self.text_ui.picker {
-            if state.rgb() != item.style.color {
-                state.set_rgb(item.style.color);
-            }
+        // Color: fill, then the optional outline and box, each with the
+        // same control (swatches, solid/gradient, stops, direction).
+        divider(ui);
+        let picker = &mut self.text_ui.picker;
+        paint_header(ui, "Color", &mut item.style.gradient, item.style.color);
+        fill_editor(
+            ui,
+            Paint::Text,
+            &mut item.style.color,
+            &mut item.style.gradient,
+            picker,
+            width,
+        );
+
+        divider(ui);
+        let outline = OUTLINES
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                (a.1 - item.style.outline)
+                    .abs()
+                    .total_cmp(&(b.1 - item.style.outline).abs())
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        if let Some(i) = header_choice(
+            ui,
+            "Outline",
+            "text_outline",
+            &[("Off", ""), ("Thin", ""), ("Bold", "")],
+            outline,
+        ) {
+            item.style.outline = OUTLINES[i];
+        }
+        if item.style.outline > 0.0 {
             ui.add_space(8.0);
-            if picker::show(ui, state) {
-                item.style.color = state.rgb();
+            gradient_switch(
+                ui,
+                "outline_kind",
+                &mut item.style.outline_gradient,
+                item.style.outline_color,
+                width,
+            );
+            fill_editor(
+                ui,
+                Paint::Outline,
+                &mut item.style.outline_color,
+                &mut item.style.outline_gradient,
+                picker,
+                width,
+            );
+        }
+
+        divider(ui);
+        let shadow = match item.style.shadow {
+            Shadow::None => 0,
+            Shadow::Soft => 1,
+            Shadow::Glow => 2,
+        };
+        if let Some(i) = header_choice(
+            ui,
+            "Shadow",
+            "text_shadow",
+            &[
+                ("Off", ""),
+                ("Soft", "Drop shadow"),
+                ("Glow", "Neon halo in the text color"),
+            ],
+            shadow,
+        ) {
+            item.style.shadow = [Shadow::None, Shadow::Soft, Shadow::Glow][i];
+        }
+
+        divider(ui);
+        let boxed = match item.style.background {
+            None => 0,
+            Some(([r, ..], _)) if r < 128 => 1,
+            Some(_) => 2,
+        };
+        if let Some(i) = header_choice(
+            ui,
+            "Box",
+            "text_box",
+            &[("Off", ""), ("Dark", ""), ("Light", "")],
+            boxed,
+        ) {
+            item.style.background = match i {
+                0 => None,
+                1 => Some(([0, 0, 0], 0.72)),
+                _ => Some(([255, 255, 255], 1.0)),
+            };
+        }
+        if let Some((rgb, opacity)) = &mut item.style.background {
+            ui.add_space(8.0);
+            gradient_switch(ui, "box_kind", &mut item.style.box_gradient, *rgb, width);
+            fill_editor(
+                ui,
+                Paint::Box,
+                rgb,
+                &mut item.style.box_gradient,
+                picker,
+                width,
+            );
+            ui.add_space(6.0);
+            let mut percent = *opacity * 100.0;
+            if labeled_slider(ui, "Opacity", &mut percent, 0.0..=100.0, "%", width) {
+                *opacity = percent / 100.0;
             }
         }
-        ui.add_space(12.0);
-
-        egui::CollapsingHeader::new("Color mix")
-            .id_salt("text_color_mix")
-            .show(ui, |ui| {
-                color_mix(ui, "Text", &mut item.style.color, &mut item.style.gradient);
-                if item.style.outline > 0.0 {
-                    color_mix(
-                        ui,
-                        "Outline",
-                        &mut item.style.outline_color,
-                        &mut item.style.outline_gradient,
-                    );
-                }
-                if let Some((rgb, opacity)) = &mut item.style.background {
-                    color_mix(ui, "Box", rgb, &mut item.style.box_gradient);
-                    ui.add(egui::Slider::new(opacity, 0.0..=1.0).text("Box opacity"));
-                }
-            });
-        ui.add_space(8.0);
-
-        // Fine look controls.
-        let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(56.0, 30.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_min_width(56.0);
-                        ui.label(
-                            RichText::new(label)
-                                .font(theme::regular(12.5))
-                                .color(theme::TEXT_MUTED),
-                        );
-                    },
-                );
-                add(ui);
-            });
-            ui.add_space(4.0);
-        };
-        row(ui, "Align", &mut |ui| {
-            let index = match item.style.align {
-                Align::Left => 0,
-                Align::Center => 1,
-                Align::Right => 2,
-            };
-            if let Some(i) = widgets::segmented(
-                ui,
-                "text_align",
-                &[("Left", ""), ("Center", ""), ("Right", "")],
-                index,
-            ) {
-                item.style.align = [Align::Left, Align::Center, Align::Right][i];
-            }
-        });
-        row(ui, "Outline", &mut |ui| {
-            let index = OUTLINES
-                .iter()
-                .enumerate()
-                .min_by(|a, b| {
-                    (a.1 - item.style.outline)
-                        .abs()
-                        .total_cmp(&(b.1 - item.style.outline).abs())
-                })
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            if let Some(i) = widgets::segmented(
-                ui,
-                "text_outline",
-                &[("Off", ""), ("Thin", ""), ("Bold", "")],
-                index,
-            ) {
-                item.style.outline = OUTLINES[i];
-            }
-        });
-        row(ui, "Shadow", &mut |ui| {
-            let index = match item.style.shadow {
-                Shadow::None => 0,
-                Shadow::Soft => 1,
-                Shadow::Glow => 2,
-            };
-            if let Some(i) = widgets::segmented(
-                ui,
-                "text_shadow",
-                &[
-                    ("Off", ""),
-                    ("Soft", "Drop shadow"),
-                    ("Glow", "Neon halo in the text color"),
-                ],
-                index,
-            ) {
-                item.style.shadow = [Shadow::None, Shadow::Soft, Shadow::Glow][i];
-            }
-        });
-        row(ui, "Box", &mut |ui| {
-            let index = match item.style.background {
-                None => 0,
-                Some(([r, ..], _)) if r < 128 => 1,
-                Some(_) => 2,
-            };
-            if let Some(i) = widgets::segmented(
-                ui,
-                "text_box",
-                &[("Off", ""), ("Dark", ""), ("Light", "")],
-                index,
-            ) {
-                item.style.background = match i {
-                    0 => None,
-                    1 => Some(([0, 0, 0], 0.72)),
-                    _ => Some(([255, 255, 255], 1.0)),
-                };
-            }
-        });
-        ui.add_space(10.0);
 
         // Animation.
+        divider(ui);
         section(ui, "Animate in");
-        chip_grid(ui, 3, Intro::ALL.len(), |ui, i, width| {
+        chip_grid(ui, 3, Intro::ALL.len(), |ui, i, cell| {
             let intro = Intro::ALL[i];
-            if chip(ui, intro.label(), item.intro == intro, width).clicked() {
+            if chip(ui, intro.label(), item.intro == intro, cell).clicked() {
                 item.intro = intro;
             }
         });
         if item.intro != Intro::None {
-            duration_control(ui, "In time", &mut item.intro_ms);
+            duration_control(ui, "Length", &mut item.intro_ms);
         }
         ui.add_space(10.0);
         section(ui, "Animate out");
-        chip_grid(ui, 4, Outro::ALL.len(), |ui, i, width| {
+        let per_row = if width >= 4.0 * 56.0 { 4 } else { 2 };
+        chip_grid(ui, per_row, Outro::ALL.len(), |ui, i, cell| {
             let outro = Outro::ALL[i];
-            if chip(ui, outro.label(), item.outro == outro, width).clicked() {
+            if chip(ui, outro.label(), item.outro == outro, cell).clicked() {
                 item.outro = outro;
             }
         });
-        ui.add_space(10.0);
         if item.outro != Outro::None {
-            duration_control(ui, "Out time", &mut item.outro_ms);
+            duration_control(ui, "Length", &mut item.outro_ms);
         }
 
         // Commit: one undo step per gesture (drag, typing burst, click).
@@ -650,7 +813,341 @@ impl ClipperApp {
     }
 }
 
-fn section(ui: &mut egui::Ui, title: &str) {
+/// Which colored part of a text layer a color control edits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum Paint {
+    Text,
+    Outline,
+    Box,
+}
+
+/// One end of a gradient (`Start` is the solid color).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Stop {
+    Start,
+    End,
+}
+
+/// The open color picker: which part, which stop.
+pub(super) struct OpenPicker {
+    paint: Paint,
+    stop: Stop,
+    /// Picker shown inline (else only the stop is selected for swatches).
+    open: bool,
+    state: picker::PickerState,
+}
+
+pub(super) fn divider(ui: &mut egui::Ui) {
+    ui.add_space(12.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, theme::BORDER_SUBTLE);
+    ui.add_space(12.0);
+}
+
+/// Section title with a choice on the right of the same row.
+fn header_choice(
+    ui: &mut egui::Ui,
+    title: &str,
+    id: &str,
+    options: &[(&str, &str)],
+    selected: usize,
+) -> Option<usize> {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title)
+                .font(theme::medium(12.5))
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            widgets::segmented(ui, id, options, selected)
+        })
+        .inner
+    })
+    .inner
+}
+
+/// Title row for the main color: title plus Solid / Gradient.
+fn paint_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    gradient: &mut Option<text::Gradient>,
+    color: [u8; 3],
+) {
+    let kind = usize::from(gradient.is_some());
+    if let Some(i) = header_choice(
+        ui,
+        title,
+        "fill_kind",
+        &[("Solid", ""), ("Gradient", "Blend two colors")],
+        kind,
+    ) {
+        *gradient = (i == 1).then(|| default_gradient(color));
+    }
+    ui.add_space(8.0);
+}
+
+/// Solid / Gradient switch on its own row (outline, box).
+fn gradient_switch(
+    ui: &mut egui::Ui,
+    id: &str,
+    gradient: &mut Option<text::Gradient>,
+    color: [u8; 3],
+    width: f32,
+) {
+    let kind = usize::from(gradient.is_some());
+    if let Some(i) = widgets::segmented_fill(
+        ui,
+        id,
+        &[("Solid", ""), ("Gradient", "Blend two colors")],
+        kind,
+        width,
+    ) {
+        *gradient = (i == 1).then(|| default_gradient(color));
+    }
+    ui.add_space(8.0);
+}
+
+/// A gradient that starts as a visible variation of `color`.
+fn default_gradient(color: [u8; 3]) -> text::Gradient {
+    let hsva = egui::ecolor::Hsva::from_srgb(color);
+    let end = if hsva.s < 0.15 {
+        // White/grey/black: blend toward a soft blue.
+        [120, 170, 255]
+    } else {
+        egui::ecolor::Hsva::new((hsva.h + 0.12).fract(), hsva.s, hsva.v.max(0.6), 1.0).to_srgb()
+    };
+    text::Gradient { end, angle: 0.0 }
+}
+
+/// Swatches + (for gradients) a stop bar and direction, + inline picker.
+/// Swatches color the selected stop.
+fn fill_editor(
+    ui: &mut egui::Ui,
+    paint: Paint,
+    rgb: &mut [u8; 3],
+    gradient: &mut Option<text::Gradient>,
+    picker: &mut Option<OpenPicker>,
+    width: f32,
+) {
+    ui.push_id(paint, |ui| {
+        if gradient.is_none()
+            && picker
+                .as_ref()
+                .is_some_and(|p| p.paint == paint && p.stop == Stop::End)
+        {
+            *picker = None;
+        }
+        let stop = picker
+            .as_ref()
+            .filter(|p| p.paint == paint)
+            .map_or(Stop::Start, |p| p.stop);
+        let open = picker.as_ref().is_some_and(|p| p.paint == paint && p.open);
+        let target =
+            |rgb: &mut [u8; 3], gradient: &mut Option<text::Gradient>, stop: Stop| -> [u8; 3] {
+                match (stop, gradient.as_ref()) {
+                    (Stop::End, Some(g)) => g.end,
+                    _ => *rgb,
+                }
+            };
+        let current = target(rgb, gradient, stop);
+        let mut set: Option<[u8; 3]> = None;
+
+        if let Some(g) = gradient.as_mut() {
+            // Stop bar: the gradient itself, a handle at each end.
+            let (bar, _) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::hover());
+            let track = bar.shrink2(egui::vec2(15.0, 7.0));
+            let c = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+            let mut mesh = egui::Mesh::default();
+            let i = mesh.vertices.len() as u32;
+            mesh.colored_vertex(track.left_top(), c(*rgb));
+            mesh.colored_vertex(track.right_top(), c(g.end));
+            mesh.colored_vertex(track.right_bottom(), c(g.end));
+            mesh.colored_vertex(track.left_bottom(), c(*rgb));
+            mesh.add_triangle(i, i + 1, i + 2);
+            mesh.add_triangle(i, i + 2, i + 3);
+            ui.painter().add(mesh);
+            ui.painter().rect_stroke(
+                track,
+                3.0,
+                Stroke::new(1.0_f32, Color32::from_white_alpha(30)),
+            );
+            for (which, x, color) in [
+                (Stop::Start, track.left(), *rgb),
+                (Stop::End, track.right(), g.end),
+            ] {
+                let center = egui::pos2(x, bar.center().y);
+                let hit = egui::Rect::from_center_size(center, egui::vec2(28.0, 28.0));
+                let response = ui
+                    .interact(hit, ui.id().with(("stop", which as u8)), widgets::CLICK)
+                    .on_hover_text(match which {
+                        Stop::Start => "Start color",
+                        Stop::End => "End color",
+                    })
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                let active = stop == which;
+                ui.painter().circle_filled(center, 10.0, c(color));
+                ui.painter()
+                    .circle_stroke(center, 10.0, Stroke::new(2.0_f32, theme::BG_PANEL));
+                ui.painter().circle_stroke(
+                    center,
+                    12.5,
+                    if active {
+                        Stroke::new(1.5_f32, theme::ACCENT)
+                    } else if response.hovered() {
+                        Stroke::new(1.0_f32, theme::TEXT_MUTED)
+                    } else {
+                        Stroke::NONE
+                    },
+                );
+                if response.clicked() {
+                    // First click selects the stop (swatches then color
+                    // it); clicking the selected stop toggles its picker.
+                    *picker = Some(OpenPicker {
+                        paint,
+                        stop: which,
+                        open: if active { !open } else { open },
+                        state: picker::PickerState::new(color),
+                    });
+                }
+            }
+            ui.add_space(6.0);
+            // Direction: four arrows and a swap.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new("Direction")
+                        .font(theme::regular(12.0))
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if arrow_button(ui, None, false)
+                        .on_hover_text("Swap colors")
+                        .clicked()
+                    {
+                        std::mem::swap(rgb, &mut g.end);
+                    }
+                    ui.add_space(6.0);
+                    for angle in [135.0, 90.0, 45.0, 0.0] {
+                        let on = (g.angle.rem_euclid(360.0) - angle).abs() < 1.0;
+                        if arrow_button(ui, Some(angle), on).clicked() {
+                            g.angle = angle;
+                        }
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 4.0);
+            for color in SWATCHES {
+                if swatch(ui, color, current == color).clicked() {
+                    set = Some(color);
+                }
+            }
+            let custom = !SWATCHES.contains(&current);
+            if custom_swatch(ui, current, custom || open).clicked() {
+                *picker = Some(OpenPicker {
+                    paint,
+                    stop,
+                    open: !open,
+                    state: picker::PickerState::new(current),
+                });
+            }
+        });
+        if let Some(p) = picker.as_mut().filter(|p| p.paint == paint && p.open) {
+            if p.state.rgb() != current && set.is_none() {
+                p.state.set_rgb(current);
+            }
+            ui.add_space(8.0);
+            if picker::show(ui, &mut p.state) {
+                set = Some(p.state.rgb());
+            }
+        }
+        if let Some(color) = set {
+            match (stop, gradient.as_mut()) {
+                (Stop::End, Some(g)) => g.end = color,
+                _ => *rgb = color,
+            }
+        }
+    });
+}
+
+/// Small square button with a direction arrow (`None` = swap glyph).
+fn arrow_button(ui: &mut egui::Ui, angle: Option<f32>, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), widgets::CLICK);
+    let fill = if on {
+        theme::BG_BUTTON_ACTIVE
+    } else if response.hovered() {
+        theme::BG_BUTTON_HOVER
+    } else {
+        theme::BG_BUTTON
+    };
+    ui.painter().rect_filled(rect, 6.0, fill);
+    ui.painter().rect_stroke(
+        rect.shrink(0.5),
+        6.0,
+        Stroke::new(1.0_f32, if on { theme::ACCENT } else { theme::BORDER }),
+    );
+    let color = if on {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::TEXT_SECONDARY
+    };
+    let stroke = Stroke::new(1.5_f32, color);
+    let c = rect.center();
+    let arrow = |a: f32, len: f32, offset: egui::Vec2| {
+        let d = egui::vec2(a.to_radians().cos(), a.to_radians().sin());
+        let tip = c + offset + d * len;
+        let tail = c + offset - d * len;
+        ui.painter().line_segment([tail, tip], stroke);
+        let back = -d * 4.0;
+        let side = egui::vec2(-d.y, d.x) * 3.2;
+        ui.painter().line_segment([tip, tip + back + side], stroke);
+        ui.painter().line_segment([tip, tip + back - side], stroke);
+    };
+    match angle {
+        Some(a) => arrow(a, 6.0, egui::Vec2::ZERO),
+        None => {
+            arrow(0.0, 5.5, egui::vec2(0.0, -3.0));
+            arrow(180.0, 5.5, egui::vec2(0.0, 3.0));
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Label, a slider filling the row, and the value.
+pub(super) fn labeled_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    width: f32,
+) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .font(theme::regular(12.0))
+                .color(theme::TEXT_MUTED),
+        );
+        ui.spacing_mut().slider_width = (width - 140.0).max(60.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(
+                egui::Slider::new(value, range)
+                    .fixed_decimals(0)
+                    .suffix(suffix),
+            )
+            .changed()
+        })
+        .inner
+    })
+    .inner
+}
+
+pub(super) fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(
         RichText::new(title)
             .font(theme::medium(12.0))
@@ -660,7 +1157,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 /// Lays `count` equal-width cells out `per_row` to a row.
-fn chip_grid(
+pub(super) fn chip_grid(
     ui: &mut egui::Ui,
     per_row: usize,
     count: usize,
@@ -680,7 +1177,7 @@ fn chip_grid(
 }
 
 /// Selectable pill with a centered label.
-fn chip(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
+pub(super) fn chip(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 30.0), widgets::CLICK);
     let fill = if active {
         theme::BG_BUTTON_ACTIVE
@@ -887,38 +1384,12 @@ fn custom_swatch(ui: &mut egui::Ui, current: [u8; 3], active: bool) -> egui::Res
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-// ── Timeline band ──────────────────────────────────────────────────────
+// ── Timeline text lanes ────────────────────────────────────────────────
 
-/// Height of one row of text bars in the timeline band.
-pub(super) const BAND_ROW: f32 = 26.0;
-const BAND_MAX_ROWS: usize = 4;
 /// Grab zone at each end of a bar for trimming, in points.
 const TRIM_GRAB: f32 = 7.0;
 /// Snap distance for bar edges, in points.
 const BAND_SNAP: f32 = 8.0;
-
-/// Packs layers into rows so overlapping ones stack: each takes the first
-/// row that is free at its start (or, past the row cap, the row that frees
-/// up soonest). Returns the row of each layer and the row count (≥ 1).
-pub(super) fn band_rows(texts: &[TextItem]) -> (HashMap<TextId, usize>, usize) {
-    let mut order: Vec<&TextItem> = texts.iter().collect();
-    order.sort_by_key(|t| (t.start_ms, t.id));
-    let mut ends: Vec<i64> = Vec::new();
-    let mut rows = HashMap::new();
-    for t in order {
-        let row = match ends.iter().position(|end| *end <= t.start_ms) {
-            Some(row) => row,
-            None if ends.len() < BAND_MAX_ROWS => {
-                ends.push(i64::MIN);
-                ends.len() - 1
-            }
-            None => (0..ends.len()).min_by_key(|r| ends[*r]).unwrap_or(0),
-        };
-        ends[row] = ends[row].max(t.end_ms);
-        rows.insert(t.id, row);
-    }
-    (rows, ends.len().max(1))
-}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Grab {
@@ -927,20 +1398,80 @@ enum Grab {
     End,
 }
 
+/// Where a text bar dragged off its lane lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LaneTarget {
+    /// An existing text lane with room.
+    Lane(TrackId),
+    /// A new text lane inserted at this row of the timeline view.
+    New(usize),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BandDrag {
     id: TextId,
     grab: Grab,
     origin: (i64, i64),
-    press_x: f32,
+    press: egui::Pos2,
+    target: Option<LaneTarget>,
 }
 
-/// What the user did in the band this frame; applied by the caller once the
-/// project is no longer borrowed.
+/// Row geometry of the timeline, for dragging text between lanes.
+pub(super) struct LaneRows<'a> {
+    pub top: f32,
+    pub height: f32,
+    pub inset: f32,
+    pub tracks: &'a [Track],
+}
+
+impl LaneRows<'_> {
+    fn row_top(&self, index: usize) -> f32 {
+        self.top + index as f32 * self.height
+    }
+    /// Lane the pointer at `y` drops `range` of text `id` on.
+    fn target(
+        &self,
+        y: f32,
+        own: TrackId,
+        id: TextId,
+        (start, end): (i64, i64),
+        texts: &[TextItem],
+    ) -> Option<LaneTarget> {
+        let own_row = self.tracks.iter().position(|t| t.id == own)?;
+        let rel = (y - self.top) / self.height;
+        let row = rel.floor();
+        if row >= 0.0 && (row as usize) == own_row {
+            return None;
+        }
+        let free = |lane: TrackId| {
+            !texts
+                .iter()
+                .any(|t| t.track == lane && t.id != id && start < t.end_ms && end > t.start_ms)
+        };
+        let within = rel - row;
+        if row >= 0.0 && (0.2..0.8).contains(&within) {
+            if let Some(t) = self
+                .tracks
+                .get(row as usize)
+                .filter(|t| t.kind == TrackKind::Text && free(t.id))
+            {
+                return Some(LaneTarget::Lane(t.id));
+            }
+        }
+        let visual = self.tracks.iter().filter(|t| t.kind.is_visual()).count();
+        let slot = (rel + 0.5).floor().clamp(0.0, visual as f32) as usize;
+        // Dropping right above or below its own lane, alone there, changes nothing.
+        let alone = texts.iter().filter(|t| t.track == own).count() == 1;
+        (!(alone && (slot == own_row || slot == own_row + 1))).then_some(LaneTarget::New(slot))
+    }
+}
+
+/// What the user did on a text lane this frame; applied by the caller once
+/// the project is no longer borrowed.
 #[derive(Debug, PartialEq)]
 pub(super) enum BandAction {
-    /// New layer, at this time or the playhead.
-    Add(Option<i64>),
+    /// New layer at this time (or the playhead), on this lane if it has room.
+    Add(Option<i64>, Option<TrackId>),
     Select(TextId),
     Retime {
         id: TextId,
@@ -949,6 +1480,11 @@ pub(super) enum BandAction {
         /// First frame of the gesture: take an undo snapshot.
         begin: bool,
     },
+    Relane {
+        id: TextId,
+        target: LaneTarget,
+    },
+    Split(TextId),
     Duplicate(TextId),
     Delete(TextId),
     Seek(i64),
@@ -998,100 +1534,110 @@ fn retime(
     }
 }
 
-/// Draws the text band (header cell + bars) into `rect` and handles its
-/// input. `snaps` are times bar edges stick to (playhead, clip edges).
+/// Paints one text bar.
+fn paint_text_bar(
+    painter: &egui::Painter,
+    bar: egui::Rect,
+    item: &TextItem,
+    selected: bool,
+    hot: bool,
+    disabled: bool,
+) {
+    let fill = if selected {
+        theme::CLIP_TEXT_EDGE.gamma_multiply(0.8)
+    } else if hot {
+        theme::CLIP_TEXT.gamma_multiply(1.25)
+    } else {
+        theme::CLIP_TEXT
+    };
+    let fade = if disabled { 0.4 } else { 1.0 };
+    painter.rect_filled(bar, 5.0, fill.gamma_multiply(fade));
+    painter.rect_stroke(
+        bar.shrink(if selected { 1.0 } else { 0.5 }),
+        5.0,
+        if selected {
+            Stroke::new(2.0_f32, theme::ACCENT)
+        } else {
+            Stroke::new(1.0_f32, theme::CLIP_TEXT_EDGE.gamma_multiply(fade))
+        },
+    );
+    let clip = painter.with_clip_rect(
+        bar.shrink2(egui::vec2(6.0, 0.0))
+            .intersect(painter.clip_rect()),
+    );
+    let glyph = egui::pos2(bar.left() + 14.0, bar.center().y);
+    if bar.width() > 34.0 {
+        clip.text(
+            glyph,
+            Align2::CENTER_CENTER,
+            "T",
+            theme::semibold(13.0),
+            theme::TEXT_PRIMARY.gamma_multiply(0.85 * fade),
+        );
+    }
+    let first_line = item.text.lines().next().unwrap_or("").trim();
+    let (label, color) = if first_line.is_empty() {
+        ("Text", theme::TEXT_MUTED)
+    } else {
+        (first_line, theme::TEXT_PRIMARY)
+    };
+    clip.text(
+        egui::pos2(
+            bar.left() + if bar.width() > 34.0 { 26.0 } else { 6.0 },
+            bar.center().y,
+        ),
+        Align2::LEFT_CENTER,
+        label,
+        theme::medium(12.0),
+        color.gamma_multiply(fade),
+    );
+}
+
+/// Draws the bars of one text lane (`lane` = its time area) and handles
+/// their input: drag to move (also onto other text lanes, or between
+/// lanes for a new one), drag an end to trim, double-click empty space
+/// to add text there. `snaps` are times bar edges stick to.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn show_text_band(
+pub(super) fn show_text_lane(
     ui: &mut egui::Ui,
-    rect: egui::Rect,
+    painter: &egui::Painter,
+    lane: egui::Rect,
+    lane_id: TrackId,
+    rows: &LaneRows,
     lanes: editor::Lanes,
     texts: &[TextItem],
     selected: Option<TextId>,
-    playhead: i64,
     snaps: &[i64],
+    disabled: bool,
     drag: &mut Option<BandDrag>,
 ) -> Vec<BandAction> {
     let mut actions = Vec::new();
-    let painter = ui.painter_at(rect);
-    let header = egui::Rect::from_min_max(rect.min, egui::pos2(lanes.left, rect.bottom()));
-    let area = egui::Rect::from_min_max(egui::pos2(lanes.left, rect.top()), rect.max);
-    let bars = painter.with_clip_rect(area);
-    painter.rect_filled(header, 0.0, Color32::from_rgb(23, 24, 29));
-    painter.rect_filled(area, 0.0, theme::BG_HEADER);
-    painter.line_segment(
-        [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0_f32, theme::BORDER),
-    );
-    painter.line_segment(
-        [header.right_top(), header.right_bottom()],
-        Stroke::new(1.0_f32, theme::BORDER),
-    );
-    painter.text(
-        egui::pos2(header.left() + 14.0, header.top() + BAND_ROW / 2.0),
-        Align2::LEFT_CENTER,
-        "Text",
-        theme::medium(12.0),
-        theme::TEXT_SECONDARY,
-    );
-    let plus = egui::Rect::from_center_size(
-        egui::pos2(header.right() - 20.0, header.top() + BAND_ROW / 2.0),
-        egui::vec2(22.0, 20.0),
-    );
-    let add = ui
-        .interact(plus, ui.id().with("text_band_add"), widgets::CLICK)
-        .on_hover_text("Add text at the playhead (T)")
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if add.hovered() {
-        painter.rect_filled(plus, 4.0, theme::BG_BUTTON_HOVER);
-    }
-    painter.text(
-        plus.center(),
-        Align2::CENTER_CENTER,
-        "+",
-        theme::medium(15.0),
-        if add.hovered() {
-            theme::TEXT_PRIMARY
-        } else {
-            theme::TEXT_MUTED
-        },
-    );
-    if add.clicked() {
-        actions.push(BandAction::Add(None));
-    }
-
-    // Empty band: click seeks, double-click adds a layer there.
+    // Empty lane space: click seeks, double-click adds text there.
     let background = ui
-        .interact(area, ui.id().with("text_band_bg"), egui::Sense::click())
+        .interact(
+            lane,
+            ui.id().with(("text_lane_bg", lane_id)),
+            egui::Sense::click(),
+        )
         .on_hover_text_at_pointer("Double-click to add text here");
     if let Some(pos) = background.interact_pointer_pos() {
         if background.double_clicked() {
-            actions.push(BandAction::Add(Some(lanes.time_at(pos.x))));
+            actions.push(BandAction::Add(Some(lanes.time_at(pos.x)), Some(lane_id)));
         } else if background.clicked() {
             actions.push(BandAction::Seek(lanes.time_at(pos.x)));
         }
     }
-    if texts.is_empty() {
-        bars.text(
-            egui::pos2(area.left() + 10.0, area.top() + BAND_ROW / 2.0),
-            Align2::LEFT_CENTER,
-            "Double-click or press T to add text",
-            theme::regular(11.5),
-            theme::TEXT_FAINT,
-        );
-    }
 
-    let (rows, _) = band_rows(texts);
     let reach = (BAND_SNAP / lanes.width * lanes.span as f32).round() as i64;
-    for item in texts {
-        let row = rows.get(&item.id).copied().unwrap_or(0) as f32;
+    for item in texts.iter().filter(|t| t.track == lane_id) {
         let x0 = lanes.x_of(item.start_ms);
         let x1 = lanes.x_of(item.end_ms).max(x0 + 4.0);
         let bar = egui::Rect::from_min_max(
-            egui::pos2(x0, rect.top() + row * BAND_ROW + 3.0),
-            egui::pos2(x1, rect.top() + (row + 1.0) * BAND_ROW - 2.0),
+            egui::pos2(x0, lane.top() + rows.inset),
+            egui::pos2(x1, lane.bottom() - rows.inset),
         );
         let response = ui.interact(
-            bar.intersect(area),
+            bar.intersect(lane),
             ui.id().with(("text_bar", item.id)),
             egui::Sense::click_and_drag(),
         );
@@ -1119,15 +1665,19 @@ pub(super) fn show_text_band(
         if response.clicked() {
             actions.push(BandAction::Select(item.id));
         }
+        if response.double_clicked() {
+            actions.push(BandAction::Select(item.id));
+        }
         if response.drag_started() {
-            let press_x = ui
+            let press = ui
                 .input(|i| i.pointer.press_origin())
-                .map_or(bar.center().x, |p| p.x);
+                .unwrap_or(bar.center());
             *drag = Some(BandDrag {
                 id: item.id,
-                grab: grab_at(press_x),
+                grab: grab_at(press.x),
                 origin: (item.start_ms, item.end_ms),
-                press_x,
+                press,
+                target: None,
             });
             actions.push(BandAction::Select(item.id));
         }
@@ -1136,7 +1686,7 @@ pub(super) fn show_text_band(
             response.interact_pointer_pos(),
         ) {
             if response.dragged() {
-                let delta = ((pos.x - d.press_x) / lanes.width * lanes.span as f32).round() as i64;
+                let delta = ((pos.x - d.press.x) / lanes.width * lanes.span as f32).round() as i64;
                 let mut edges: Vec<i64> = snaps.to_vec();
                 edges.extend(
                     texts
@@ -1149,7 +1699,25 @@ pub(super) fn show_text_band(
                 } else {
                     reach
                 };
-                let (start, end) = retime(d.grab, d.origin, delta, &edges, reach);
+                let (mut start, mut end) = retime(d.grab, d.origin, delta, &edges, reach);
+                // Trims stop at the lane neighbours.
+                let prev_end = texts
+                    .iter()
+                    .filter(|t| t.track == lane_id && t.id != item.id && t.end_ms <= d.origin.0)
+                    .map(|t| t.end_ms)
+                    .max()
+                    .unwrap_or(0);
+                let next_start = texts
+                    .iter()
+                    .filter(|t| t.track == lane_id && t.id != item.id && t.start_ms >= d.origin.1)
+                    .map(|t| t.start_ms)
+                    .min()
+                    .unwrap_or(i64::MAX);
+                match d.grab {
+                    Grab::Start => start = start.max(prev_end),
+                    Grab::End => end = end.min(next_start),
+                    Grab::Move => {}
+                }
                 if (start, end) != (item.start_ms, item.end_ms) || response.drag_started() {
                     actions.push(BandAction::Retime {
                         id: item.id,
@@ -1158,76 +1726,113 @@ pub(super) fn show_text_band(
                         begin: response.drag_started(),
                     });
                 }
+                if d.grab == Grab::Move {
+                    let moved_far = (pos.y - d.press.y).abs() > rows.height * 0.35;
+                    let target = if moved_far {
+                        rows.target(pos.y, lane_id, item.id, (start, end), texts)
+                    } else {
+                        None
+                    };
+                    if let Some(active) = drag.as_mut() {
+                        active.target = target;
+                    }
+                }
             }
         }
+        let target = drag.filter(|d| d.id == item.id).and_then(|d| d.target);
         if response.drag_stopped() {
+            let own_free = !texts.iter().any(|t| {
+                t.track == lane_id
+                    && t.id != item.id
+                    && item.start_ms < t.end_ms
+                    && item.end_ms > t.start_ms
+            });
+            // Moved onto a neighbour without leaving the lane: open a
+            // fresh lane right above instead of overlapping.
+            let target = target.or_else(|| {
+                (!own_free)
+                    .then(|| rows.tracks.iter().position(|t| t.id == lane_id))
+                    .flatten()
+                    .map(LaneTarget::New)
+            });
+            if let Some(target) = target {
+                actions.push(BandAction::Relane {
+                    id: item.id,
+                    target,
+                });
+            }
             *drag = None;
         }
         response.context_menu(|ui| {
-            if ui.button("Duplicate").clicked() {
+            ui.set_width(200.0);
+            if widgets::menu_item(ui, "Split at playhead", Some("S")).clicked() {
+                actions.push(BandAction::Split(item.id));
+                ui.close_menu();
+            }
+            if widgets::menu_item(ui, "Duplicate", None).clicked() {
                 actions.push(BandAction::Duplicate(item.id));
                 ui.close_menu();
             }
-            if ui.button("Delete").clicked() {
+            widgets::menu_separator(ui);
+            if widgets::menu_item(ui, "Delete", Some("Del")).clicked() {
                 actions.push(BandAction::Delete(item.id));
                 ui.close_menu();
             }
         });
 
         let is_selected = selected == Some(item.id);
-        let fill = if is_selected {
-            theme::CLIP_TEXT_EDGE.gamma_multiply(0.75)
-        } else if response.hovered() {
-            theme::CLIP_TEXT.gamma_multiply(1.25)
-        } else {
-            theme::CLIP_TEXT
-        };
-        bars.rect_filled(bar, 4.0, fill);
-        bars.rect_stroke(
-            bar.shrink(0.5),
-            4.0,
-            if is_selected {
-                Stroke::new(1.5_f32, theme::ACCENT)
-            } else {
-                Stroke::new(1.0_f32, theme::CLIP_TEXT_EDGE)
-            },
-        );
-        let first_line = item.text.lines().next().unwrap_or("").trim();
-        let (label, color) = if first_line.is_empty() {
-            ("Text", theme::TEXT_MUTED)
-        } else {
-            (first_line, theme::TEXT_PRIMARY)
-        };
-        bars.with_clip_rect(bar.shrink2(egui::vec2(6.0, 0.0)).intersect(area))
-            .text(
-                egui::pos2(bar.left() + 8.0, bar.center().y),
-                Align2::LEFT_CENTER,
-                label,
-                theme::medium(11.5),
-                color,
-            );
-    }
-
-    let x = lanes.x_of(playhead);
-    if (area.left()..=area.right()).contains(&x) {
-        bars.line_segment(
-            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            Stroke::new(1.5_f32, theme::PLAYHEAD),
-        );
+        let hot = response.hovered() || active.is_some();
+        match target {
+            None => paint_text_bar(painter, bar, item, is_selected, hot, disabled),
+            Some(target) => {
+                // Lifted out of the lane: draw it where it will land.
+                let (top, insert) = match target {
+                    LaneTarget::Lane(id) => (
+                        rows.tracks
+                            .iter()
+                            .position(|t| t.id == id)
+                            .map(|i| rows.row_top(i)),
+                        false,
+                    ),
+                    LaneTarget::New(slot) => (Some(rows.row_top(slot) - rows.height * 0.5), true),
+                };
+                if let Some(top) = top {
+                    let float = painter.with_clip_rect(
+                        egui::Rect::from_min_max(
+                            egui::pos2(lane.left(), f32::NEG_INFINITY),
+                            egui::pos2(lane.right(), f32::INFINITY),
+                        )
+                        .intersect(ui.clip_rect()),
+                    );
+                    if insert {
+                        let y = top + rows.height * 0.5;
+                        float.line_segment(
+                            [egui::pos2(lane.left(), y), egui::pos2(lane.right(), y)],
+                            Stroke::new(2.0_f32, theme::ACCENT),
+                        );
+                    }
+                    let ghost = egui::Rect::from_min_max(
+                        egui::pos2(bar.left(), top + rows.inset),
+                        egui::pos2(bar.right(), top + rows.height - rows.inset),
+                    );
+                    paint_text_bar(&float, ghost, item, true, true, false);
+                }
+            }
+        }
     }
     actions
 }
 
 impl ClipperApp {
     /// Applies what happened in the timeline text band.
-    pub(super) fn apply_band_actions(&mut self, actions: Vec<BandAction>) {
+    pub(super) fn apply_band_actions(&mut self, actions: Vec<BandAction>, view: &[Track]) {
         for action in actions {
             match action {
-                BandAction::Add(at) => {
+                BandAction::Add(at, lane) => {
                     if let Some(ms) = at {
                         self.seek_to(ms);
                     }
-                    self.add_text_layer();
+                    self.add_text_layer_on(lane);
                 }
                 BandAction::Select(id) => {
                     let Some(p) = &mut self.project else { continue };
@@ -1255,6 +1860,30 @@ impl ClipperApp {
                         (t.start_ms, t.end_ms) = (start, end);
                     }
                 }
+                BandAction::Relane { id, target } => {
+                    let Some(p) = &mut self.project else { continue };
+                    let lane = match target {
+                        LaneTarget::Lane(lane) => lane,
+                        LaneTarget::New(slot) => {
+                            let index = view
+                                .get(slot)
+                                .and_then(|t| p.tracks.iter().position(|x| x.id == t.id))
+                                .unwrap_or(p.tracks.len());
+                            p.new_track(TrackKind::Text, index)
+                        }
+                    };
+                    if let Some(t) = p.text_mut(id) {
+                        t.track = lane;
+                    }
+                    p.prune_tracks();
+                }
+                BandAction::Split(id) => {
+                    self.push_undo();
+                    if let Some(p) = &mut self.project {
+                        p.select_text(Some(id));
+                        p.split_text(id);
+                    }
+                }
                 BandAction::Duplicate(id) => {
                     let Some(source) = self.project.as_ref().and_then(|p| p.text(id)).cloned()
                     else {
@@ -1267,6 +1896,14 @@ impl ClipperApp {
                         copy.id = p.id_gen.next_text();
                         copy.start_ms = copy.end_ms;
                         copy.end_ms = copy.start_ms + len;
+                        if !p.text_lane_free(copy.track, copy.start_ms, copy.end_ms, None) {
+                            let index = p
+                                .tracks
+                                .iter()
+                                .position(|t| t.id == copy.track)
+                                .unwrap_or(0);
+                            copy.track = p.new_track(TrackKind::Text, index);
+                        }
                         let new_id = copy.id;
                         p.texts.push(copy);
                         p.select_text(Some(new_id));
@@ -1279,11 +1916,13 @@ impl ClipperApp {
                         if p.selected_text == Some(id) {
                             p.selected_text = None;
                         }
+                        p.prune_tracks();
                     }
                 }
                 BandAction::Seek(ms) => {
                     if let Some(p) = &mut self.project {
                         p.selected_text = None;
+                        p.selected_clips.clear();
                     }
                     self.seek_to(ms);
                 }
@@ -1299,98 +1938,41 @@ impl ClipperApp {
     }
 }
 
-/// Shared compact timing control for text and clip animations.
+/// Shared compact timing control for text and clip animations: a label,
+/// a slider filling the row and the length in seconds.
 pub(super) fn duration_control(ui: &mut egui::Ui, label: &str, ms: &mut f32) {
+    ui.add_space(6.0);
+    let width = ui.available_width();
     let mut seconds = *ms / 1000.0;
-    if ui
-        .add(
-            egui::Slider::new(&mut seconds, 0.05..=5.0)
-                .logarithmic(true)
-                .fixed_decimals(2)
-                .suffix(" s")
-                .text(label),
-        )
-        .on_hover_text("Shorter = faster. Short clips automatically shorten the animation to fit.")
-        .changed()
-    {
+    let changed = ui
+        .horizontal(|ui| {
+            ui.label(
+                RichText::new(label)
+                    .font(theme::regular(12.0))
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.spacing_mut().slider_width = (width - 140.0).max(60.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Slider::new(&mut seconds, 0.05..=5.0)
+                        .logarithmic(true)
+                        .fixed_decimals(2)
+                        .suffix(" s"),
+                )
+                .on_hover_text("Shorter = faster. Short clips shorten the animation to fit.")
+                .changed()
+            })
+            .inner
+        })
+        .inner;
+    if changed {
         *ms = seconds * 1000.0;
     }
-}
-
-fn color_mix(
-    ui: &mut egui::Ui,
-    label: &str,
-    rgb: &mut [u8; 3],
-    gradient: &mut Option<text::Gradient>,
-) {
-    ui.push_id(label, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(label);
-            ui.color_edit_button_srgb(rgb)
-                .on_hover_text(format!("{label} color"));
-            let mut enabled = gradient.is_some();
-            if ui.checkbox(&mut enabled, "Gradient").changed() {
-                *gradient = enabled.then_some(text::Gradient {
-                    end: [255, 120, 210],
-                    angle: 90.0,
-                });
-            }
-            if let Some(g) = gradient {
-                ui.color_edit_button_srgb(&mut g.end)
-                    .on_hover_text("End color");
-            }
-        });
-        if let Some(g) = gradient {
-            ui.horizontal(|ui| {
-                for (name, a, b) in [
-                    ("Sunset", [255, 191, 65], [255, 62, 137]),
-                    ("Ice", [85, 241, 255], [100, 99, 255]),
-                    ("Candy", [255, 132, 229], [122, 255, 208]),
-                ] {
-                    if ui.small_button(name).clicked() {
-                        *rgb = a;
-                        g.end = b;
-                    }
-                }
-            });
-            ui.add(
-                egui::Slider::new(&mut g.angle, 0.0..=360.0)
-                    .suffix("°")
-                    .text("Direction"),
-            );
-        }
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn layer(id: u32, start: i64, end: i64) -> TextItem {
-        TextItem::new(TextId(id), start, end)
-    }
-
-    #[test]
-    fn overlapping_layers_stack_and_free_rows_are_reused() {
-        let texts = [
-            layer(1, 0, 3_000),
-            layer(2, 1_000, 2_000),
-            layer(3, 3_000, 4_000),
-        ];
-        let (rows, count) = band_rows(&texts);
-        assert_eq!(count, 2);
-        assert_eq!(rows[&TextId(1)], 0);
-        assert_eq!(rows[&TextId(2)], 1);
-        // Starts exactly when the first ends: back on the top row.
-        assert_eq!(rows[&TextId(3)], 0);
-        assert_eq!(band_rows(&[]).1, 1);
-    }
-
-    #[test]
-    fn row_count_is_capped() {
-        let texts: Vec<_> = (0..10).map(|i| layer(i, 0, 5_000)).collect();
-        assert_eq!(band_rows(&texts).1, BAND_MAX_ROWS);
-    }
 
     #[test]
     fn bar_drags_snap_and_keep_a_minimum_length() {

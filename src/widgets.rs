@@ -30,6 +30,7 @@ pub enum Icon {
     SpeakerMuted,
     ChevronDown,
     Check,
+    Close,
 }
 
 /// Points along a circular arc, for the speaker's sound waves.
@@ -139,6 +140,11 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 PathStroke::new(stroke.width, color),
             ));
         }
+        Icon::Close => {
+            let r = s * 0.22;
+            painter.line_segment([c + vec2(-r, -r), c + vec2(r, r)], stroke);
+            painter.line_segment([c + vec2(-r, r), c + vec2(r, -r)], stroke);
+        }
     }
 }
 
@@ -148,6 +154,60 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, on: bool, on_color: Color
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), CLICK);
     paint_icon_button(ui, rect, &response, icon, on, on_color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Destination highlight for files dragged in from outside: a faint tint,
+/// a hairline accent border and, optionally, a centered label with a
+/// painted "drop" glyph. `fade` (0..1) animates it in and out.
+pub fn paint_drop_zone(painter: &egui::Painter, rect: egui::Rect, fade: f32, label: Option<&str>) {
+    if fade <= 0.0 {
+        return;
+    }
+    painter.rect_filled(rect, 8.0, theme::ACCENT.gamma_multiply(0.07 * fade));
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        8.0,
+        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.55 * fade)),
+    );
+    let Some(label) = label else { return };
+    let galley = painter.layout_no_wrap(label.to_owned(), theme::medium(12.5), theme::TEXT_PRIMARY);
+    let pill =
+        egui::Rect::from_center_size(rect.center(), egui::vec2(galley.size().x + 52.0, 36.0));
+    painter.rect_filled(pill, 18.0, theme::BG_MODAL.gamma_multiply(fade));
+    painter.rect_stroke(
+        pill,
+        18.0,
+        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.35 * fade)),
+    );
+    // Arrow into a tray.
+    let c = egui::pos2(pill.left() + 22.0, pill.center().y);
+    let stroke = Stroke::new(1.6_f32, theme::ACCENT.gamma_multiply(fade));
+    painter.line_segment(
+        [c + egui::vec2(0.0, -7.0), c + egui::vec2(0.0, 2.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [c + egui::vec2(-3.5, -1.5), c + egui::vec2(0.0, 2.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [c + egui::vec2(3.5, -1.5), c + egui::vec2(0.0, 2.0)],
+        stroke,
+    );
+    painter.add(egui::Shape::line(
+        vec![
+            c + egui::vec2(-6.5, 2.5),
+            c + egui::vec2(-6.5, 6.5),
+            c + egui::vec2(6.5, 6.5),
+            c + egui::vec2(6.5, 2.5),
+        ],
+        stroke,
+    ));
+    painter.galley(
+        egui::pos2(pill.left() + 38.0, pill.center().y - galley.size().y * 0.5),
+        galley,
+        theme::TEXT_PRIMARY.gamma_multiply(fade),
+    );
 }
 
 /// Paints an icon button over an already-allocated rect (for buttons that
@@ -179,6 +239,59 @@ pub fn paint_icon_button(
         theme::TEXT_SECONDARY
     };
     paint_icon(ui.painter(), rect.shrink(rect.width() * 0.2), icon, color);
+}
+
+/// Small "▶ Preview" pill for playing back an effect in place.
+pub fn preview_button(ui: &mut Ui) -> Response {
+    let font = theme::medium(11.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap("Preview".to_owned(), font, theme::TEXT_PRIMARY);
+    let size = vec2(galley.size().x + 34.0, 24.0);
+    let (rect, response) = ui.allocate_exact_size(size, CLICK);
+    let hot = response.hovered();
+    let pressed = response.is_pointer_button_down_on();
+    let fill = if pressed {
+        theme::BG_BUTTON_ACTIVE
+    } else if hot {
+        theme::BG_BUTTON_HOVER
+    } else {
+        theme::BG_BUTTON
+    };
+    ui.painter().rect_filled(rect, 12.0, fill);
+    ui.painter().rect_stroke(
+        rect.shrink(0.5),
+        12.0,
+        Stroke::new(
+            1.0_f32,
+            if hot {
+                theme::ACCENT.gamma_multiply(0.7)
+            } else {
+                theme::BORDER
+            },
+        ),
+    );
+    let icon = Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(10.0, 10.0));
+    paint_icon(
+        ui.painter(),
+        icon,
+        Icon::Play,
+        if hot {
+            theme::ACCENT
+        } else {
+            theme::TEXT_SECONDARY
+        },
+    );
+    ui.painter().galley(
+        pos2(rect.left() + 24.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        if hot {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_SECONDARY
+        },
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// The circular transport button: filled, the one strong shape in the bar.
@@ -514,18 +627,44 @@ pub fn segmented(
     options: &[(&str, &str)],
     selected: usize,
 ) -> Option<usize> {
+    segmented_sized(ui, id, options, selected, None)
+}
+
+/// `segmented` stretched to `width`, options sharing it equally.
+pub fn segmented_fill(
+    ui: &mut Ui,
+    id: &str,
+    options: &[(&str, &str)],
+    selected: usize,
+    width: f32,
+) -> Option<usize> {
+    segmented_sized(ui, id, options, selected, Some(width))
+}
+
+fn segmented_sized(
+    ui: &mut Ui,
+    id: &str,
+    options: &[(&str, &str)],
+    selected: usize,
+    fill: Option<f32>,
+) -> Option<usize> {
     let font = theme::medium(12.5);
-    let widths: Vec<f32> = options
-        .iter()
-        .map(|(label, _)| {
-            ui.painter()
-                .layout_no_wrap((*label).to_owned(), font.clone(), theme::TEXT_PRIMARY)
-                .size()
-                .x
-                + 28.0
-        })
-        .collect();
     let pad = 3.0;
+    let widths: Vec<f32> = match fill {
+        Some(width) => {
+            vec![((width - pad * 2.0) / options.len().max(1) as f32).floor(); options.len()]
+        }
+        None => options
+            .iter()
+            .map(|(label, _)| {
+                ui.painter()
+                    .layout_no_wrap((*label).to_owned(), font.clone(), theme::TEXT_PRIMARY)
+                    .size()
+                    .x
+                    + 24.0
+            })
+            .collect(),
+    };
     let total = vec2(widths.iter().sum::<f32>() + pad * 2.0, 30.0);
     let (outer, _) = ui.allocate_exact_size(total, Sense::hover());
     ui.painter().rect_filled(outer, 8.0, theme::BG_PREVIEW);

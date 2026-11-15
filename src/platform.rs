@@ -119,6 +119,85 @@ pub fn show_startup_error(error: &str) {
     eprintln!("{message}");
 }
 
+/// Pointer position over `window` in egui points, read from the OS. During
+/// a file drag from Explorer or an X11 file manager the window gets no
+/// pointer events (winit reports none either), so egui's pointer is stale;
+/// this lets a drop target the timeline instead of only the media bin.
+/// `None` where the platform can't tell (Wayland).
+pub fn drag_cursor(
+    window: &impl raw_window_handle::HasWindowHandle,
+    pixels_per_point: f32,
+) -> Option<egui::Pos2> {
+    use raw_window_handle::RawWindowHandle;
+    let handle = window.window_handle().ok()?;
+    let (x, y) = match handle.as_raw() {
+        #[cfg(windows)]
+        RawWindowHandle::Win32(win32) => {
+            #[repr(C)]
+            struct Point {
+                x: i32,
+                y: i32,
+            }
+            #[link(name = "user32")]
+            extern "system" {
+                fn GetCursorPos(point: *mut Point) -> i32;
+                fn ScreenToClient(hwnd: *mut std::ffi::c_void, point: *mut Point) -> i32;
+            }
+            let mut point = Point { x: 0, y: 0 };
+            // SAFETY: plain Win32 calls with a valid out-pointer and our
+            // own live window handle.
+            let ok = unsafe {
+                GetCursorPos(&mut point) != 0
+                    && ScreenToClient(win32.hwnd.get() as *mut _, &mut point) != 0
+            };
+            ok.then_some((point.x as f32, point.y as f32))?
+        }
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xlib(xlib) => x11_pointer(xlib.window)?,
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xcb(xcb) => x11_pointer(u64::from(xcb.window.get()))?,
+        _ => return None,
+    };
+    Some(egui::pos2(x, y) / pixels_per_point.max(0.1))
+}
+
+#[cfg(target_os = "linux")]
+fn x11_pointer(window: u64) -> Option<(f32, f32)> {
+    use std::sync::OnceLock;
+    use x11_dl::xlib;
+    // One private connection, opened on first use.
+    struct Conn(xlib::Xlib, usize);
+    // SAFETY: the display is only touched from the UI thread.
+    unsafe impl Send for Conn {}
+    unsafe impl Sync for Conn {}
+    static CONN: OnceLock<Option<Conn>> = OnceLock::new();
+    let conn = CONN
+        .get_or_init(|| {
+            let lib = xlib::Xlib::open().ok()?;
+            // SAFETY: XOpenDisplay(NULL) opens $DISPLAY or returns null.
+            let display = unsafe { (lib.XOpenDisplay)(std::ptr::null()) };
+            (!display.is_null()).then_some(Conn(lib, display as usize))
+        })
+        .as_ref()?;
+    let (mut root, mut child) = (0, 0);
+    let (mut rx, mut ry, mut wx, mut wy, mut mask) = (0, 0, 0, 0, 0);
+    // SAFETY: valid display, our window id, and out-pointers on the stack.
+    let same_screen = unsafe {
+        (conn.0.XQueryPointer)(
+            conn.1 as *mut xlib::Display,
+            window as xlib::Window,
+            &mut root,
+            &mut child,
+            &mut rx,
+            &mut ry,
+            &mut wx,
+            &mut wy,
+            &mut mask,
+        )
+    };
+    (same_screen != 0).then_some((wx as f32, wy as f32))
+}
+
 /// Swaps the window's icons for the multi-size icon embedded in the
 /// executable (resource 1, see `build.rs`). winit only accepts a single
 /// RGBA image and lets Windows scale it, which smears the 16 px title-bar

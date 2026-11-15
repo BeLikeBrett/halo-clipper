@@ -19,6 +19,8 @@ pub struct Segment {
     pub gain: f32,
     pub transform: Transform,
     pub animation: crate::animation::Animation,
+    /// Lane index, 0 = top. Video paints from the deepest lane up.
+    pub depth: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Composition {
@@ -29,8 +31,10 @@ pub struct Composition {
     pub background: crate::framing::Background,
     /// Video in bottom-to-top paint order, then audio in any order.
     pub segments: Vec<Segment>,
-    /// Text layers, painted above all video in list order.
+    /// Text layers. Each paints at its lane's depth among the video
+    /// (`text_depth`; missing = above everything), in list order on ties.
     pub texts: Vec<TextItem>,
+    pub text_depth: std::collections::HashMap<crate::text::TextId, usize>,
 }
 impl Composition {
     /// Output frame size and rate for `encode`.
@@ -137,7 +141,34 @@ impl Composition {
             }
         }
 
-        for (i, s) in segments.iter().enumerate() {
+        // One paint order for video and text: deepest lane first, video
+        // before text on a tie, list order otherwise (stable sort).
+        let mut order: Vec<(usize, bool, usize)> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.depth, false, i))
+            .chain(
+                texts
+                    .iter()
+                    .enumerate()
+                    .map(|(k, t)| (self.text_depth.get(&t.id).copied().unwrap_or(0), true, k)),
+            )
+            .collect();
+        order.sort_by_key(|(depth, text, _)| (std::cmp::Reverse(*depth), *text));
+        for (_, is_text, i) in order {
+            if is_text {
+                let (k, t) = (i, &texts[i]);
+                let input = segments.len() + k;
+                let start = t.start_ms as f64 / 1000.0;
+                let end = t.end_ms as f64 / 1000.0;
+                graph.push_str(&format!(
+                    "[{input}:v]format=rgba,setpts=PTS-STARTPTS+{start:.6}/TB[text{k}];[{current}][text{k}]overlay=x={}:y={}:format=rgb:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[titled{k}];",
+                    t.x, t.y,
+                ));
+                current = format!("titled{k}");
+                continue;
+            }
+            let s = segments[i];
             let start = s.start_ms as f64 / 1000.0;
             let end = s.end_ms as f64 / 1000.0;
             let speed = s.speed.clamp(0.25, 4.0);
@@ -164,16 +195,6 @@ impl Composition {
                 graph.push_str(&format!(",setpts=PTS+{start:.6}/TB[v{i}];[{current}][v{i}]overlay=x='W*{:.6}-w/2+W*({dx})':y='H*{:.6}-h/2':format=rgb:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[mix{i}];", t.x, t.y));
                 current = format!("mix{i}");
             }
-        }
-        for (k, t) in texts.iter().enumerate() {
-            let input = segments.len() + k;
-            let start = t.start_ms as f64 / 1000.0;
-            let end = t.end_ms as f64 / 1000.0;
-            graph.push_str(&format!(
-                "[{input}:v]format=rgba,setpts=PTS-STARTPTS+{start:.6}/TB[text{k}];[{current}][text{k}]overlay=x={}:y={}:format=rgb:eof_action=pass:repeatlast=0:enable='gte(t,{start:.6})*lt(t,{end:.6})'[titled{k}];",
-                t.x, t.y,
-            ));
-            current = format!("titled{k}");
         }
         let bridge = if encode.video_codec.needs_vaapi_upload() {
             "format=nv12,hwupload"
@@ -267,6 +288,7 @@ mod tests {
             gain: 1.0,
             transform: Transform::default(),
             animation: Default::default(),
+            depth: 0,
         }
     }
     fn render(c: Composition, path: PathBuf) -> PathBuf {
@@ -356,6 +378,7 @@ mod tests {
                 background: Default::default(),
                 segments: vec![top],
                 texts: vec![],
+                text_depth: Default::default(),
             };
             let path = render(c, d.join(format!("border-{effect:?}.mp4")));
             let start = pixel(&path, "0", 2, 2);
@@ -399,6 +422,7 @@ mod tests {
                 background: Default::default(),
                 segments: vec![top],
                 texts: vec![],
+                text_depth: Default::default(),
             };
             let path = render(c, d.join(format!("mixed-{intro:?}-{outro:?}.mp4")));
             let middle = pixel(&path, "1.0", 32, 32);
@@ -436,6 +460,7 @@ mod tests {
                 background: Default::default(),
                 segments: vec![bottom, top],
                 texts: Vec::new(),
+                text_depth: Default::default(),
             };
             let path = render(c, d.join(format!("effect-{effect:?}.mp4")));
             // Layer before/after, settled middle, and no lingering white wash.
@@ -466,7 +491,7 @@ mod tests {
         let black = video(&d, "text_base.mp4", "black");
         // A white box with white text: solid, so the probe pixel at the
         // layer's center is unambiguous.
-        let mut title = TextItem::new(TextId(1), 1000, 2000);
+        let mut title = TextItem::new(TextId(1), crate::track::TrackId(0), 1000, 2000);
         title.text = "Hi".into();
         title.size = 0.3;
         title.x = 0.75;
@@ -484,6 +509,7 @@ mod tests {
             background: Default::default(),
             segments: vec![segment(black, 0, 3000)],
             texts: vec![title],
+            text_depth: Default::default(),
         };
         let path = render(c, d.join("text_out.mp4"));
         let lit = |time, x, y| pixel(&path, time, x, y).iter().all(|v| *v > 200);
@@ -510,6 +536,7 @@ mod tests {
             background: Default::default(),
             segments: vec![base, top],
             texts: Vec::new(),
+            text_depth: Default::default(),
         };
         let path = render(c.clone(), d.join("out.mp4"));
         let before = pixel(&path, "0.5", 32, 32);
@@ -557,6 +584,7 @@ mod tests {
             background: Default::default(),
             segments: vec![segment(source, 0, 1000)],
             texts: Vec::new(),
+            text_depth: Default::default(),
         };
         let fit = render(c.clone(), d.join("fit.mp4"));
         assert!(pixel(&fit, "0.5", 5, 5).iter().all(|v| *v < 20));
@@ -598,6 +626,7 @@ mod tests {
             background: crate::framing::Background::Blur,
             segments: vec![base, top],
             texts: Vec::new(),
+            text_depth: Default::default(),
         };
         let path = render(c, d.join("fallback.mp4"));
         assert!(pixel(&path, "0.5", 4, 4)[0] > 200); // behind the blue foreground, base remains the canvas
@@ -636,6 +665,7 @@ mod tests {
             background: Default::default(),
             segments: vec![s],
             texts: Vec::new(),
+            text_depth: Default::default(),
         };
         let path = render(c, d.join("audio.mp4"));
         let out = crate::platform::command("ffmpeg")
@@ -685,6 +715,7 @@ mod window_placement_tests {
                 speed: 1.0,
                 gain: 1.0,
                 animation: Default::default(),
+                depth: 0,
                 transform: Transform {
                     fit: Default::default(),
                     scale: 0.5,
@@ -694,6 +725,7 @@ mod window_placement_tests {
                 },
             }],
             texts: Vec::new(),
+            text_depth: Default::default(),
         };
         let settings = EncodeSettings::default_for_source(1920, 1080);
         let command = c
@@ -707,5 +739,66 @@ mod window_placement_tests {
         assert!(graph.contains("W*1.100000-w/2"));
         assert!(graph.contains("H*-0.100000-h/2"));
         assert!(graph.contains("scale=w=960:h=540"));
+    }
+
+    #[test]
+    fn text_on_a_lower_lane_is_painted_under_the_video_above_it() {
+        use crate::text::{TextId, TextItem};
+        let segment = |depth| Segment {
+            source: PathBuf::from("v.mp4"),
+            audio_index: None,
+            start_ms: 0,
+            end_ms: 1000,
+            src_start_ms: 0,
+            src_end_ms: 1000,
+            speed: 1.0,
+            gain: 1.0,
+            animation: Default::default(),
+            depth,
+            transform: Default::default(),
+        };
+        let title = TextItem::new(TextId(7), crate::track::TrackId(9), 0, 1000);
+        let layer = crate::textrender::ExportLayer {
+            id: TextId(7),
+            list: PathBuf::from("t.ffconcat"),
+            fps: 30.0,
+            x: 0,
+            y: 0,
+            start_ms: 0,
+            end_ms: 1000,
+        };
+        let graph_for = |text_depth: usize| {
+            let c = Composition {
+                width: 640,
+                height: 360,
+                fps: 30.0,
+                duration_ms: 1000,
+                background: Default::default(),
+                // Lane 2 (bottom) then lane 0 (top), as Project emits them.
+                segments: vec![segment(2), segment(0)],
+                texts: vec![title.clone()],
+                text_depth: [(TextId(7), text_depth)].into_iter().collect(),
+            };
+            let settings = EncodeSettings::default_for_source(640, 360);
+            let command = c
+                .command(
+                    std::path::Path::new("out.mp4"),
+                    &settings,
+                    std::slice::from_ref(&layer),
+                )
+                .unwrap();
+            let args: Vec<_> = command
+                .get_args()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            args[args.iter().position(|s| s == "-filter_complex").unwrap() + 1].clone()
+        };
+        // Between the lanes: over the bottom video, under the top one.
+        let middle = graph_for(1);
+        assert!(middle.contains("[mix0][text0]overlay"), "{middle}");
+        assert!(middle.contains("[titled0][v1]overlay"), "{middle}");
+        // On top of everything.
+        let top = graph_for(0);
+        assert!(top.contains("[mix1][text0]overlay"), "{top}");
     }
 }

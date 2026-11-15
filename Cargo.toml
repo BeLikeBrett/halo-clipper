@@ -1,6 +1,6 @@
 [package]
 name = "halo_clipper"
-version = "0.10.5"
+version = "0.10.6"
 edition = "2021"
 description = "Halo Clipper — fast, native Windows and Linux video editor"
 license = "MIT"
@@ -34,8 +34,11 @@ semver = "1"
 ab_glyph = "0.2"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
 
-[target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pointer position during X11 file drags (winit reports none).
+x11-dl = "2.21"
 
 [build-dependencies]
 winresource = "0.1"

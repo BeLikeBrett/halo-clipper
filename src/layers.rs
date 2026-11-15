@@ -153,7 +153,11 @@ impl Project {
         }
     }
     pub(super) fn next_layer_name(&self, kind: TrackKind) -> String {
-        let prefix = if kind == TrackKind::Video { 'V' } else { 'A' };
+        let prefix = match kind {
+            TrackKind::Video => 'V',
+            TrackKind::Audio => 'A',
+            TrackKind::Text => 'T',
+        };
         let next = self
             .tracks
             .iter()
@@ -175,12 +179,8 @@ impl Project {
             source_audio_index: None,
             source: None,
         };
-        let video_count = self
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Video)
-            .count();
-        let index = if kind == TrackKind::Video {
+        let video_count = self.tracks.iter().filter(|t| t.kind.is_visual()).count();
+        let index = if kind.is_visual() {
             index.min(video_count)
         } else {
             index.max(video_count).min(self.tracks.len())
@@ -290,8 +290,10 @@ impl Project {
                 .retain(|id| self.clips.iter().any(|c| c.id == *id));
         }
         self.groups.retain(|_, g| !g.members.is_empty());
-        self.tracks
-            .retain(|t| self.clips.iter().any(|c| c.track_id == t.id));
+        self.tracks.retain(|t| {
+            self.clips.iter().any(|c| c.track_id == t.id)
+                || self.texts.iter().any(|x| x.track == t.id)
+        });
     }
     pub(super) fn reorder_track(&mut self, id: TrackId, index: usize) {
         let Some(old) = self.tracks.iter().position(|t| t.id == id) else {
@@ -299,12 +301,8 @@ impl Project {
         };
         let track = self.tracks.remove(old);
         let index = if index > old { index - 1 } else { index };
-        let videos = self
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Video)
-            .count();
-        let index = if track.kind == TrackKind::Video {
+        let videos = self.tracks.iter().filter(|t| t.kind.is_visual()).count();
+        let index = if track.kind.is_visual() {
             index.min(videos)
         } else {
             index.max(videos).min(self.tracks.len())
@@ -430,6 +428,45 @@ impl ClipperApp {
                 errors.len(),
                 errors[0]
             )
+        };
+    }
+
+    /// Files dropped onto the Advanced timeline: imported (or reused from
+    /// Media) and placed one after another from `start` on a new row at
+    /// view `index`. One undo step.
+    pub(super) fn drop_on_timeline(&mut self, paths: Vec<PathBuf>, start: i64, index: usize) {
+        let mut errors = Vec::new();
+        let mut placed = 0;
+        let mut at = start;
+        self.push_undo();
+        for path in paths {
+            crate::diagnostics::register_media(&path);
+            let info = match media::probe_layer(&path) {
+                Ok(info) if path.is_file() => info,
+                Ok(_) => {
+                    errors.push("Drop video or audio files, rather than folders.".to_string());
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("Could not import: {e:#}"));
+                    continue;
+                }
+            };
+            let Some(p) = &mut self.project else { return };
+            let length = info.duration_ms;
+            let id = p.import_asset(LayerSource { path, media: info });
+            p.place_asset(id, at, None, index);
+            at += length;
+            placed += 1;
+        }
+        if placed == 0 {
+            self.undo_stack.pop();
+        } else {
+            self.live.pause();
+        }
+        self.status = match (placed, errors.first()) {
+            (_, None) => format!("Added {placed} to the timeline."),
+            (_, Some(e)) => format!("Added {placed}. {} file(s) skipped. {e}", errors.len()),
         };
     }
 

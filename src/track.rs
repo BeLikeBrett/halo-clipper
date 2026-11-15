@@ -29,6 +29,17 @@ pub struct TrackId(pub u32);
 pub enum TrackKind {
     Video,
     Audio,
+    /// Text layers (`Project::texts`); composited at the lane's depth
+    /// among the video lanes.
+    Text,
+}
+
+impl TrackKind {
+    /// Lanes that draw on the canvas. They stack above the audio lanes,
+    /// in any order among themselves.
+    pub fn is_visual(self) -> bool {
+        self != Self::Audio
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -607,8 +607,8 @@ impl ClipperApp {
                         .sample(c.transform, at - c.cut_start_ms, c.duration_ms());
             }
         }
-        self.live.paint(ui, canvas, settings.background);
-        self.paint_canvas_texts(ui, canvas);
+        self.paint_canvas_layers(ui, canvas, settings.background);
+        self.show_inline_text_editor(ui, canvas);
         let visible = now < self.canvas_ui.outline_until || self.canvas_drag.is_some();
         if visible {
             ui.ctx().request_repaint_after(Duration::from_secs_f64(

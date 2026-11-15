@@ -299,6 +299,9 @@ impl TextStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextItem {
     pub id: TextId,
+    /// The text lane this layer lives on; its position among the video
+    /// lanes sets what the text draws above and below.
+    pub track: crate::track::TrackId,
     /// Cut-time range, half-open.
     pub start_ms: i64,
     pub end_ms: i64,
@@ -321,9 +324,10 @@ pub const MAX_SIZE: f32 = 0.5;
 pub const MIN_DURATION_MS: i64 = 200;
 
 impl TextItem {
-    pub fn new(id: TextId, start_ms: i64, end_ms: i64) -> Self {
+    pub fn new(id: TextId, track: crate::track::TrackId, start_ms: i64, end_ms: i64) -> Self {
         Self {
             id,
+            track,
             start_ms,
             end_ms: end_ms.max(start_ms + MIN_DURATION_MS),
             text: String::new(),
@@ -585,7 +589,7 @@ mod tests {
     use super::*;
 
     fn item(intro: Intro, outro: Outro) -> TextItem {
-        let mut t = TextItem::new(TextId(1), 1_000, 5_000);
+        let mut t = TextItem::new(TextId(1), crate::track::TrackId(0), 1_000, 5_000);
         t.text = "Hello there, world".into();
         t.intro = intro;
         t.outro = outro;

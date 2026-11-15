@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.6
+
+- Advanced: fix echoing and clipping audio when playing, pausing or moving
+  clips. Streams of one file now share one decoder with the export's limiter,
+  and the Simple player is stopped when entering Advanced.
+- Advanced: instant cuts play smoothly; the next clip on each layer is
+  preloaded and swapped in at the cut.
+- Text is a normal layer you can put on any lane (new text goes on top); the
+  Text band is gone. Type directly on the preview.
+- Cleaner text settings (gradient stop bar, no presets) and clip Frame /
+  Animation panel with a proper Preview button.
+- G closes gaps (selection-aware ripple).
+- Drop files onto the Advanced timeline; cleaner drop highlight on Media.
+- Switching to Advanced places the first clip on the timeline.
+- Minimal timeline scrollbar with a playhead marker when zoomed.
+
 ## 0.10.5
 
 - Windows: if the app can't start (for example a graphics driver without

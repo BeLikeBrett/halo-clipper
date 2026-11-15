@@ -11,6 +11,8 @@
 mod canvas;
 #[path = "editor.rs"]
 mod editor;
+#[path = "gaps.rs"]
+mod gaps;
 #[path = "grouping.rs"]
 mod grouping;
 #[path = "layers.rs"]
@@ -183,7 +185,13 @@ impl Project {
     fn composition(&self, preview: bool) -> crate::composition::Composition {
         let mut segments = Vec::new();
         // Top lane is painted last. All audio streams remain independent.
-        for t in self.tracks.iter().rev().filter(|t| !t.muted) {
+        for (depth, t) in self
+            .tracks
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, t)| !t.muted)
+        {
             for c in self.clips.iter().filter(|c| c.track_id == t.id) {
                 let (source, info) = self.clip_source(c);
                 let audio_index = c.audio_stream.or(t.source_audio_index).unwrap_or(0);
@@ -209,9 +217,22 @@ impl Project {
                     gain: c.gain * t.gain,
                     transform: c.transform,
                     animation: c.animation,
+                    depth,
                 });
             }
         }
+        let depth: HashMap<TrackId, usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id, i))
+            .collect();
+        let muted: HashSet<TrackId> = self
+            .tracks
+            .iter()
+            .filter(|t| t.muted)
+            .map(|t| t.id)
+            .collect();
         crate::composition::Composition {
             width: self.canvas_media().width,
             height: self.canvas_media().height,
@@ -219,15 +240,58 @@ impl Project {
             duration_ms: self.content_end_ms(),
             background: self.canvas.background,
             segments,
-            texts: self.texts.clone(),
+            texts: self
+                .texts
+                .iter()
+                .filter(|t| !muted.contains(&t.track))
+                .cloned()
+                .collect(),
+            text_depth: self
+                .texts
+                .iter()
+                .map(|t| (t.id, depth.get(&t.track).copied().unwrap_or(0)))
+                .collect(),
         }
     }
 
-    /// Adds an empty text layer at the playhead and selects it.
-    fn add_text(&mut self) -> TextId {
+    /// True when `lane` has no text overlapping `[start, end)` other than
+    /// `except`.
+    fn text_lane_free(&self, lane: TrackId, start: i64, end: i64, except: Option<TextId>) -> bool {
+        !self.texts.iter().any(|t| {
+            t.track == lane && Some(t.id) != except && start < t.end_ms && end > t.start_ms
+        })
+    }
+
+    /// The text lane for a new layer over `[start, end)`: `preferred` when
+    /// it is a text lane with room, else the top lane when that is a text
+    /// lane with room, else a new text lane on top of everything.
+    fn text_lane_for(&mut self, start: i64, end: i64, preferred: Option<TrackId>) -> TrackId {
+        let is_text = |p: &Self, id: TrackId| {
+            p.tracks
+                .iter()
+                .any(|t| t.id == id && t.kind == TrackKind::Text)
+        };
+        let candidates = preferred
+            .into_iter()
+            .chain(self.tracks.first().map(|t| t.id));
+        for lane in candidates {
+            if is_text(self, lane) && self.text_lane_free(lane, start, end, None) {
+                return lane;
+            }
+        }
+        let index = preferred
+            .and_then(|id| self.tracks.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        self.new_track(TrackKind::Text, index)
+    }
+
+    /// Adds an empty text layer at the playhead and selects it. It goes on
+    /// `lane` when that has room, otherwise on top of everything.
+    fn add_text(&mut self, lane: Option<TrackId>) -> TextId {
         let id = self.id_gen.next_text();
         let start = self.playhead_ms.max(0);
-        let mut item = TextItem::new(id, start, start + 3_000);
+        let track = self.text_lane_for(start, start + 3_000, lane);
+        let mut item = TextItem::new(id, track, start, start + 3_000);
         // Inherit the look of the previous layer so a run of captions
         // stays consistent without re-styling each one.
         if let Some(last) = self.texts.last() {
@@ -531,6 +595,9 @@ enum ClipAction {
     /// Multi-track "Detach": break the link on the selected clip's group.
     DetachSelected,
     AttachSelected,
+    /// Multi-track "G": ripple the selection left against its neighbours,
+    /// or close every gap when nothing is selected.
+    CloseGaps,
 }
 
 #[derive(Default)]
@@ -600,6 +667,13 @@ pub struct ClipperApp {
     last_lavfi_complex: String,
     /// Set once the startup window has been checked against the monitor.
     window_fit_checked: bool,
+    /// Files are being dragged over the window.
+    file_hover: bool,
+    /// Pointer during that drag, when the OS can tell us.
+    file_hover_pos: Option<egui::Pos2>,
+    /// Where the Advanced timeline's lanes were drawn last frame, so an
+    /// external file drop can land on a time and row.
+    timeline_drop: Option<editor::TimelineDropZone>,
     last_audio_track_muted: bool,
     /// Edge-trigger state for `mpv.speed` — only push a property change
     /// when the V1 clip under the playhead changes its speed setting.
@@ -687,6 +761,9 @@ impl ClipperApp {
             export_options_open: false,
             last_lavfi_complex: String::new(),
             window_fit_checked: false,
+            file_hover: false,
+            file_hover_pos: None,
+            timeline_drop: None,
             last_audio_track_muted: false,
             last_clip_speed: 1.0,
             clip_drag_session: None,
@@ -1157,6 +1234,7 @@ impl ClipperApp {
                 ClipAction::DeleteSelected => {
                     p.texts.retain(|t| t.id != id);
                     p.selected_text = None;
+                    p.prune_tracks();
                     return;
                 }
                 _ => {}
@@ -1254,6 +1332,13 @@ impl ClipperApp {
                     self.undo_stack.pop();
                 }
             }
+            ClipAction::CloseGaps => {
+                if p.close_gaps() {
+                    self.live.pause();
+                } else {
+                    self.undo_stack.pop();
+                }
+            }
         }
     }
 
@@ -1304,6 +1389,11 @@ impl ClipperApp {
         self.canvas_drag = None;
         self.canvas_ui = Default::default();
         let _ = self.player.set_paused(true);
+        if new_mode == EditMode::MultiTrack {
+            // Advanced plays through its own decoders. Unload Simple's
+            // player outright so it can never sound alongside them.
+            let _ = self.player.stop();
+        }
         let _ = self.player.set_lavfi_complex("");
         self.last_lavfi_complex.clear();
         if let Some(h) = self.proxy_handle.take() {
@@ -1312,6 +1402,39 @@ impl ClipperApp {
         self.restore_history();
         if new_mode == EditMode::SimpleClip {
             self.load_simple_preview();
+        } else {
+            self.seed_advanced_timeline();
+        }
+    }
+
+    /// An empty Advanced timeline starts with the clip being worked on in
+    /// Simple Clip (or the first imported video), so switching modes never
+    /// lands on a blank editor. One undo step.
+    fn seed_advanced_timeline(&mut self) {
+        let Some(p) = self.project.as_ref() else {
+            return;
+        };
+        if !p.clips.is_empty() || !p.texts.is_empty() {
+            return;
+        }
+        let video = |id: &TrackId| {
+            p.assets
+                .iter()
+                .any(|a| a.id == *id && a.source.media.width > 0)
+        };
+        let Some(id) = p
+            .simple
+            .focus
+            .filter(video)
+            .or_else(|| p.assets.iter().map(|a| a.id).find(video))
+        else {
+            return;
+        };
+        self.push_undo();
+        if let Some(p) = &mut self.project {
+            p.place_asset(id, 0, None, 0);
+            p.selected_clips.clear();
+            p.playhead_ms = p.playhead_ms.min(p.content_end_ms());
         }
     }
     fn toggle_play(&mut self) {
@@ -1653,6 +1776,9 @@ impl ClipperApp {
                     if i.consume_key(egui::Modifiers::NONE, egui::Key::T) {
                         add_text = true;
                     }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::G) {
+                        deferred_action = Some(ClipAction::CloseGaps);
+                    }
                     if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
                         deferred_action = Some(ClipAction::DeleteSelected);
                     }
@@ -1707,17 +1833,44 @@ impl ClipperApp {
 }
 
 impl eframe::App for ClipperApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.fit_window_to_monitor(ctx);
-        let dropped = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect::<Vec<_>>()
+        let (hovering, dropped) = ctx.input(|i| {
+            (
+                !i.raw.hovered_files.is_empty(),
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
+            )
         });
+        if hovering || !dropped.is_empty() {
+            let cursor = crate::platform::drag_cursor(frame, ctx.pixels_per_point())
+                .or_else(|| ctx.pointer_latest_pos());
+            if cursor.is_some() {
+                self.file_hover_pos = cursor;
+            }
+            ctx.request_repaint();
+        }
+        self.file_hover = hovering;
         if !dropped.is_empty() {
-            self.import_dropped_media(dropped);
+            let spot = self
+                .file_hover_pos
+                .and_then(|pos| self.timeline_drop.as_ref()?.spot(pos));
+            match spot {
+                Some((start, index)) => self.drop_on_timeline(dropped, start, index),
+                None => self.import_dropped_media(dropped),
+            }
+            self.file_hover_pos = None;
+        }
+        // The Advanced timeline re-records its lanes every frame it draws.
+        if !self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.mode == EditMode::MultiTrack)
+        {
+            self.timeline_drop = None;
         }
         self.updater.poll();
         if self.proxy_handle.is_some()
@@ -1953,7 +2106,8 @@ impl eframe::App for ClipperApp {
         }) {
             egui::SidePanel::right("edit_panel")
                 .resizable(true)
-                .default_width(280.0)
+                .default_width(300.0)
+                .min_width(284.0)
                 .frame(
                     Frame::none()
                         .fill(theme::BG_PANEL)
@@ -4747,7 +4901,7 @@ mod text_layer_tests {
         let mut p = project();
         p.selected_clips.insert(p.clips[0].id);
         p.playhead_ms = 1_500;
-        let first = p.add_text();
+        let first = p.add_text(None);
         assert_eq!(p.selected_text, Some(first));
         assert!(
             p.selected_clips.is_empty(),
@@ -4759,7 +4913,7 @@ mod text_layer_tests {
         let moved = p.text_mut(first).unwrap();
         moved.x = 0.2;
         moved.style.font = crate::text::TextFont::Bangers;
-        let second = p.add_text();
+        let second = p.add_text(None);
         assert_ne!(first, second);
         let t = p.text(second).unwrap();
         assert_eq!(t.x, 0.2);
@@ -4770,7 +4924,7 @@ mod text_layer_tests {
     #[test]
     fn split_text_cuts_at_the_playhead_and_selects_the_right_half() {
         let mut p = project();
-        let id = p.add_text();
+        let id = p.add_text(None);
         p.text_mut(id).unwrap().text = "Hello".into();
         p.playhead_ms = 100;
         assert!(!p.split_text(id), "too close to the start");
@@ -4793,7 +4947,7 @@ mod text_layer_tests {
     fn undo_restores_text_layers_and_selection() {
         let mut p = project();
         let before = UndoSnapshot::capture(&p);
-        let id = p.add_text();
+        let id = p.add_text(None);
         p.text_mut(id).unwrap().text = "Hi".into();
         let after = UndoSnapshot::capture(&p);
         before.apply(&mut p);
@@ -4808,7 +4962,7 @@ mod text_layer_tests {
     fn text_past_the_last_clip_extends_the_export() {
         let mut p = project();
         p.playhead_ms = 5_000;
-        let id = p.add_text();
+        let id = p.add_text(None);
         assert_eq!(p.content_end_ms(), 8_000);
         let composition = p.composition(false);
         assert_eq!(composition.texts.len(), 1);

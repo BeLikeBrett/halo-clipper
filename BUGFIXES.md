@@ -5,6 +5,44 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-15 — Advanced: echoing / clipping audio while playing and editing
+
+### Symptom
+
+- Playing, pausing or moving clips in Advanced sometimes doubled the audio
+  for a moment (echo), and a clip with two audio streams could distort.
+- Once, after editing in Simple Clip and switching to Advanced, the audio
+  sounded clipped, as if both editors were playing.
+
+### Root cause
+
+- Every audio stream had its own mpv decoder. Two streams of the same file
+  drifted apart independently, which is heard as an echo.
+- The decoders' outputs were summed by the sound server with no limiter,
+  while the export runs `amix` + `alimiter`; loud game audio plus mic clipped
+  only in preview.
+- After a seek or resume, a decoder that came back late was only corrected by
+  the periodic drift check (up to ~750 ms of overlap).
+- Splitting a clip reloaded the same file at the cut, which briefly overlapped
+  the old and new decoders.
+- Entering Advanced paused but did not unload the Simple Clip player, so
+  nothing guaranteed it stayed silent.
+
+### Fix
+
+- `live.rs`: group streams by file and timing; one decoder per group with a
+  lavfi-complex `volume`/`amix`/`alimiter` graph matching the export (unit
+  test pins the graph string). Lone streams fold their gain into mpv's cubic
+  volume.
+- An epoch counter forces immediate realignment after seek/pause/play.
+  Same-file clip changes seek instead of reloading. Standby decoders are
+  parked on the next cut and swapped in.
+- `set_mode` calls `Player::stop()` when entering Advanced.
+- Verified in the Xvfb rig with a two-stream test file: steady drift −9 ms
+  video / +13 ms audio, and −3 / −25 ms across a cut.
+
+---
+
 ## 2026-11-13 — Windows: app did nothing when launched; export/UI gaps on Windows
 
 Found by installing the CI-built `Halo-Clipper-Setup.exe` (0.10.4) on a clean

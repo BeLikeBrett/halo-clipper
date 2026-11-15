@@ -364,11 +364,12 @@ pub fn show_multitrack(
         let show_mute_glyph = match track.kind {
             TrackKind::Audio => true,
             TrackKind::Video => true,
+            TrackKind::Text => false,
         };
         if show_mute_glyph {
             let muted_display = match track.kind {
                 TrackKind::Audio => track.muted,
-                TrackKind::Video => track.muted,
+                TrackKind::Video | TrackKind::Text => track.muted,
             };
             let mute_size = 18.0;
             let mute_rect = Rect::from_min_size(
@@ -408,7 +409,7 @@ pub fn show_multitrack(
             if mute_resp.clicked() {
                 match track.kind {
                     TrackKind::Audio => out.mute_toggled = Some(track.id),
-                    TrackKind::Video => out.mute_toggled = Some(track.id),
+                    TrackKind::Video | TrackKind::Text => out.mute_toggled = Some(track.id),
                 }
             }
         }
@@ -423,7 +424,7 @@ pub fn show_multitrack(
         // Clips on this lane. Sort first so we can detect adjacency for
         // the split-gap below.
         let track_fill = match track.kind {
-            TrackKind::Video => clip_fill_v,
+            TrackKind::Video | TrackKind::Text => clip_fill_v,
             TrackKind::Audio => clip_fill_a,
         };
         let mut t_clips: Vec<&Clip> = state

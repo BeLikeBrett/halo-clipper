@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "halo_clipper"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1573,6 +1573,7 @@ dependencies = [
  "sha2",
  "tiny-skia",
  "winresource",
+ "x11-dl",
 ]
 
 [[package]]

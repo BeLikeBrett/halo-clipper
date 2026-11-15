@@ -246,6 +246,48 @@ pub fn block_size(item: &TextItem, w: f32, h: f32) -> (f32, f32) {
     )
 }
 
+/// Bounds of what is actually drawn (glyph ink plus outline, or the
+/// boxes when the style has a background), as (left, top, right, bottom)
+/// pixels relative to the block's center. Display fonts leave a lot of
+/// empty line box above and below the letters; a selection frame drawn
+/// from these bounds hugs the visible text instead.
+pub fn ink_bounds(item: &TextItem, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let lay = layout(item, w, h);
+    let (bw, bh) = block_size(item, w, h);
+    if item.style.background.is_some() {
+        return (-bw * 0.5, -bh * 0.5, bw * 0.5, bh * 0.5);
+    }
+    let f = font(item.style.font);
+    let scale = PxScale::from(lay.px);
+    let (ox, oy) = (-lay.width * 0.5, -lay.height * 0.5);
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
+    for line in &lay.lines {
+        let baseline = oy + line.top + lay.ascent;
+        for g in line.glyphs.iter().filter(|g| !g.is_space) {
+            let glyph = g
+                .id
+                .with_scale_and_position(scale, ab_glyph::point(ox + line.offset + g.x, baseline));
+            if let Some(outlined) = f.outline_glyph(glyph) {
+                let r = outlined.px_bounds();
+                bounds = Some(match bounds {
+                    None => (r.min.x, r.min.y, r.max.x, r.max.y),
+                    Some((l, t, rr, b)) => (
+                        l.min(r.min.x),
+                        t.min(r.min.y),
+                        rr.max(r.max.x),
+                        b.max(r.max.y),
+                    ),
+                });
+            }
+        }
+    }
+    let pad = item.style.outline * lay.px;
+    match bounds {
+        Some((l, t, r, b)) => (l - pad, t - pad, r + pad, b + pad),
+        None => (-bw * 0.5, -bh * 0.5, bw * 0.5, bh * 0.5),
+    }
+}
+
 /// Fixed frame size for every animation state of `item`, so exported
 /// frames all share one overlay position.
 fn frame_size(item: &TextItem, lay: &Layout) -> (u32, u32) {
@@ -698,6 +740,7 @@ fn box_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal
 /// One text layer prepared for ffmpeg: a concat list of PNG frames and
 /// where the frame's top-left lands on the output canvas.
 pub struct ExportLayer {
+    pub id: crate::text::TextId,
     pub list: PathBuf,
     pub fps: f64,
     pub x: i32,
@@ -758,6 +801,7 @@ pub fn write_export_layers(
         let list_path = dir.join(format!("text{n}.ffconcat"));
         std::fs::write(&list_path, list)?;
         layers.push(ExportLayer {
+            id: item.id,
             list: list_path,
             fps,
             x: (item.x * w - size.0 as f32 * 0.5).round() as i32,
@@ -775,7 +819,7 @@ mod tests {
     use crate::text::{Intro, TextFont, TextId, STYLE_PRESETS};
 
     fn item(text: &str) -> TextItem {
-        let mut t = TextItem::new(TextId(1), 0, 2_000);
+        let mut t = TextItem::new(TextId(1), crate::track::TrackId(0), 0, 2_000);
         t.text = text.into();
         t
     }
@@ -985,7 +1029,7 @@ fn dump_text_samples() {
     let dir = PathBuf::from(dir);
     std::fs::create_dir_all(&dir).unwrap();
     let base = |text: &str| {
-        let mut t = TextItem::new(TextId(1), 0, 3_000);
+        let mut t = TextItem::new(TextId(1), crate::track::TrackId(0), 0, 3_000);
         t.text = text.into();
         t
     };

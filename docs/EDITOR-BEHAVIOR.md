@@ -74,6 +74,45 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## Layers, audio sync and cut playback (2026-11-15)
+
+- Text is a layer like any other: the Text band is gone. Text lanes stack with
+  video lanes above the audio lanes; empty text lanes are pruned with the
+  others. Muted text lanes hide their text in preview and export.
+- Inline text editing: click selected text (or double-click any text) on the
+  preview to type in a bubble under it. Enter finishes, Shift+Enter adds a
+  line, clicking away closes it; one editing session is one undo step. The
+  selection frame hugs the drawn glyphs and outline (or the box when on).
+- Text inspector: Style, Font, Align, Color (Solid/Gradient), Outline, Shadow,
+  Box, Animate in/out. Gradients are edited on a stop bar with draggable
+  handles, four direction arrows and a swap button. No named gradient presets.
+- Clip panel: Frame (Fit/Fill, Zoom, Opacity) and Animation (Start of clip /
+  End of clip chips, a Preview pill, Length, and Strength where it applies).
+- G closes gaps. With a selection, the selection and everything that starts at
+  or after it slide left until something on one of their lanes touches (groups
+  move together). With nothing selected, every empty stretch of the timeline,
+  including the lead-in, is removed across all lanes so layers stay aligned.
+  Nothing to close is a no-op without an undo entry.
+- External drops in Advanced: hovering the timeline shows an insertion line
+  and an "Add at" chip on the target lane (or a new lane); dropping imports
+  the files and places them back-to-back from that time as one undo step.
+  Hovering Media shows a soft rounded drop card instead of the old outline.
+  Wayland reports no pointer during an OS drag, so there drops go to Media.
+- Switching to Advanced with an empty timeline places the Simple Clip source
+  (or the first imported video) at 0:00 as one undo step. Entering Advanced
+  stops the Simple player so it can never play underneath.
+- Live audio: streams of one file with the same timing share one mpv decoder
+  and are mixed with the export's amix + alimiter graph, so they can't drift
+  apart (echo) or sum past full scale (clipping). After a seek or pause, every
+  decoder realigns on the next frame instead of waiting for the drift check.
+  Clip changes within the same file seek rather than reload.
+- Cut playback: each lane keeps a standby decoder parked on its next cut
+  (2.5 s lookahead) and swaps it in at the boundary, so instant cuts play
+  without a reload gap. Set `HALO_CLIPPER_TRACE_LIVE=1` to log sync decisions.
+- Zoomed timeline: a thin scrollbar under the lanes; drag the thumb, or click
+  the track to glide there. A white tick marks the playhead, and the view
+  follows the playhead while it plays.
+
 ## Interface pass (2026-11-13)
 
 - Typography: Inter (Regular/Medium/SemiBold) for the interface and
@@ -135,9 +174,12 @@ isolated configuration/cache directories.
 
 - Advanced text is stored in `Project::texts`, independently of media clips.
   Its position is normalized to the output canvas, so titles can sit in the
-  bars around a fitted video. Text paints above video in list order.
-- T, Add text, or the Text band’s + adds a three-second layer at the playhead,
-  pauses playback, selects it, and focuses the text field. A new layer inherits
+  bars around a fitted video. Text lives on Text lanes (T1, T2…) and paints in
+  lane order with video, so a lower text lane sits under the video above it.
+- T or Add text adds a three-second layer at the playhead on the topmost free
+  text lane (a new top lane if none is free), pauses playback, selects it, and
+  opens the inline editor on the preview. Double-click an empty spot on a text
+  lane to add one there. A new layer inherits
   the previous look. Empty layers show a preview placeholder and never export it.
 - Drag the preview text to position it. Canvas and video edges/centers snap;
   Alt bypasses snapping. Drag a corner or scroll over selected text to resize.
@@ -151,10 +193,11 @@ isolated configuration/cache directories.
   the complete Type/Words reveal. Short layers cap each transition at half
   their length. Paused selection shows settled text for editing;
   selected text outside its range is ghosted only while paused.
-- Text bars are pinned under the ruler. Drag the body to move or an end to trim,
+- Text bars sit on their lanes like clips; dragging one vertically moves it to
+  another lane or a new one. Drag the body to move or an end to trim,
   with snapping to playhead and neighboring edit points (Alt bypasses it).
   S splits selected text and selects the right half; Del removes it. The bar
-  context menu offers Duplicate and Delete. Overlaps stack in up to four rows.
+  context menu offers Duplicate and Delete.
 - Text editing is included in Advanced undo history; text and clip selection
   are mutually exclusive. A text-entry gesture or pointer drag is one undo step.
 - `text.rs` holds the model/animation curves; `textrender.rs` draws with bundled
@@ -229,7 +272,8 @@ neighboring clips. This release does not add speed ramps or automatic beat synci
 Windows OLE drops are explicitly enabled on the viewport; Linux uses winit's
 X11/Wayland file-drop events. External drags briefly highlight Media and show
 Drop to import. Single or multiple files are probed and staged in the bin,
-without placing timeline clips or switching the current Simple Clip source.
+without switching the current Simple Clip source. In Advanced, dropping on the
+timeline also places the files there (see the 2026-11-15 section).
 The first video initializes an empty Simple workspace; an empty Advanced
 workspace keeps its mode. Duplicate paths are skipped, invalid files report
 an error while valid files in the same batch still import. An Advanced batch

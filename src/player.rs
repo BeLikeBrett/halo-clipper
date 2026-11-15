@@ -40,6 +40,19 @@ pub struct PlayerState {
 }
 
 impl PlayerState {
+    /// Playback position now: the last reported `time-pos` advanced by the
+    /// time since that report while playing. mpv only reports positions
+    /// as frames/packets pass, so the raw value lags by up to a packet.
+    pub fn estimated_ms(&self, speed: f32) -> i64 {
+        let since = match (self.paused, self.last_update) {
+            (false, Some(at)) => {
+                (at.elapsed().as_secs_f64() * 1000.0 * f64::from(speed.max(0.01))).min(250.0) as i64
+            }
+            _ => 0,
+        };
+        self.position_ms + since
+    }
+
     fn fresh() -> Self {
         Self {
             paused: true,
@@ -101,6 +114,11 @@ impl Player {
                 init.set_property("msg-level", "all=v")?;
             }
             init.set_property("vo", if audio_only { "null" } else { "libmpv" })?;
+            // Test rigs route preview audio away from the real speakers
+            // (e.g. `HALO_CLIPPER_AO=null`).
+            if let Ok(ao) = std::env::var("HALO_CLIPPER_AO") {
+                init.set_property("ao", ao.as_str())?;
+            }
             // Each layer owns a renderer inside egui's GL context. Copy-back
             // decode retains hardware acceleration without importing decoder
             // surfaces across incompatible GPU/GL contexts (including llvmpipe).
@@ -213,6 +231,16 @@ impl Player {
         let mut s = self.state.lock().unwrap();
         s.loaded_file = Some(source.to_path_buf());
         s.position_ms = start_ms;
+        s.paused = true;
+        Ok(())
+    }
+
+    /// Unloads the media so this player can't make a sound until the next
+    /// `set_file`.
+    pub fn stop(&self) -> Result<()> {
+        self.mpv.command("stop", &[])?;
+        let mut s = self.state.lock().unwrap();
+        s.loaded_file = None;
         s.paused = true;
         Ok(())
     }
