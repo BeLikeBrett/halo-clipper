@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.7
+
+- Linux: dragging files into the app now works on Wayland desktops (niri,
+  GNOME, KDE), onto Media or straight onto the timeline.
+- Moving clips and text between layers is predictable and smooth: lanes slide
+  apart to open a "New layer" row, and the dragged item glides into the row it
+  will land in. Dropping on a free lane of the same kind uses that lane.
+- Shift+Enter adds a new line while typing on the preview.
+- Gradient colors: pick Start / End, with direction tiles that show the result.
+- "Fit to screen" replaces Reset frame and the Fit/Fill switch; it lights up
+  when the video has been moved or resized. Also in the clip panel.
+- Bigger Simple Clip / Advanced switch; File and Help moved to the left corner.
+
 ## 0.10.6
 
 - Advanced: fix echoing and clipping audio when playing, pausing or moving

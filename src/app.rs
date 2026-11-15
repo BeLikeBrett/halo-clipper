@@ -671,6 +671,11 @@ pub struct ClipperApp {
     file_hover: bool,
     /// Pointer during that drag, when the OS can tell us.
     file_hover_pos: Option<egui::Pos2>,
+    /// File drops on native Wayland (`None` on X11 or before the first frame).
+    #[cfg(target_os = "linux")]
+    wayland_drops: Option<crate::wayland_drop::WaylandDrops>,
+    #[cfg(target_os = "linux")]
+    wayland_drops_tried: bool,
     /// Where the Advanced timeline's lanes were drawn last frame, so an
     /// external file drop can land on a time and row.
     timeline_drop: Option<editor::TimelineDropZone>,
@@ -763,6 +768,10 @@ impl ClipperApp {
             window_fit_checked: false,
             file_hover: false,
             file_hover_pos: None,
+            #[cfg(target_os = "linux")]
+            wayland_drops: None,
+            #[cfg(target_os = "linux")]
+            wayland_drops_tried: false,
             timeline_drop: None,
             last_audio_track_muted: false,
             last_clip_speed: 1.0,
@@ -1835,7 +1844,8 @@ impl ClipperApp {
 impl eframe::App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.fit_window_to_monitor(ctx);
-        let (hovering, dropped) = ctx.input(|i| {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let (mut hovering, mut dropped) = ctx.input(|i| {
             (
                 !i.raw.hovered_files.is_empty(),
                 i.raw
@@ -1845,8 +1855,30 @@ impl eframe::App for ClipperApp {
                     .collect::<Vec<_>>(),
             )
         });
+        // Native Wayland: winit reports no file drags, read them ourselves.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut wayland_cursor = None;
+        #[cfg(target_os = "linux")]
+        {
+            if !std::mem::replace(&mut self.wayland_drops_tried, true) {
+                self.wayland_drops = crate::platform::wayland_drops(frame, ctx);
+            }
+            if let Some(drops) = &self.wayland_drops {
+                if let Some((x, y)) = drops.hover() {
+                    hovering = true;
+                    // Surface coordinates are logical px; egui points add zoom.
+                    let scale = ctx
+                        .input(|i| i.viewport().native_pixels_per_point)
+                        .unwrap_or(1.0)
+                        / ctx.pixels_per_point();
+                    wayland_cursor = Some(egui::pos2(x as f32 * scale, y as f32 * scale));
+                }
+                dropped.extend(drops.take());
+            }
+        }
         if hovering || !dropped.is_empty() {
-            let cursor = crate::platform::drag_cursor(frame, ctx.pixels_per_point())
+            let cursor = wayland_cursor
+                .or_else(|| crate::platform::drag_cursor(frame, ctx.pixels_per_point()))
                 .or_else(|| ctx.pointer_latest_pos());
             if cursor.is_some() {
                 self.file_hover_pos = cursor;
@@ -1859,7 +1891,7 @@ impl eframe::App for ClipperApp {
                 .file_hover_pos
                 .and_then(|pos| self.timeline_drop.as_ref()?.spot(pos));
             match spot {
-                Some((start, index)) => self.drop_on_timeline(dropped, start, index),
+                Some((start, lane, index)) => self.drop_on_timeline(dropped, start, lane, index),
                 None => self.import_dropped_media(dropped),
             }
             self.file_hover_pos = None;
@@ -1961,85 +1993,97 @@ impl eframe::App for ClipperApp {
             .frame(
                 Frame::none()
                     .fill(theme::BG_HEADER)
-                    .inner_margin(Margin::symmetric(12.0, 7.0))
+                    .inner_margin(Margin::symmetric(8.0, 6.0))
                     .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    paint_brand(ui);
-                    ui.add_space(14.0);
-                    let mut want_open = false;
-                    let mut want_settings = false;
-                    let mut want_support = false;
-                    let mut want_quit = false;
-                    crate::widgets::menu_bar_button(ui, "File", 210.0, |ui| {
-                        want_open = crate::widgets::menu_item(ui, "Open Video…", None).clicked();
-                        crate::widgets::menu_separator(ui);
-                        want_settings = crate::widgets::menu_item(ui, "Settings…", None).clicked();
-                        crate::widgets::menu_separator(ui);
-                        want_quit = crate::widgets::menu_item(ui, "Quit", None).clicked();
-                        want_open || want_settings || want_quit
-                    });
-                    let update = matches!(self.updater.state, crate::updater::State::Available(_));
-                    crate::widgets::menu_bar_button(ui, "Help", 210.0, |ui| {
-                        want_support = crate::widgets::menu_item(
-                            ui,
-                            if update {
-                                "Install update…"
-                            } else {
-                                "Help & updates…"
-                            },
-                            None,
-                        )
-                        .clicked();
-                        want_support
-                    });
-                    if update {
-                        // A quiet badge instead of renaming the menu.
-                        let dot = ui.min_rect().right_top() + egui::vec2(-6.0, 7.0);
-                        ui.painter().circle_filled(dot, 3.5, theme::ACCENT);
-                    }
-                    if want_open {
-                        self.open_file();
-                    }
-                    if want_settings {
-                        self.settings_open = true;
-                    }
-                    if want_support {
-                        self.support_open = true;
-                    }
-                    if want_quit {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-
-                    // Mode switch, centered in the bar regardless of what
-                    // sits on the left.
-                    let mode = self.project.as_ref().map(|p| p.mode);
-                    let options = [
-                        (
-                            "Simple Clip",
-                            "Mark In/Out and export one range. Instant; single-cut workflow.",
-                        ),
-                        (
-                            "Advanced",
-                            "Multi-track editing: split, delete, layer video and audio, \
-                             detach audio streams into their own lanes.",
-                        ),
-                    ];
-                    let switch_w = 214.0;
-                    let center = ui.max_rect().center().x;
-                    let gap = (center - switch_w * 0.5 - ui.cursor().left()).max(8.0);
-                    ui.add_space(gap);
-                    let selected = usize::from(mode == Some(EditMode::MultiTrack));
-                    if let Some(index) = crate::widgets::segmented(ui, "mode", &options, selected) {
-                        self.set_mode(if index == 0 {
-                            EditMode::SimpleClip
-                        } else {
-                            EditMode::MultiTrack
+                // A fixed-height row so the menus center on the tall switch.
+                let row = egui::vec2(ui.available_width(), 42.0);
+                ui.allocate_ui_with_layout(
+                    row,
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let mut want_open = false;
+                        let mut want_settings = false;
+                        let mut want_support = false;
+                        let mut want_quit = false;
+                        crate::widgets::menu_bar_button(ui, "File", 210.0, |ui| {
+                            want_open =
+                                crate::widgets::menu_item(ui, "Open Video…", None).clicked();
+                            crate::widgets::menu_separator(ui);
+                            want_settings =
+                                crate::widgets::menu_item(ui, "Settings…", None).clicked();
+                            crate::widgets::menu_separator(ui);
+                            want_quit = crate::widgets::menu_item(ui, "Quit", None).clicked();
+                            want_open || want_settings || want_quit
                         });
-                    }
-                });
+                        let update =
+                            matches!(self.updater.state, crate::updater::State::Available(_));
+                        crate::widgets::menu_bar_button(ui, "Help", 210.0, |ui| {
+                            want_support = crate::widgets::menu_item(
+                                ui,
+                                if update {
+                                    "Install update…"
+                                } else {
+                                    "Help & updates…"
+                                },
+                                None,
+                            )
+                            .clicked();
+                            want_support
+                        });
+                        if update {
+                            // A quiet badge instead of renaming the menu.
+                            let dot = ui.min_rect().right_top() + egui::vec2(-6.0, 7.0);
+                            ui.painter().circle_filled(dot, 3.5, theme::ACCENT);
+                        }
+                        if want_open {
+                            self.open_file();
+                        }
+                        if want_settings {
+                            self.settings_open = true;
+                        }
+                        if want_support {
+                            self.support_open = true;
+                        }
+                        if want_quit {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+
+                        // Mode switch, centered in the bar regardless of what
+                        // sits on the left.
+                        let mode = self.project.as_ref().map(|p| p.mode);
+                        let options = [
+                            (
+                                "Simple Clip",
+                                "Mark In/Out and export one range. Instant; single-cut workflow.",
+                            ),
+                            (
+                                "Advanced",
+                                "Multi-track editing: split, delete, layer video and audio, \
+                             detach audio streams into their own lanes.",
+                            ),
+                        ];
+                        let switch_w = 302.0;
+                        let center = ui.max_rect().center().x;
+                        let gap = (center - switch_w * 0.5 - ui.cursor().left()).max(8.0);
+                        ui.add_space(gap);
+                        let selected = usize::from(mode == Some(EditMode::MultiTrack));
+                        if let Some(index) = crate::widgets::mode_switch(ui, options, selected) {
+                            self.set_mode(if index == 0 {
+                                EditMode::SimpleClip
+                            } else {
+                                EditMode::MultiTrack
+                            });
+                        }
+                        // The name sits in the right corner; menus own the left.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            paint_brand(ui);
+                        });
+                    },
+                );
             });
 
         let advanced = self
@@ -2051,9 +2095,9 @@ impl eframe::App for ClipperApp {
             .as_ref()
             .map(|p| p.timeline_view().0.len())
             .unwrap_or(0);
-        let dragging = egui::DragAndDrop::payload::<editor::EditorDrag>(ctx)
-            .is_some_and(|payload| matches!(payload.as_ref(), editor::EditorDrag::Asset(_)));
-        let fit_rows = (rows + usize::from(dragging && rows > 0)).max(1);
+        // One spare row under the lanes: room for a drag's new lane to open
+        // without resizing the panel (and moving the lanes) mid-drag.
+        let fit_rows = rows + 1;
         let panel_id = if advanced {
             egui::Id::new(("advanced_timeline", fit_rows))
         } else {
@@ -2216,6 +2260,11 @@ impl eframe::App for ClipperApp {
     /// cancel any in-flight transcode so the ffmpeg child doesn't keep
     /// running after our process exits.
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        // Stop reading the Wayland display before winit closes it.
+        #[cfg(target_os = "linux")]
+        if let Some(mut drops) = self.wayland_drops.take() {
+            drops.stop();
+        }
         if let Some(gl) = _gl {
             self.live.destroy(gl);
         } else {
@@ -4580,7 +4629,15 @@ fn show_multitrack_info(ui: &mut egui::Ui, project: &Project, cut_duration: i64)
 
 /// App mark + name for the top bar: a ring (the "halo") with a bright arc,
 /// painted so it stays crisp at any scale.
+/// Logo ring + name. Laid out right to left (it sits in the bar's right
+/// corner), so the name is added first.
 fn paint_brand(ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new("Halo Clipper")
+            .font(theme::semibold(13.5))
+            .color(theme::TEXT_SECONDARY),
+    );
+    ui.add_space(6.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 28.0), egui::Sense::hover());
     let c = rect.center();
     ui.painter().circle_stroke(
@@ -4598,12 +4655,6 @@ fn paint_brand(ui: &mut egui::Ui) {
         arc,
         egui::epaint::PathStroke::new(2.0_f32, theme::ACCENT),
     ));
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new("Halo Clipper")
-            .font(theme::semibold(13.5))
-            .color(theme::TEXT_PRIMARY),
-    );
 }
 
 /// Primary call-to-action button. Uses the muted-teal `BTN_PRIMARY`

@@ -621,6 +621,174 @@ pub fn menu_separator(ui: &mut Ui) {
 
 /// Two-or-more option switch in one recessed track; the highlight slides
 /// between options. Returns the index clicked this frame, if any.
+/// "Fit to screen": lit (accent) when the selected video has been moved
+/// or resized off its fitted frame, dimmed and inert when it already fits.
+/// `width` stretches it (the clip panel); `None` sizes it to its label.
+pub fn fit_button(ui: &mut Ui, moved: bool, width: Option<f32>) -> egui::Response {
+    let font = theme::medium(12.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap("Fit to screen".to_owned(), font, Color32::WHITE);
+    let icon = 14.0;
+    let content = icon + 7.0 + galley.size().x;
+    let size = vec2(width.unwrap_or(content + 24.0), 30.0);
+    let sense = if moved { CLICK } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let lit =
+        ui.ctx()
+            .animate_bool_with_time(ui.id().with(("fit_lit", rect.min.x as i32)), moved, 0.18);
+    let hovered = moved && response.hovered();
+    let fill = lerp_color(
+        theme::BG_BUTTON_DISABLED,
+        if hovered {
+            theme::BTN_PRIMARY_HOVER
+        } else {
+            theme::BTN_PRIMARY
+        },
+        lit,
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, 7.0, fill);
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        7.0,
+        Stroke::new(
+            1.0_f32,
+            lerp_color(theme::BORDER_SUBTLE, theme::ACCENT, 0.6 * lit),
+        ),
+    );
+    let color = lerp_color(theme::TEXT_FAINT, theme::BTN_PRIMARY_TEXT, lit);
+    let left = rect.center().x - content * 0.5;
+    // Four corner brackets: "fit the frame".
+    let frame = egui::Rect::from_center_size(
+        egui::pos2(left + icon * 0.5, rect.center().y),
+        vec2(icon, icon - 3.0),
+    );
+    let stroke = Stroke::new(1.5_f32, color);
+    for (corner, dx, dy) in [
+        (frame.left_top(), 1.0, 1.0),
+        (frame.right_top(), -1.0, 1.0),
+        (frame.left_bottom(), 1.0, -1.0),
+        (frame.right_bottom(), -1.0, -1.0),
+    ] {
+        painter.line_segment([corner, corner + vec2(4.0 * dx, 0.0)], stroke);
+        painter.line_segment([corner, corner + vec2(0.0, 4.0 * dy)], stroke);
+    }
+    painter.galley(
+        egui::pos2(left + icon + 7.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    if lit > 0.0 && lit < 1.0 {
+        ui.ctx().request_repaint();
+    }
+    if moved {
+        response
+            .on_hover_text("Put the video back: centered, filling the canvas (or whole with bars when the shapes differ). Ctrl+Z undoes it.")
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response.on_hover_text(
+            "The video already fits the screen. Drag or resize it on the preview to reframe.",
+        )
+    }
+}
+
+/// The Simple Clip / Advanced switch: a large pill whose lit half slides
+/// to the active mode, each half with a small glyph of what it does.
+pub fn mode_switch(ui: &mut Ui, options: [(&str, &str); 2], selected: usize) -> Option<usize> {
+    let half = vec2(148.0, 36.0);
+    let pad = 3.0;
+    let (outer, _) = ui.allocate_exact_size(
+        vec2(half.x * 2.0 + pad * 2.0, half.y + pad * 2.0),
+        Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(outer, 12.0, theme::BG_PREVIEW);
+    painter.rect_stroke(outer, 12.0, Stroke::new(1.0_f32, theme::BORDER));
+    let selected = selected.min(1);
+    let t =
+        ui.ctx()
+            .animate_value_with_time(ui.id().with("mode_switch_knob"), selected as f32, 0.16);
+    let knob = egui::Rect::from_min_size(outer.min + vec2(pad + t * half.x, pad), half);
+    painter.rect_filled(knob, 9.0, theme::BTN_PRIMARY);
+    painter.rect_stroke(
+        knob,
+        9.0,
+        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.55)),
+    );
+    let mut clicked = None;
+    for (i, (label, tip)) in options.iter().enumerate() {
+        let rect = egui::Rect::from_min_size(outer.min + vec2(pad + i as f32 * half.x, pad), half);
+        let response = ui
+            .interact(rect, ui.id().with(("mode_switch", i)), CLICK)
+            .on_hover_text(*tip)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        // How lit this half is (follows the sliding knob).
+        let lit = 1.0 - (t - i as f32).abs().min(1.0);
+        if response.hovered() && i != selected {
+            ui.painter().rect_filled(
+                rect.shrink(1.0),
+                9.0,
+                theme::BG_BUTTON_HOVER.gamma_multiply(0.6),
+            );
+        }
+        let color = lerp_color(theme::TEXT_SECONDARY, theme::BTN_PRIMARY_TEXT, lit);
+        let galley = ui
+            .painter()
+            .layout_no_wrap((*label).to_owned(), theme::semibold(14.0), color);
+        let glyph_w = 18.0;
+        let content = glyph_w + 8.0 + galley.size().x;
+        let left = rect.center().x - content * 0.5;
+        let glyph = egui::Rect::from_center_size(
+            egui::pos2(left + glyph_w * 0.5, rect.center().y),
+            vec2(glyph_w, 14.0),
+        );
+        paint_mode_glyph(ui.painter(), glyph, i, color);
+        ui.painter().galley(
+            egui::pos2(
+                left + glyph_w + 8.0,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            color,
+        );
+        if response.clicked() && i != selected {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}
+
+/// Simple: one clip between In/Out brackets. Advanced: stacked layers.
+fn paint_mode_glyph(painter: &egui::Painter, rect: egui::Rect, mode: usize, color: Color32) {
+    let stroke = Stroke::new(1.6_f32, color);
+    if mode == 0 {
+        let bar = egui::Rect::from_center_size(rect.center(), vec2(rect.width() - 8.0, 6.0));
+        painter.rect_filled(bar, 2.0, color.gamma_multiply(0.85));
+        for (x, dir) in [(rect.left() + 1.0, 1.0), (rect.right() - 1.0, -1.0)] {
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
+            for y in [rect.top(), rect.bottom()] {
+                painter.line_segment([egui::pos2(x, y), egui::pos2(x + 3.0 * dir, y)], stroke);
+            }
+        }
+    } else {
+        for (row, (inset, width)) in [(0.0, 0.7), (4.0, 0.75), (2.0, 0.6)]
+            .into_iter()
+            .enumerate()
+        {
+            let y = rect.top() + 1.0 + row as f32 * 5.0;
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + inset, y),
+                vec2(rect.width() * width, 3.4),
+            );
+            painter.rect_filled(bar, 1.5, color.gamma_multiply(0.95 - row as f32 * 0.2));
+        }
+    }
+}
+
 pub fn segmented(
     ui: &mut Ui,
     id: &str,

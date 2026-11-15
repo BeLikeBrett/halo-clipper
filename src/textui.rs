@@ -358,7 +358,11 @@ impl ClipperApp {
             },
         );
         let finish = ui.ctx().memory(|m| m.has_focus(field_id))
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            // `consume_key` matches Enter with Shift held too (egui ignores
+            // unrequested Shift), so leave Shift+Enter to the field's newline.
+            && ui.input_mut(|i| {
+                !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            });
         let mut text = item.text.clone();
         let response = egui::Area::new(ui.id().with("inline_text_area"))
             .order(egui::Order::Foreground)
@@ -954,90 +958,72 @@ fn fill_editor(
         let mut set: Option<[u8; 3]> = None;
 
         if let Some(g) = gradient.as_mut() {
-            // Stop bar: the gradient itself, a handle at each end.
-            let (bar, _) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::hover());
-            let track = bar.shrink2(egui::vec2(15.0, 7.0));
-            let c = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
-            let mut mesh = egui::Mesh::default();
-            let i = mesh.vertices.len() as u32;
-            mesh.colored_vertex(track.left_top(), c(*rgb));
-            mesh.colored_vertex(track.right_top(), c(g.end));
-            mesh.colored_vertex(track.right_bottom(), c(g.end));
-            mesh.colored_vertex(track.left_bottom(), c(*rgb));
-            mesh.add_triangle(i, i + 1, i + 2);
-            mesh.add_triangle(i, i + 2, i + 3);
-            ui.painter().add(mesh);
-            ui.painter().rect_stroke(
-                track,
-                3.0,
-                Stroke::new(1.0_f32, Color32::from_white_alpha(30)),
-            );
-            for (which, x, color) in [
-                (Stop::Start, track.left(), *rgb),
-                (Stop::End, track.right(), g.end),
-            ] {
-                let center = egui::pos2(x, bar.center().y);
-                let hit = egui::Rect::from_center_size(center, egui::vec2(28.0, 28.0));
-                let response = ui
-                    .interact(hit, ui.id().with(("stop", which as u8)), widgets::CLICK)
-                    .on_hover_text(match which {
-                        Stop::Start => "Start color",
-                        Stop::End => "End color",
-                    })
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                let active = stop == which;
-                ui.painter().circle_filled(center, 10.0, c(color));
-                ui.painter()
-                    .circle_stroke(center, 10.0, Stroke::new(2.0_f32, theme::BG_PANEL));
-                ui.painter().circle_stroke(
-                    center,
-                    12.5,
-                    if active {
-                        Stroke::new(1.5_f32, theme::ACCENT)
-                    } else if response.hovered() {
-                        Stroke::new(1.0_f32, theme::TEXT_MUTED)
-                    } else {
-                        Stroke::NONE
-                    },
-                );
-                if response.clicked() {
-                    // First click selects the stop (swatches then color
-                    // it); clicking the selected stop toggles its picker.
-                    *picker = Some(OpenPicker {
-                        paint,
-                        stop: which,
-                        open: if active { !open } else { open },
-                        state: picker::PickerState::new(color),
-                    });
-                }
-            }
-            ui.add_space(6.0);
-            // Direction: four arrows and a swap.
+            // Two color wells: pick one, then a swatch (or the picker)
+            // colors it. Clicking the picked well again opens the picker.
+            let swap_w = 30.0;
+            let well_w = ((width - swap_w - 12.0) / 2.0).floor();
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for which in [Stop::Start, Stop::End] {
+                    let color = match which {
+                        Stop::Start => *rgb,
+                        Stop::End => g.end,
+                    };
+                    let active = stop == which;
+                    let response = color_well(
+                        ui,
+                        match which {
+                            Stop::Start => "Start",
+                            Stop::End => "End",
+                        },
+                        color,
+                        active,
+                        well_w,
+                    );
+                    if response.clicked() {
+                        *picker = Some(OpenPicker {
+                            paint,
+                            stop: which,
+                            open: if active { !open } else { open },
+                            state: picker::PickerState::new(color),
+                        });
+                    }
+                    if which == Stop::Start
+                        && swap_button(ui, swap_w)
+                            .on_hover_text("Swap colors")
+                            .clicked()
+                    {
+                        std::mem::swap(rgb, &mut g.end);
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            // Direction: each tile shows this gradient running that way.
+            ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Direction")
                         .font(theme::regular(12.0))
                         .color(theme::TEXT_MUTED),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if arrow_button(ui, None, false)
-                        .on_hover_text("Swap colors")
-                        .clicked()
-                    {
-                        std::mem::swap(rgb, &mut g.end);
-                    }
-                    ui.add_space(6.0);
-                    for angle in [135.0, 90.0, 45.0, 0.0] {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    for (angle, tip) in [
+                        (135.0, "Top right to bottom left"),
+                        (90.0, "Top to bottom"),
+                        (45.0, "Top left to bottom right"),
+                        (0.0, "Left to right"),
+                    ] {
                         let on = (g.angle.rem_euclid(360.0) - angle).abs() < 1.0;
-                        if arrow_button(ui, Some(angle), on).clicked() {
+                        if direction_tile(ui, *rgb, g.end, angle, on)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
                             g.angle = angle;
                         }
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(10.0);
         }
 
         ui.horizontal_wrapped(|ui| {
@@ -1075,46 +1061,137 @@ fn fill_editor(
     });
 }
 
-/// Small square button with a direction arrow (`None` = swap glyph).
-fn arrow_button(ui: &mut egui::Ui, angle: Option<f32>, on: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), widgets::CLICK);
-    let fill = if on {
+/// One end of a gradient: a pill with its color and name; ringed in the
+/// accent while it's the one the swatches color.
+fn color_well(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: [u8; 3],
+    active: bool,
+    width: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), widgets::CLICK);
+    let fill = if active {
         theme::BG_BUTTON_ACTIVE
     } else if response.hovered() {
         theme::BG_BUTTON_HOVER
     } else {
         theme::BG_BUTTON
     };
-    ui.painter().rect_filled(rect, 6.0, fill);
-    ui.painter().rect_stroke(
+    let painter = ui.painter();
+    painter.rect_filled(rect, 8.0, fill);
+    painter.rect_stroke(
         rect.shrink(0.5),
-        6.0,
-        Stroke::new(1.0_f32, if on { theme::ACCENT } else { theme::BORDER }),
+        8.0,
+        Stroke::new(
+            if active { 1.5_f32 } else { 1.0 },
+            if active { theme::ACCENT } else { theme::BORDER },
+        ),
     );
-    let color = if on {
-        theme::TEXT_PRIMARY
-    } else {
-        theme::TEXT_SECONDARY
-    };
-    let stroke = Stroke::new(1.5_f32, color);
+    let dot = egui::pos2(rect.left() + 18.0, rect.center().y);
+    painter.circle_filled(dot, 9.0, Color32::from_rgb(color[0], color[1], color[2]));
+    painter.circle_stroke(
+        dot,
+        9.0,
+        Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::medium(12.5),
+        if active {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_SECONDARY
+        },
+    );
+    response
+        .on_hover_text(if active {
+            "Click again for the full color picker"
+        } else {
+            "Choose this end's color"
+        })
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Round button with two opposing arrows.
+fn swap_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, 34.0), widgets::CLICK);
     let c = rect.center();
-    let arrow = |a: f32, len: f32, offset: egui::Vec2| {
-        let d = egui::vec2(a.to_radians().cos(), a.to_radians().sin());
-        let tip = c + offset + d * len;
-        let tail = c + offset - d * len;
-        ui.painter().line_segment([tail, tip], stroke);
-        let back = -d * 4.0;
-        let side = egui::vec2(-d.y, d.x) * 3.2;
-        ui.painter().line_segment([tip, tip + back + side], stroke);
-        ui.painter().line_segment([tip, tip + back - side], stroke);
-    };
-    match angle {
-        Some(a) => arrow(a, 6.0, egui::Vec2::ZERO),
-        None => {
-            arrow(0.0, 5.5, egui::vec2(0.0, -3.0));
-            arrow(180.0, 5.5, egui::vec2(0.0, 3.0));
-        }
+    if response.hovered() {
+        ui.painter().circle_filled(c, 13.0, theme::BG_BUTTON_HOVER);
     }
+    let stroke = Stroke::new(
+        1.5_f32,
+        if response.hovered() {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_MUTED
+        },
+    );
+    for (dy, dir) in [(-3.0, 1.0), (3.0, -1.0)] {
+        let tail = c + egui::vec2(-5.5 * dir, dy);
+        let tip = c + egui::vec2(5.5 * dir, dy);
+        ui.painter().line_segment([tail, tip], stroke);
+        ui.painter()
+            .line_segment([tip, tip + egui::vec2(-3.0 * dir, -2.5)], stroke);
+        ui.painter()
+            .line_segment([tip, tip + egui::vec2(-3.0 * dir, 2.5)], stroke);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A small swatch of the gradient running at `angle` (0° = left to right,
+/// 90° = top to bottom), matching how the text renders it.
+fn direction_tile(
+    ui: &mut egui::Ui,
+    from: [u8; 3],
+    to: [u8; 3],
+    angle: f32,
+    on: bool,
+) -> egui::Response {
+    // Square, so diagonals read differently from verticals.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), widgets::CLICK);
+    let tile = rect.shrink(if on { 2.5 } else { 3.0 });
+    let (dy, dx) = angle.to_radians().sin_cos();
+    let span = ((tile.width() * dx.abs() + tile.height() * dy.abs()) * 0.5).max(1.0);
+    let lerp = |p: egui::Pos2| {
+        let v = p - tile.center();
+        let t = ((v.x * dx + v.y * dy) / span * 0.5 + 0.5).clamp(0.0, 1.0);
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        Color32::from_rgb(
+            mix(from[0], to[0]),
+            mix(from[1], to[1]),
+            mix(from[2], to[2]),
+        )
+    };
+    let mut mesh = egui::Mesh::default();
+    for corner in [
+        tile.left_top(),
+        tile.right_top(),
+        tile.right_bottom(),
+        tile.left_bottom(),
+    ] {
+        mesh.colored_vertex(corner, lerp(corner));
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    let painter = ui.painter();
+    painter.add(mesh);
+    // Square tile corners, then a rounded frame drawn over them.
+    painter.rect_stroke(tile, 4.0, Stroke::new(3.0_f32, theme::BG_PANEL));
+    painter.rect_stroke(
+        rect.shrink(0.75),
+        6.0,
+        if on {
+            Stroke::new(1.5_f32, theme::ACCENT)
+        } else if response.hovered() {
+            Stroke::new(1.0_f32, theme::TEXT_MUTED)
+        } else {
+            Stroke::new(1.0_f32, theme::BORDER)
+        },
+    );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1416,53 +1493,14 @@ pub(super) struct BandDrag {
     target: Option<LaneTarget>,
 }
 
-/// Row geometry of the timeline, for dragging text between lanes.
-pub(super) struct LaneRows<'a> {
-    pub top: f32,
-    pub height: f32,
-    pub inset: f32,
-    pub tracks: &'a [Track],
-}
-
-impl LaneRows<'_> {
-    fn row_top(&self, index: usize) -> f32 {
-        self.top + index as f32 * self.height
+impl BandDrag {
+    /// The text being moved as a whole (not trimmed).
+    pub(super) fn moving(&self) -> Option<TextId> {
+        (self.grab == Grab::Move).then_some(self.id)
     }
-    /// Lane the pointer at `y` drops `range` of text `id` on.
-    fn target(
-        &self,
-        y: f32,
-        own: TrackId,
-        id: TextId,
-        (start, end): (i64, i64),
-        texts: &[TextItem],
-    ) -> Option<LaneTarget> {
-        let own_row = self.tracks.iter().position(|t| t.id == own)?;
-        let rel = (y - self.top) / self.height;
-        let row = rel.floor();
-        if row >= 0.0 && (row as usize) == own_row {
-            return None;
-        }
-        let free = |lane: TrackId| {
-            !texts
-                .iter()
-                .any(|t| t.track == lane && t.id != id && start < t.end_ms && end > t.start_ms)
-        };
-        let within = rel - row;
-        if row >= 0.0 && (0.2..0.8).contains(&within) {
-            if let Some(t) = self
-                .tracks
-                .get(row as usize)
-                .filter(|t| t.kind == TrackKind::Text && free(t.id))
-            {
-                return Some(LaneTarget::Lane(t.id));
-            }
-        }
-        let visual = self.tracks.iter().filter(|t| t.kind.is_visual()).count();
-        let slot = (rel + 0.5).floor().clamp(0.0, visual as f32) as usize;
-        // Dropping right above or below its own lane, alone there, changes nothing.
-        let alone = texts.iter().filter(|t| t.track == own).count() == 1;
-        (!(alone && (slot == own_row || slot == own_row + 1))).then_some(LaneTarget::New(slot))
+    /// The lane the timeline resolved for the pointer this frame.
+    pub(super) fn set_target(&mut self, target: LaneTarget) {
+        self.target = Some(target);
     }
 }
 
@@ -1535,6 +1573,20 @@ fn retime(
 }
 
 /// Paints one text bar.
+/// A text bar picked up by a drag: selected look plus a drop shadow.
+pub(super) fn paint_lifted_text_bar(painter: &egui::Painter, bar: egui::Rect, item: &TextItem) {
+    painter.add(
+        egui::Shadow {
+            offset: egui::vec2(0.0, 3.0),
+            blur: 10.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(120),
+        }
+        .as_shape(bar, 6.0),
+    );
+    paint_text_bar(painter, bar, item, true, true, false);
+}
+
 fn paint_text_bar(
     painter: &egui::Painter,
     bar: egui::Rect,
@@ -1603,7 +1655,7 @@ pub(super) fn show_text_lane(
     painter: &egui::Painter,
     lane: egui::Rect,
     lane_id: TrackId,
-    rows: &LaneRows,
+    inset: f32,
     lanes: editor::Lanes,
     texts: &[TextItem],
     selected: Option<TextId>,
@@ -1633,8 +1685,8 @@ pub(super) fn show_text_lane(
         let x0 = lanes.x_of(item.start_ms);
         let x1 = lanes.x_of(item.end_ms).max(x0 + 4.0);
         let bar = egui::Rect::from_min_max(
-            egui::pos2(x0, lane.top() + rows.inset),
-            egui::pos2(x1, lane.bottom() - rows.inset),
+            egui::pos2(x0, lane.top() + inset),
+            egui::pos2(x1, lane.bottom() - inset),
         );
         let response = ui.interact(
             bar.intersect(lane),
@@ -1726,36 +1778,12 @@ pub(super) fn show_text_lane(
                         begin: response.drag_started(),
                     });
                 }
-                if d.grab == Grab::Move {
-                    let moved_far = (pos.y - d.press.y).abs() > rows.height * 0.35;
-                    let target = if moved_far {
-                        rows.target(pos.y, lane_id, item.id, (start, end), texts)
-                    } else {
-                        None
-                    };
-                    if let Some(active) = drag.as_mut() {
-                        active.target = target;
-                    }
-                }
             }
         }
+        // The timeline resolves the lane (see `editor::resolve_lane`).
         let target = drag.filter(|d| d.id == item.id).and_then(|d| d.target);
         if response.drag_stopped() {
-            let own_free = !texts.iter().any(|t| {
-                t.track == lane_id
-                    && t.id != item.id
-                    && item.start_ms < t.end_ms
-                    && item.end_ms > t.start_ms
-            });
-            // Moved onto a neighbour without leaving the lane: open a
-            // fresh lane right above instead of overlapping.
-            let target = target.or_else(|| {
-                (!own_free)
-                    .then(|| rows.tracks.iter().position(|t| t.id == lane_id))
-                    .flatten()
-                    .map(LaneTarget::New)
-            });
-            if let Some(target) = target {
+            if let Some(target) = target.filter(|t| *t != LaneTarget::Lane(lane_id)) {
                 actions.push(BandAction::Relane {
                     id: item.id,
                     target,
@@ -1782,42 +1810,9 @@ pub(super) fn show_text_lane(
 
         let is_selected = selected == Some(item.id);
         let hot = response.hovered() || active.is_some();
-        match target {
-            None => paint_text_bar(painter, bar, item, is_selected, hot, disabled),
-            Some(target) => {
-                // Lifted out of the lane: draw it where it will land.
-                let (top, insert) = match target {
-                    LaneTarget::Lane(id) => (
-                        rows.tracks
-                            .iter()
-                            .position(|t| t.id == id)
-                            .map(|i| rows.row_top(i)),
-                        false,
-                    ),
-                    LaneTarget::New(slot) => (Some(rows.row_top(slot) - rows.height * 0.5), true),
-                };
-                if let Some(top) = top {
-                    let float = painter.with_clip_rect(
-                        egui::Rect::from_min_max(
-                            egui::pos2(lane.left(), f32::NEG_INFINITY),
-                            egui::pos2(lane.right(), f32::INFINITY),
-                        )
-                        .intersect(ui.clip_rect()),
-                    );
-                    if insert {
-                        let y = top + rows.height * 0.5;
-                        float.line_segment(
-                            [egui::pos2(lane.left(), y), egui::pos2(lane.right(), y)],
-                            Stroke::new(2.0_f32, theme::ACCENT),
-                        );
-                    }
-                    let ghost = egui::Rect::from_min_max(
-                        egui::pos2(bar.left(), top + rows.inset),
-                        egui::pos2(bar.right(), top + rows.height - rows.inset),
-                    );
-                    paint_text_bar(&float, ghost, item, true, true, false);
-                }
-            }
+        // A bar being moved is drawn by the timeline, gliding to its lane.
+        if target.is_none() {
+            paint_text_bar(painter, bar, item, is_selected, hot, disabled);
         }
     }
     actions

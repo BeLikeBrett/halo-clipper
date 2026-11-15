@@ -209,14 +209,17 @@ pub(super) struct TimelineDropZone {
     rows_top: f32,
     /// Index in `Project::tracks` of each visible row.
     real: Vec<usize>,
+    /// Video lanes among the visible rows (by row), for dropping onto one.
+    video: Vec<Option<TrackId>>,
     visual_rows: usize,
     total: usize,
     snaps: Vec<i64>,
 }
 impl TimelineDropZone {
     /// Drop time (snapped to 0, the playhead and clip ends within 12 px)
-    /// and insertion row above the audio rows, for a pointer over the lanes.
-    fn spot_and_row(&self, pos: egui::Pos2) -> Option<(i64, usize)> {
+    /// and where: the middle of a video lane drops onto it, elsewhere a new
+    /// lane opens at the nearest boundary above the audio rows.
+    fn spot_and_row(&self, pos: egui::Pos2) -> Option<(i64, FileLane)> {
         if !self.area.contains(pos) {
             return None;
         }
@@ -229,16 +232,41 @@ impl TimelineDropZone {
             .filter(|s| (s - raw).abs() <= reach)
             .min_by_key(|s| (s - raw).abs())
             .unwrap_or(raw);
-        let row = ((pos.y - self.rows_top) / LANE_HEIGHT + 0.5)
-            .floor()
-            .clamp(0.0, self.visual_rows as f32) as usize;
-        Some((start, row))
+        let rel = ((pos.y - self.rows_top) / LANE_HEIGHT).max(0.0);
+        let row = rel.floor() as usize;
+        if (0.25..0.75).contains(&(rel - row as f32)) {
+            if let Some(Some(lane)) = self.video.get(row) {
+                return Some((start, FileLane::Onto(*lane, row)));
+            }
+        }
+        let slot = (rel + 0.5).floor().min(self.visual_rows as f32) as usize;
+        Some((start, FileLane::Insert(slot)))
     }
-    /// Drop time and `Project::tracks` insertion index.
-    pub(super) fn spot(&self, pos: egui::Pos2) -> Option<(i64, usize)> {
-        let (start, row) = self.spot_and_row(pos)?;
-        Some((start, self.real.get(row).copied().unwrap_or(self.total)))
+    /// Drop time, the lane to drop onto (if it has room), and the
+    /// `Project::tracks` index for a new lane.
+    pub(super) fn spot(&self, pos: egui::Pos2) -> Option<(i64, Option<TrackId>, usize)> {
+        let (start, lane) = self.spot_and_row(pos)?;
+        Some(match lane {
+            FileLane::Onto(id, row) => (
+                start,
+                Some(id),
+                self.real.get(row).copied().unwrap_or(self.total),
+            ),
+            FileLane::Insert(slot) => (
+                start,
+                None,
+                self.real.get(slot).copied().unwrap_or(self.total),
+            ),
+        })
     }
+}
+
+/// Where dropped files go: onto a video lane (and its row), or a new lane
+/// at this row boundary.
+#[derive(Clone, Copy)]
+enum FileLane {
+    Onto(TrackId, usize),
+    Insert(usize),
 }
 
 #[derive(Clone)]
@@ -251,14 +279,138 @@ struct Placement {
     kind: TrackKind,
     label: String,
 }
-fn insertion_slot(y: f32, top: f32, tracks: &[Track], kind: TrackKind) -> usize {
-    let nearest = ((y - top) / LANE_HEIGHT + 0.5).floor().max(0.0) as usize;
-    let videos = tracks.iter().filter(|t| t.kind.is_visual()).count();
-    if kind.is_visual() {
-        nearest.min(videos)
+/// What a vertical drag needs to know about the item being moved.
+pub(super) struct LaneAsk<'a> {
+    /// Kind of lane the item lives on.
+    pub kind: TrackKind,
+    /// Lane it came from (`None` for new media).
+    pub own: Option<TrackId>,
+    /// The item is the only thing on `own`: a new lane right next to it
+    /// would change nothing.
+    pub alone: bool,
+    /// The item fits on this lane at its current time.
+    pub fits: &'a dyn Fn(TrackId) -> bool,
+}
+
+/// The lane a dragged item lands on. `y` is relative to the lanes' top in
+/// the layout as drawn, with last frame's insertion `gap` open. Reading the
+/// drawn layout (not the closed one) keeps an open gap under the pointer
+/// stable instead of flickering as the lanes slide.
+pub(super) fn resolve_lane(
+    y: f32,
+    gap: Option<usize>,
+    tracks: &[Track],
+    ask: &LaneAsk,
+) -> textui::LaneTarget {
+    use textui::LaneTarget::{Lane, New};
+    let h = LANE_HEIGHT;
+    let visual = tracks.iter().filter(|t| t.kind.is_visual()).count();
+    let (lo, hi) = if ask.kind.is_visual() {
+        (0, visual)
     } else {
-        nearest.max(videos).min(tracks.len())
+        (visual, tracks.len())
+    };
+    let gap = gap.filter(|g| (lo..=hi).contains(g));
+    if let Some(g) = gap {
+        let top = g as f32 * h;
+        if (top..top + h).contains(&y) {
+            return New(g);
+        }
     }
+    let y = match gap {
+        Some(g) if y >= (g + 1) as f32 * h => y - h,
+        _ => y,
+    }
+    .max(0.0);
+    let row = (y / h).floor() as usize;
+    let within = y / h - row as f32;
+    let fits = |id: TrackId| (ask.fits)(id);
+    let decided = match tracks.get(row) {
+        None => New(hi),
+        // Its own lane keeps it while it fits: horizontal moves with a
+        // little vertical wobble never open a lane.
+        Some(t) if Some(t.id) == ask.own && fits(t.id) => Lane(t.id),
+        Some(t) if t.kind == ask.kind && (0.25..0.75).contains(&within) => {
+            if fits(t.id) {
+                Lane(t.id)
+            } else if ask.kind.is_visual() {
+                // Occupied: a new layer on top of it.
+                New(row)
+            } else {
+                New(row + 1)
+            }
+        }
+        Some(_) => New(if within < 0.5 { row } else { row + 1 }),
+    };
+    match decided {
+        New(slot) => {
+            let slot = slot.clamp(lo, hi);
+            let own_row = ask
+                .own
+                .and_then(|own| tracks.iter().position(|t| t.id == own));
+            match (ask.alone, own_row, ask.own) {
+                (true, Some(r), Some(own)) if slot == r || slot == r + 1 => Lane(own),
+                _ => New(slot),
+            }
+        }
+        lane => lane,
+    }
+}
+
+/// The lane a drop would create: a soft accent row with a label in the
+/// header column. Drawn under the lanes, which slide aside to reveal it.
+fn paint_new_lane(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    left: f32,
+    slot: usize,
+    kind: TrackKind,
+) {
+    let top = rect.top() + slot as f32 * LANE_HEIGHT;
+    let row = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), top),
+        egui::vec2(rect.width(), LANE_HEIGHT),
+    );
+    painter.rect_filled(row, 0.0, theme::BG_PANEL);
+    let well = egui::Rect::from_min_max(
+        egui::pos2(left + 4.0, row.top() + 4.0),
+        egui::pos2(row.right() - 4.0, row.bottom() - 4.0),
+    );
+    painter.rect_filled(well, 6.0, theme::ACCENT.gamma_multiply(0.08));
+    painter.rect_stroke(
+        well,
+        6.0,
+        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.45)),
+    );
+    let name = match kind {
+        TrackKind::Video => "New video layer",
+        TrackKind::Audio => "New audio layer",
+        TrackKind::Text => "New text layer",
+    };
+    painter.text(
+        egui::pos2(rect.left() + 14.0, row.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        theme::medium(11.5),
+        theme::ACCENT,
+    );
+}
+
+/// Eases a drawn position toward `target` (frame-rate independent).
+fn glide(ctx: &egui::Context, id: egui::Id, target: f32) -> f32 {
+    let dt = ctx.input(|i| i.stable_dt).min(0.05);
+    let value = ctx.data_mut(|d| {
+        let y = d.get_temp_mut_or_insert_with(id, || target);
+        *y += (target - *y) * (1.0 - (-dt * 24.0).exp());
+        if (target - *y).abs() < 0.5 {
+            *y = target;
+        }
+        *y
+    });
+    if value != target {
+        ctx.request_repaint();
+    }
+    value
 }
 fn ruler_step(duration: i64, width: f32) -> i64 {
     let desired = duration as f32 / (width / 100.0).max(1.0);
@@ -285,6 +437,7 @@ fn short_duration(ms: i64) -> String {
         format!("{}:{:02}", ms / 60_000, (ms / 1000) % 60)
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn placement(
     p: &Project,
     tracks: &[Track],
@@ -292,6 +445,7 @@ fn placement(
     payload: &EditorDrag,
     pos: egui::Pos2,
     lanes: Lanes,
+    gap: Option<usize>,
     ctx: &egui::Context,
 ) -> Option<Placement> {
     let (length, grab, kind, exclude, label) = match payload {
@@ -370,28 +524,31 @@ fn placement(
             }
         }
     }
-    let top = lanes.top;
-    let slot = insertion_slot(pos.y, top, tracks, kind);
-    let row = ((pos.y - top) / LANE_HEIGHT).floor().max(0.0) as usize;
-    let within = (pos.y - top).rem_euclid(LANE_HEIGHT);
-    let target = if matches!(payload, EditorDrag::Clip { .. })
-        && within > 10.0
-        && within < LANE_HEIGHT - 10.0
-    {
-        tracks
-            .get(row)
-            .filter(|t| t.kind == kind)
-            .map(|t| t.id)
-            .filter(|id| {
-                !clips.iter().any(|c| {
-                    c.track_id == *id
-                        && Some(c.id) != exclude
-                        && start < c.cut_end_ms()
-                        && start + length > c.cut_start_ms
-                })
-            })
-    } else {
-        None
+    let own = exclude.and_then(|id| clips.iter().find(|c| c.id == id).map(|c| c.track_id));
+    let fits = |lane: TrackId| {
+        !clips.iter().any(|c| {
+            c.track_id == lane
+                && Some(c.id) != exclude
+                && start < c.cut_end_ms()
+                && start + length > c.cut_start_ms
+        })
+    };
+    let ask = LaneAsk {
+        kind,
+        own,
+        alone: own.is_some_and(|lane| {
+            clips
+                .iter()
+                .all(|c| c.track_id != lane || Some(c.id) == exclude)
+        }),
+        fits: &fits,
+    };
+    let (slot, target) = match resolve_lane(pos.y - lanes.top, gap, tracks, &ask) {
+        textui::LaneTarget::Lane(id) => (
+            tracks.iter().position(|t| t.id == id).unwrap_or(0),
+            Some(id),
+        ),
+        textui::LaneTarget::New(slot) => (slot, None),
     };
     Some(Placement {
         start,
@@ -675,18 +832,9 @@ impl ClipperApp {
         let mut transform = c.transform;
         let previous = transform;
         textui::section(ui, "Frame");
-        let fit = usize::from(transform.fit == crate::framing::Fit::Fill);
-        if let Some(i) = crate::widgets::segmented_fill(
-            ui,
-            "clip_fit",
-            &[
-                ("Fit", "Show the whole video"),
-                ("Fill", "Fill the canvas, cropping the edges"),
-            ],
-            fit,
-            width,
-        ) {
-            transform.fit = [crate::framing::Fit::Fit, crate::framing::Fit::Fill][i];
+        if crate::widgets::fit_button(ui, !self.frame_is_fitted(c.id), Some(width)).clicked() {
+            self.fit_to_screen(c.id);
+            return;
         }
         ui.add_space(8.0);
         let mut zoom = transform.scale * 100.0;
@@ -1355,7 +1503,9 @@ impl ClipperApp {
             .show(ui, |ui| {
                 let lane_h = LANE_HEIGHT;
                 let rows = tracks.len();
-                let reserve = usize::from(payload.is_some() && !tracks.is_empty());
+                let text_drag = band_drag.as_ref().and_then(|d| d.moving());
+                let dragging = payload.is_some() || text_drag.is_some();
+                let reserve = usize::from(dragging && !tracks.is_empty());
                 let content_h = (rows + reserve).max(1) as f32 * lane_h;
                 let total_h = content_h.max(height);
                 let (rect, _) = ui.allocate_exact_size(
@@ -1391,13 +1541,62 @@ impl ClipperApp {
                     .ctx()
                     .pointer_hover_pos()
                     .filter(|pos| rect.intersect(ui.clip_rect()).contains(*pos));
+                // Last frame's insertion gap, so the lane decision reads
+                // the layout as drawn.
+                let gap_id = ui.id().with("drag_gap");
+                let last_gap = ui.data(|d| d.get_temp::<Option<usize>>(gap_id)).flatten();
                 let placement = payload.as_ref().and_then(|drag| {
-                    hover.and_then(|pos| placement(p, &tracks, &clips, drag, pos, lanes, ui.ctx()))
+                    hover.and_then(|pos| {
+                        placement(p, &tracks, &clips, drag, pos, lanes, last_gap, ui.ctx())
+                    })
                 });
-                let gap = placement
-                    .as_ref()
-                    .filter(|drop| drop.target.is_none())
-                    .map(|drop| drop.slot);
+                // A text bar being moved: same lane rules as clips.
+                let text_target = text_drag.and_then(|id| {
+                    let item = p.texts.iter().find(|t| t.id == id)?;
+                    let pos = ui.ctx().pointer_interact_pos()?;
+                    let fits = |lane: TrackId| {
+                        !p.texts.iter().any(|t| {
+                            t.track == lane
+                                && t.id != id
+                                && item.start_ms < t.end_ms
+                                && item.end_ms > t.start_ms
+                        })
+                    };
+                    let ask = LaneAsk {
+                        kind: TrackKind::Text,
+                        own: Some(item.track),
+                        alone: p.texts.iter().all(|t| t.track != item.track || t.id == id),
+                        fits: &fits,
+                    };
+                    Some(resolve_lane(pos.y - rect.top(), last_gap, &tracks, &ask))
+                });
+                if let (Some(d), Some(target)) = (band_drag.as_mut(), text_target) {
+                    d.set_target(target);
+                }
+                let gap = match text_target {
+                    Some(textui::LaneTarget::New(slot)) => Some(slot),
+                    Some(_) => None,
+                    None => placement
+                        .as_ref()
+                        .filter(|drop| drop.target.is_none())
+                        .map(|drop| drop.slot),
+                };
+                if dragging {
+                    ui.data_mut(|d| d.insert_temp(gap_id, gap));
+                } else {
+                    ui.data_mut(|d| {
+                        d.remove::<Option<usize>>(gap_id);
+                        d.remove::<f32>(gap_id.with("ghost"));
+                    });
+                }
+                // The opening lane, under the rows that slide away from it.
+                if let Some(slot) = gap {
+                    let kind = text_target
+                        .map(|_| TrackKind::Text)
+                        .or(placement.as_ref().map(|place| place.kind))
+                        .unwrap_or(TrackKind::Video);
+                    paint_new_lane(&painter, rect, left, slot, kind);
+                }
                 // The clip being moved leaves its old spot the moment a
                 // drop position exists; only the ghost is drawn.
                 let moving = match (payload.as_deref(), &placement) {
@@ -1413,7 +1612,7 @@ impl ClipperApp {
                     let shift = ui.ctx().animate_value_with_time(
                         ui.id().with(("lane_insertion", t.id)),
                         target_shift,
-                        0.10,
+                        0.14,
                     );
                     let top = rect.top() + index as f32 * lane_h + shift;
                     let row = egui::Rect::from_min_max(
@@ -1556,12 +1755,7 @@ impl ClipperApp {
                             &lane_painter,
                             lane.intersect(lane_area),
                             t.id,
-                            &textui::LaneRows {
-                                top: rect.top(),
-                                height: lane_h,
-                                inset: CLIP_INSET,
-                                tracks: &tracks,
-                            },
+                            CLIP_INSET,
                             lanes,
                             &p.texts,
                             p.selected_text,
@@ -1703,33 +1897,11 @@ impl ClipperApp {
                             Some(target) => tracks.iter().position(|t| t.id == target).unwrap_or(0),
                             None => place.slot,
                         };
-                        let y = rect.top() + row_index as f32 * lane_h;
-                        if place.target.is_none() {
-                            let lane = egui::Rect::from_min_size(
-                                egui::pos2(rect.left(), y),
-                                egui::vec2(rect.width(), lane_h),
-                            );
-                            painter.rect_filled(lane, 0.0, theme::ACCENT.gamma_multiply(0.07));
-                            painter.line_segment(
-                                [lane.left_top(), lane.right_top()],
-                                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.5)),
-                            );
-                            painter.line_segment(
-                                [lane.left_bottom(), lane.right_bottom()],
-                                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.5)),
-                            );
-                            painter.text(
-                                egui::pos2(rect.left() + 14.0, y + lane_h * 0.5),
-                                Align2::LEFT_CENTER,
-                                if place.kind == TrackKind::Video {
-                                    "+ Video track"
-                                } else {
-                                    "+ Audio track"
-                                },
-                                theme::medium(11.5),
-                                theme::ACCENT,
-                            );
-                        }
+                        let y = glide(
+                            ui.ctx(),
+                            gap_id.with("ghost"),
+                            rect.top() + row_index as f32 * lane_h,
+                        );
                         let x0 = lanes.x_of(place.start);
                         let ghost = egui::Rect::from_min_max(
                             egui::pos2(x0, y + CLIP_INSET),
@@ -1814,6 +1986,32 @@ impl ClipperApp {
                     }
                 }
 
+                // A text bar being moved glides to the lane it will land on.
+                if let (Some(id), Some(target)) = (text_drag, text_target) {
+                    let row = match target {
+                        textui::LaneTarget::Lane(lane) => {
+                            tracks.iter().position(|t| t.id == lane).unwrap_or(0)
+                        }
+                        textui::LaneTarget::New(slot) => slot,
+                    };
+                    let y = glide(
+                        ui.ctx(),
+                        gap_id.with("ghost"),
+                        rect.top() + row as f32 * lane_h,
+                    );
+                    if let Some(item) = p.texts.iter().find(|t| t.id == id) {
+                        let x0 = lanes.x_of(item.start_ms);
+                        let bar = egui::Rect::from_min_max(
+                            egui::pos2(x0, y + CLIP_INSET),
+                            egui::pos2(
+                                lanes.x_of(item.end_ms).max(x0 + 4.0),
+                                y + lane_h - CLIP_INSET,
+                            ),
+                        );
+                        textui::paint_lifted_text_bar(&lane_painter, bar, item);
+                    }
+                }
+
                 // ── Playhead line (grabbable a few px either side) ──
                 let viewport = ui.clip_rect().intersect(rect);
                 let x = lanes.x_of(playhead);
@@ -1858,6 +2056,10 @@ impl ClipperApp {
                 .iter()
                 .filter_map(|t| real_indices.get(&t.id).copied())
                 .collect(),
+            video: tracks
+                .iter()
+                .map(|t| (t.kind == TrackKind::Video && !t.muted).then_some(t.id))
+                .collect(),
             visual_rows: tracks.iter().filter(|t| t.kind.is_visual()).count(),
             total: p.tracks.len(),
             snaps: [0, playhead]
@@ -1875,18 +2077,38 @@ impl ClipperApp {
             file_spot.is_some(),
             0.12,
         );
-        if let Some((start, row)) = file_spot {
+        if let Some((start, lane)) = file_spot {
             let painter = ui.painter_at(lanes_view);
             crate::widgets::paint_drop_zone(&painter, lanes_view.shrink(1.0), drop_fade, None);
-            let y = rows_top + row as f32 * LANE_HEIGHT;
             let x = zone.lanes.x_of(start);
-            painter.line_segment(
-                [
-                    egui::pos2(zone.lanes.left, y),
-                    egui::pos2(lanes_view.right(), y),
-                ],
-                Stroke::new(2.0_f32, theme::ACCENT.gamma_multiply(drop_fade)),
-            );
+            let y = match lane {
+                FileLane::Onto(_, row) => {
+                    // The lane it lands on, softly lit.
+                    let top = rows_top + row as f32 * LANE_HEIGHT;
+                    let well = egui::Rect::from_min_max(
+                        egui::pos2(zone.lanes.left + 2.0, top + 3.0),
+                        egui::pos2(lanes_view.right() - 3.0, top + LANE_HEIGHT - 3.0),
+                    );
+                    painter.rect_filled(well, 6.0, theme::ACCENT.gamma_multiply(0.10 * drop_fade));
+                    painter.rect_stroke(
+                        well,
+                        6.0,
+                        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.55 * drop_fade)),
+                    );
+                    top + LANE_HEIGHT * 0.5
+                }
+                FileLane::Insert(slot) => {
+                    let y = rows_top + slot as f32 * LANE_HEIGHT;
+                    painter.line_segment(
+                        [
+                            egui::pos2(zone.lanes.left, y),
+                            egui::pos2(lanes_view.right(), y),
+                        ],
+                        Stroke::new(2.0_f32, theme::ACCENT.gamma_multiply(drop_fade)),
+                    );
+                    y
+                }
+            };
             painter.line_segment(
                 [
                     egui::pos2(x, lanes_view.top()),
@@ -2284,6 +2506,7 @@ mod interaction_tests {
                 &drag,
                 egui::pos2(x, 20.0),
                 Lanes::new(rect, p.canvas_length_ms()),
+                None,
                 &ctx,
             )
             .unwrap()
@@ -2310,6 +2533,7 @@ mod interaction_tests {
             &drag,
             egui::pos2(HEADER_W, 10.0),
             Lanes::new(rect, p.canvas_length_ms()),
+            None,
             &ctx,
         )
         .unwrap();
@@ -2320,6 +2544,7 @@ mod interaction_tests {
             &drag,
             egui::pos2(HEADER_W, LANE_HEIGHT - 8.0),
             Lanes::new(rect, p.canvas_length_ms()),
+            None,
             &ctx,
         )
         .unwrap();
@@ -2362,5 +2587,102 @@ mod interaction_tests {
     fn ruler_ticks_never_repeat_whole_second_labels() {
         assert_eq!(ruler_step(13388, 1800.0), 1000);
         assert!(ruler_step(2000, 1200.0) < 1000); // fractional labels at close scale
+    }
+}
+
+#[cfg(test)]
+mod lane_drag_tests {
+    use super::*;
+    use textui::LaneTarget::{Lane, New};
+
+    /// T1, V1, V2, A1 (top to bottom), as the timeline shows them.
+    fn lanes() -> Vec<Track> {
+        let mut p = Project::empty();
+        let v2 = p.new_track(TrackKind::Video, usize::MAX);
+        p.new_track(TrackKind::Audio, usize::MAX);
+        p.new_track(TrackKind::Video, 0);
+        p.new_track(TrackKind::Text, 0);
+        let mut view = p.tracks.clone();
+        view.sort_by_key(|t| {
+            (
+                !t.kind.is_visual(),
+                t.id != v2 && t.kind == TrackKind::Video,
+            )
+        });
+        view.sort_by_key(|t| match t.kind {
+            TrackKind::Text => 0,
+            TrackKind::Video if t.id == v2 => 2,
+            TrackKind::Video => 1,
+            TrackKind::Audio => 3,
+        });
+        view
+    }
+    const H: f32 = LANE_HEIGHT;
+    fn mid(row: usize) -> f32 {
+        (row as f32 + 0.5) * H
+    }
+
+    #[test]
+    fn middle_of_a_free_lane_of_its_kind_targets_it_edges_insert() {
+        let t = lanes();
+        let fits = |_: TrackId| true;
+        let ask = LaneAsk {
+            kind: TrackKind::Video,
+            own: Some(t[2].id),
+            alone: false,
+            fits: &fits,
+        };
+        assert_eq!(resolve_lane(mid(1), None, &t, &ask), Lane(t[1].id));
+        assert_eq!(resolve_lane(H + 3.0, None, &t, &ask), New(1));
+        assert_eq!(resolve_lane(2.0 * H - 3.0, None, &t, &ask), New(2));
+        // Never among the audio lanes, never above them for audio.
+        assert_eq!(resolve_lane(mid(3), None, &t, &ask), New(3));
+    }
+
+    #[test]
+    fn an_occupied_lane_opens_a_layer_above_and_its_own_lane_holds() {
+        let t = lanes();
+        let (v1, v2) = (t[1].id, t[2].id);
+        let fits = move |id: TrackId| id != v1;
+        let ask = LaneAsk {
+            kind: TrackKind::Video,
+            own: Some(v2),
+            alone: false,
+            fits: &fits,
+        };
+        assert_eq!(resolve_lane(mid(1), None, &t, &ask), New(1));
+        // A little vertical wobble on its own lane never opens a lane.
+        assert_eq!(resolve_lane(2.0 * H + 2.0, None, &t, &ask), Lane(v2));
+    }
+
+    #[test]
+    fn an_open_gap_stays_while_the_pointer_is_in_it() {
+        let t = lanes();
+        let fits = |_: TrackId| true;
+        let ask = LaneAsk {
+            kind: TrackKind::Text,
+            own: Some(t[0].id),
+            alone: false,
+            fits: &fits,
+        };
+        // Gap open at row 1 (between T1 and V1): anywhere in it keeps it.
+        assert_eq!(resolve_lane(H + 1.0, Some(1), &t, &ask), New(1));
+        assert_eq!(resolve_lane(2.0 * H - 1.0, Some(1), &t, &ask), New(1));
+        // Below it, rows read one lower: drawn row 2 is V1.
+        assert_eq!(resolve_lane(mid(2), Some(1), &t, &ask), New(2));
+    }
+
+    #[test]
+    fn a_new_lane_right_next_to_its_only_occupant_changes_nothing() {
+        let t = lanes();
+        let fits = |_: TrackId| true;
+        let ask = LaneAsk {
+            kind: TrackKind::Text,
+            own: Some(t[0].id),
+            alone: true,
+            fits: &fits,
+        };
+        assert_eq!(resolve_lane(H + 3.0, None, &t, &ask), Lane(t[0].id));
+        assert_eq!(resolve_lane(2.0 * H - 3.0, None, &t, &ask), New(2));
     }
 }

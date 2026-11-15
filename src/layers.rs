@@ -432,9 +432,15 @@ impl ClipperApp {
     }
 
     /// Files dropped onto the Advanced timeline: imported (or reused from
-    /// Media) and placed one after another from `start` on a new row at
-    /// view `index`. One undo step.
-    pub(super) fn drop_on_timeline(&mut self, paths: Vec<PathBuf>, start: i64, index: usize) {
+    /// Media) and placed one after another from `start`, on `lane` where
+    /// they fit, else on a new row at `index`. One undo step.
+    pub(super) fn drop_on_timeline(
+        &mut self,
+        paths: Vec<PathBuf>,
+        start: i64,
+        lane: Option<TrackId>,
+        index: usize,
+    ) {
         let mut errors = Vec::new();
         let mut placed = 0;
         let mut at = start;
@@ -455,7 +461,7 @@ impl ClipperApp {
             let Some(p) = &mut self.project else { return };
             let length = info.duration_ms;
             let id = p.import_asset(LayerSource { path, media: info });
-            p.place_asset(id, at, None, index);
+            p.place_asset(id, at, lane, index);
             at += length;
             placed += 1;
         }

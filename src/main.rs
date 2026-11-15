@@ -26,6 +26,8 @@ mod timeline;
 mod track;
 mod updater;
 mod video_fbo;
+#[cfg(target_os = "linux")]
+mod wayland_drop;
 mod widgets;
 
 use app::ClipperApp;

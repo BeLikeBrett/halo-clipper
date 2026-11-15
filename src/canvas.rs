@@ -173,6 +173,62 @@ pub(super) fn reset_transform(source: (u32, u32), canvas: (u32, u32), opacity: f
     }
 }
 
+impl ClipperApp {
+    /// How "Fit to screen" frames this clip on the current canvas.
+    fn fitted_transform(&self, id: ClipId) -> Option<Transform> {
+        let p = self.project.as_ref()?;
+        let media = p.canvas_media();
+        let canvas = (media.width, media.height);
+        let clip = track::clip_by_id(&p.clips, id)?;
+        let m = p.clip_source(clip).1;
+        Some(reset_transform(
+            (m.width, m.height),
+            canvas,
+            clip.transform.opacity,
+        ))
+    }
+
+    /// The clip shows where "Fit to screen" would put it. Compares the
+    /// drawn frame, not the fields: Fit and Fill look the same when the
+    /// shapes match.
+    pub(super) fn frame_is_fitted(&self, id: ClipId) -> bool {
+        let Some(p) = self.project.as_ref() else {
+            return true;
+        };
+        let (Some(clip), Some(fitted)) =
+            (track::clip_by_id(&p.clips, id), self.fitted_transform(id))
+        else {
+            return true;
+        };
+        let media = p.canvas_media();
+        let canvas = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(media.width.max(1) as f32, media.height.max(1) as f32),
+        );
+        let m = p.clip_source(clip).1;
+        let a = layer_rect(canvas, m.width, m.height, clip.transform);
+        let b = layer_rect(canvas, m.width, m.height, fitted);
+        (a.min - b.min).length() < 0.5 && (a.max - b.max).length() < 0.5
+    }
+
+    /// Centers the clip: fills the canvas when the shapes match, fits it
+    /// whole with bars when they don't (gameplay in 9:16). One undo step.
+    pub(super) fn fit_to_screen(&mut self, id: ClipId) {
+        let Some(fitted) = self.fitted_transform(id) else {
+            return;
+        };
+        self.canvas_ui.stop_wheel();
+        self.push_undo();
+        if let Some(clip) = self
+            .project
+            .as_mut()
+            .and_then(|p| p.clips.iter_mut().find(|c| c.id == id))
+        {
+            clip.transform = fitted;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CanvasDrag {
     clip: ClipId,
@@ -267,11 +323,13 @@ impl ClipperApp {
                     ui.vertical_centered(|ui| {
                         let options = [
                             ("Black", ""),
-                            ("Blur video", "A blurred, zoomed copy of the video fills the bars"),
+                            (
+                                "Blur video",
+                                "A blurred, zoomed copy of the video fills the bars",
+                            ),
                             ("Color", ""),
                         ];
-                        match widgets::segmented(ui, "canvas_background_mode", &options, selected)
-                        {
+                        match widgets::segmented(ui, "canvas_background_mode", &options, selected) {
                             Some(0) => *background = Background::Black,
                             Some(1) => *background = Background::Blur,
                             Some(_) => *background = Background::Color(picker.rgb()),
@@ -293,16 +351,15 @@ impl ClipperApp {
                 },
             );
 
-            if ui
-                .add_enabled(focused.is_some(), egui::Button::new("Reset frame"))
-                .on_hover_text("Center the selected video. Fills the canvas when the shapes match; fits whole with bars when they don't (e.g. gameplay in 9:16). Ctrl+Z to undo.")
-                .clicked()
-            {
+            let moved = focused.is_some_and(|id| !self.frame_is_fitted(id));
+            if crate::widgets::fit_button(ui, moved, None).clicked() {
                 reset = focused;
             }
             if ui
                 .button("Add text")
-                .on_hover_text("New text layer at the playhead (T). Drag it anywhere on the preview.")
+                .on_hover_text(
+                    "New text layer at the playhead (T). Drag it anywhere on the preview.",
+                )
                 .clicked()
             {
                 add_text = true;
@@ -366,7 +423,7 @@ impl ClipperApp {
                 )
                 .on_hover_cursor(egui::CursorIcon::Move);
             response.context_menu(|ui| {
-                if ui.button("Reset frame").clicked() {
+                if ui.button("Fit to screen").clicked() {
                     reset = Some(layer.id);
                     ui.close_menu();
                 }
@@ -574,20 +631,7 @@ impl ClipperApp {
             }
         }
         if let Some(id) = reset {
-            self.canvas_ui.stop_wheel();
-            self.push_undo();
-            let canvas_size = (media.width, media.height);
-            if let Some(p) = self.project.as_mut() {
-                let source = track::clip_by_id(&p.clips, id)
-                    .map(|c| {
-                        let m = p.clip_source(c).1;
-                        (m.width, m.height)
-                    })
-                    .unwrap_or(canvas_size);
-                if let Some(clip) = p.clips.iter_mut().find(|c| c.id == id) {
-                    clip.transform = reset_transform(source, canvas_size, clip.transform.opacity);
-                }
-            }
+            self.fit_to_screen(id);
             if let Some(p) = &mut self.project {
                 p.selected_clips = [id].into_iter().collect();
             }

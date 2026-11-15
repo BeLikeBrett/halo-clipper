@@ -5,6 +5,40 @@ brett-clipper). Newest at top.
 
 ---
 
+## 2026-11-15 — Linux: file drops did nothing on Wayland; Shift+Enter finished text
+
+### Symptom
+
+- On niri, dragging a video from a file manager onto Media or the timeline
+  did nothing (it worked on Windows). Window focus didn't matter.
+- In the inline text editor, Shift+Enter finished editing instead of adding
+  a line.
+- Dragging a clip or text bar between layers overlapped the lanes; text bars
+  hovered half a row off, and lanes didn't make room.
+
+### Root cause
+
+- winit 0.30 implements `HoveredFile`/`DroppedFile` only for X11; its Wayland
+  backend never emits them. A native Wayland window never sees file drops.
+- `InputState::consume_key(Modifiers::NONE, Enter)` uses `matches_logically`,
+  which ignores an unrequested Shift, so Shift+Enter was consumed as "finish"
+  before the text field could insert the newline.
+- Lane decisions used the closed layout while the lanes were drawn shifted;
+  text lanes had their own rules and drew the "new lane" ghost straddling
+  two rows.
+
+### Fix
+
+- `wayland_drop.rs`: a `wl_data_device` on winit's display (own event queue,
+  polled on a thread, stopped in `on_exit`), `text/uri-list` parsed to paths.
+  Verified in a headless sway session with a GTK4 drag source and a virtual
+  pointer: hover highlight, Media import, and a timeline drop at the pointer.
+- Inline editor: Enter finishes only without Shift.
+- `editor::resolve_lane` shared by clip, media and text drags, reading the
+  drawn layout (gap hysteresis); `lane_drag_tests` cover it.
+
+---
+
 ## 2026-11-15 — Advanced: echoing / clipping audio while playing and editing
 
 ### Symptom

@@ -74,6 +74,41 @@ isolated configuration/cache directories.
   histories. Advanced keeps its timeline, selection, and playhead. Simple undo
   restores source marks without restoring an older copy of Advanced's edit.
 
+## Lane drags, Wayland drops, frame fitting (2026-11-15, 0.10.7)
+
+- One rule set for every vertical drag (clips, media from the bin, text
+  bars), in `editor::resolve_lane`: the middle half of a lane of the item's
+  kind targets that lane when the item fits there; the outer quarters open a
+  new lane at that boundary; an occupied lane opens a new layer above it
+  (below it for audio). Its own lane keeps an item while it fits, so a
+  sideways move never opens a lane, and a new lane right beside an item's
+  own lane, when it's the only thing there, is the same as staying.
+- The decision reads the layout as drawn: once a gap opens under the
+  pointer it stays open while the pointer is inside it. The lanes below the
+  gap slide down (0.14 s), revealing a "New video/text/audio layer" row, and
+  the dragged item glides into the exact row it will land in. The timeline
+  keeps one spare row under the lanes so a gap never needs a panel resize.
+- Media dragged from the bin can land on an existing free lane too.
+- Files dropped from outside: the middle of a video lane drops onto it (a new
+  lane only if they don't fit); its edges insert a new lane.
+- Native Wayland (niri, GNOME, KDE…): winit only reports file drops on X11,
+  so `wayland_drop.rs` binds `wl_data_device` on winit's own display with a
+  private queue on a small thread, accepts `text/uri-list`, and reads the
+  drop. It also reports the pointer during the drag, so timeline drops work
+  on Wayland. The thread is stopped in `on_exit` before the display closes.
+- "Fit to screen" replaces Reset frame and the Fit/Fill switch: centered,
+  filling the canvas when the shapes match, whole with bars when they don't.
+  It lights up (accent) only when the selected video's drawn frame differs
+  from that; it's in the preview toolbar, the clip panel, and the preview's
+  right-click menu.
+- Gradients: two color wells (Start ⇄ End; click one, then a swatch; click it
+  again for the full picker) and four square direction tiles that each show
+  the actual gradient running that way.
+- Inline text: Shift+Enter adds a line (egui's `consume_key` matched Enter
+  with Shift held too, so it used to finish editing).
+- Top bar: File and Help in the left corner, a large Simple Clip / Advanced
+  switch with a sliding highlight in the center, the name on the right.
+
 ## Layers, audio sync and cut playback (2026-11-15)
 
 - Text is a layer like any other: the Text band is gone. Text lanes stack with
@@ -86,8 +121,9 @@ isolated configuration/cache directories.
 - Text inspector: Style, Font, Align, Color (Solid/Gradient), Outline, Shadow,
   Box, Animate in/out. Gradients are edited on a stop bar with draggable
   handles, four direction arrows and a swap button. No named gradient presets.
-- Clip panel: Frame (Fit/Fill, Zoom, Opacity) and Animation (Start of clip /
-  End of clip chips, a Preview pill, Length, and Strength where it applies).
+- Clip panel: Frame (Fit to screen, Zoom, Opacity) and Animation (Start of
+  clip / End of clip chips, a Preview pill, Length, and Strength where it
+  applies).
 - G closes gaps. With a selection, the selection and everything that starts at
   or after it slide left until something on one of their lanes touches (groups
   move together). With nothing selected, every empty stretch of the timeline,
@@ -97,7 +133,6 @@ isolated configuration/cache directories.
   and an "Add at" chip on the target lane (or a new lane); dropping imports
   the files and places them back-to-back from that time as one undo step.
   Hovering Media shows a soft rounded drop card instead of the old outline.
-  Wayland reports no pointer during an OS drag, so there drops go to Media.
 - Switching to Advanced with an empty timeline places the Simple Clip source
   (or the first imported video) at 0:00 as one undo step. Entering Advanced
   stops the Simple player so it can never play underneath.

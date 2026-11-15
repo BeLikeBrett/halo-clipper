@@ -161,6 +161,32 @@ pub fn drag_cursor(
     Some(egui::pos2(x, y) / pixels_per_point.max(0.1))
 }
 
+/// Starts reading file drags on a native Wayland window (winit only
+/// reports them on X11). `None` on X11 or when the protocol is missing.
+#[cfg(target_os = "linux")]
+pub fn wayland_drops(
+    frame: &eframe::Frame,
+    ctx: &egui::Context,
+) -> Option<crate::wayland_drop::WaylandDrops> {
+    use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+    let RawDisplayHandle::Wayland(handle) = frame.display_handle().ok()?.as_raw() else {
+        return None;
+    };
+    // SAFETY: winit's display lives as long as the event loop; the app
+    // stops the listener in `on_exit`, before the window is torn down.
+    let drops =
+        unsafe { crate::wayland_drop::WaylandDrops::start(handle.display.as_ptr(), ctx.clone()) };
+    log::info!(
+        "wayland file drops: {}",
+        if drops.is_some() {
+            "listening"
+        } else {
+            "unavailable"
+        }
+    );
+    drops
+}
+
 #[cfg(target_os = "linux")]
 fn x11_pointer(window: u64) -> Option<(f32, f32)> {
     use std::sync::OnceLock;

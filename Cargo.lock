@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "halo_clipper"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1560,6 +1560,7 @@ dependencies = [
  "env_logger",
  "glow 0.14.2",
  "image",
+ "libc",
  "libloading",
  "libmpv2",
  "libmpv2-sys",
@@ -1572,6 +1573,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tiny-skia",
+ "wayland-backend",
+ "wayland-client",
  "winresource",
  "x11-dl",
 ]
