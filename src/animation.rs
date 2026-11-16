@@ -2,8 +2,7 @@
 //! amplitudes; they never alter the clip's source time or attached audio.
 use crate::track::Transform;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Effect {
     #[default]
     None,
@@ -44,8 +43,7 @@ impl Effect {
         matches!(self, Self::Fade | Self::PullBack | Self::Whip)
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Animation {
     pub intro: Effect,
     pub outro: Effect,

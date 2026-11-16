@@ -51,8 +51,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EditMode {
     /// Single In/Out range; instant export.
     SimpleClip,
@@ -3535,7 +3534,12 @@ impl ClipperApp {
             }
         };
         let size_fact = |scale: f64| {
-            src_bytes.map(|b| format!("≈ {}", human(b as f64 * cut_ms as f64 / total_ms as f64 * scale)))
+            src_bytes.map(|b| {
+                format!(
+                    "≈ {}",
+                    human(b as f64 * cut_ms as f64 / total_ms as f64 * scale)
+                )
+            })
         };
 
         let fps_label = if media.fps > 0.0 {
@@ -3602,10 +3606,7 @@ impl ClipperApp {
             }
             "Stream copy — no re-encode".to_string()
         } else {
-            facts.push((
-                "Video",
-                format!("H.264 · {src_w}×{src_h} · {fps_label}"),
-            ));
+            facts.push(("Video", format!("H.264 · {src_w}×{src_h} · {fps_label}")));
             facts.push(("Audio", "AAC 192 kbps".into()));
             facts.push(("Length", length));
             if let Some(s) = size_fact(1.0) {

@@ -16,20 +16,22 @@ use crate::media::MediaInfo;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct ClipId(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct LinkId(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct TrackId(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum TrackKind {
     Video,
     Audio,
@@ -46,15 +48,13 @@ impl TrackKind {
     }
 }
 
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LayerSource {
     pub path: PathBuf,
     pub media: MediaInfo,
 }
 
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MediaAsset {
     pub id: TrackId,
     /// Stable, one-based import order, independent of timeline track IDs.
@@ -76,8 +76,7 @@ impl MediaAsset {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transform {
     pub fit: crate::framing::Fit,
     pub scale: f32,
@@ -97,8 +96,7 @@ impl Default for Transform {
     }
 }
 
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub kind: TrackKind,
@@ -116,8 +114,7 @@ pub struct Track {
     pub source: Option<LayerSource>,
 }
 
-#[derive(Clone, Copy, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub id: ClipId,
     pub track_id: TrackId,

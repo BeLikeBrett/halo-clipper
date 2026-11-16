@@ -2206,8 +2206,7 @@ impl ClipperApp {
             painter.rect_filled(
                 ghost,
                 rounding,
-                crate::widgets::lerp_color(base, edge, 0.28)
-                    .gamma_multiply(0.6 + 0.4 * drop_fade),
+                crate::widgets::lerp_color(base, edge, 0.28).gamma_multiply(0.6 + 0.4 * drop_fade),
             );
             painter.line_segment(
                 [

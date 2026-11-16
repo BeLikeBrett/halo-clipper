@@ -229,10 +229,7 @@ impl ClipperApp {
         };
         match save(&path, project) {
             Ok(()) => {
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("edit");
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("edit");
                 self.status = format!(
                     "Saved {name}. It links to your source videos — if you move them, \
                      reopening will tell you which are missing."
@@ -360,8 +357,13 @@ mod tests {
     fn missing_media_is_reported_by_path() {
         let mut p = fixture();
         p.source = std::path::PathBuf::from("/nonexistent/moved-away.mp4");
-        let err = ProjectFile::from_project(&p).ensure_media_present().unwrap_err();
+        let err = ProjectFile::from_project(&p)
+            .ensure_media_present()
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("moved-away.mp4"), "message names the file: {msg}");
+        assert!(
+            msg.contains("moved-away.mp4"),
+            "message names the file: {msg}"
+        );
     }
 }

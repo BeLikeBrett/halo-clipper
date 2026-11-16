@@ -1,7 +1,6 @@
 //! Audio attachment is a reversible view/edit group. Media edits stay on clips.
 use super::*;
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct MediaGroup {
     pub members: HashSet<ClipId>,
     pub attached: bool,

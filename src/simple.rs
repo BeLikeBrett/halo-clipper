@@ -1,7 +1,6 @@
 //! Simple Clip keeps independent source marks and histories; Advanced owns its timeline.
 use super::*;
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct SourceEdit {
     pub position: i64,
     pub in_ms: Option<i64>,

@@ -7,15 +7,15 @@
 
 use std::hash::{Hash, Hasher};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct TextId(pub u32);
 
 /// Bundled caption fonts (Latin subsets, OFL / Apache 2.0). Bundled rather
 /// than looked up on the system so preview and export, Linux and Windows,
 /// always draw the same glyphs.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum TextFont {
     Montserrat,
     Poppins,
@@ -86,16 +86,14 @@ impl TextFont {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Align {
     Left,
     Center,
     Right,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Shadow {
     None,
     /// Soft dark drop shadow below the text.
@@ -104,8 +102,7 @@ pub enum Shadow {
     Glow,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Intro {
     None,
     Fade,
@@ -140,8 +137,7 @@ impl Intro {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Outro {
     None,
     Fade,
@@ -162,15 +158,13 @@ impl Outro {
 }
 
 /// Two-color gradient; the starting color is the control's solid color.
-#[derive(Clone, Copy, PartialEq, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Gradient {
     pub end: [u8; 3],
     pub angle: f32,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TextStyle {
     pub font: TextFont,
     pub color: [u8; 3],
@@ -287,8 +281,7 @@ pub const STYLE_PRESETS: [(&str, TextStyle); 6] = [
     ),
 ];
 
-#[derive(Clone, Debug, PartialEq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TextItem {
     pub id: TextId,
     /// The text lane this layer lives on; its position among the video
