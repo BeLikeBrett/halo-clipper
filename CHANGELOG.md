@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.10.13
+
+- Save Edit / Open Edit: save your whole timeline to a file and reopen it
+  exactly where you left off. It links to your source videos, so if one is
+  moved or deleted, opening tells you which file is missing.
+- The Auto export tab now shows what it will do (copy vs re-encode), the
+  settings it will use, and a projected file size — no more blank screen.
+- Disabling a track now only hides it in the preview; the export still
+  includes it. The menu reads "Hide/Show track in preview."
+- Timeline tracks are numbered sensibly per kind — V1, V2, V3, T1, T2,
+  A1, A2 — instead of climbing internal IDs.
+- Dragging a video from the file manager onto the timeline shows the same
+  accurate clip preview as dragging from the media bin.
+- The Updates window is cleaner and now shows the new version's changelog
+  before you install.
+- Halo Clipper can update itself whenever it's installed in a writable
+  location (e.g. your home folder), not only a downloaded build.
+
+## 0.10.12
+
+- Discord exports stay under the chosen size limit, and a failed GPU
+  encoder automatically falls back to the CPU encoder.
+
 ## 0.10.11
 
 - New text layers last 10 seconds (up to the end of your clips) instead of

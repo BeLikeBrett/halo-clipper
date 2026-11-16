@@ -382,3 +382,22 @@ uses one undo step. The Import button remains available.
 
 Import numbers are stable, one-based, independent of track IDs, and preserved
 in undo snapshots. Timeline and drag labels retain the same media number.
+
+## Save/Open edit, preview-only disable, track numbers (2026-11-16)
+
+Save Edit writes the whole project (source paths, tracks, clips, texts,
+canvas, marks, mode) to a JSON `.haloedit` file; it does not embed media.
+Open Edit restores it verbatim and rebuilds the ID generator above every
+restored ID. If any referenced source file has moved, the open fails with a
+message naming the missing path(s) and the project is left unchanged. The
+scrub proxy is not saved — it regenerates on open.
+
+Disabling a track (right-click → "Hide track in preview") now hides it from
+the preview only; `composition(preview=false)` keeps disabled tracks, so the
+export is unaffected. Track titles are numbered per kind in row order
+(V1/V2…, T1/T2…, A1/A2…), computed from the live order rather than the stored
+name, so deleting a track never leaves a gap.
+
+A file dragged from the file manager shows the same ghost clip (kind color,
+filename, selection ring) as one dragged from the media bin, instead of an
+"Add at …" chip.

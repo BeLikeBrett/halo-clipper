@@ -17,15 +17,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClipId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct LinkId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TrackId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum TrackKind {
     Video,
     Audio,
@@ -43,12 +47,14 @@ impl TrackKind {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct LayerSource {
     pub path: PathBuf,
     pub media: MediaInfo,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MediaAsset {
     pub id: TrackId,
     /// Stable, one-based import order, independent of timeline track IDs.
@@ -71,6 +77,7 @@ impl MediaAsset {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Transform {
     pub fit: crate::framing::Fit,
     pub scale: f32,
@@ -91,6 +98,7 @@ impl Default for Transform {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub kind: TrackKind,
@@ -109,6 +117,7 @@ pub struct Track {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub id: ClipId,
     pub track_id: TrackId,
@@ -168,6 +177,17 @@ pub struct IdGen {
 }
 
 impl IdGen {
+    /// An IdGen whose counters all start at the given values, so IDs made
+    /// after loading a saved project never collide with the restored ones.
+    pub fn seeded(clip: u32, link: u32, track: u32, text: u32, import: u32) -> Self {
+        Self {
+            clip: AtomicU32::new(clip),
+            link: AtomicU32::new(link),
+            track: AtomicU32::new(track),
+            text: AtomicU32::new(text),
+            import: AtomicU32::new(import),
+        }
+    }
     pub fn next_clip(&self) -> ClipId {
         ClipId(self.clip.fetch_add(1, Ordering::Relaxed))
     }

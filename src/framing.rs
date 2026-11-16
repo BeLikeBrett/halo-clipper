@@ -1,5 +1,6 @@
 //! Canvas shape is independent of source quality. Preview and export share it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Aspect {
     #[default]
     Original,
@@ -40,6 +41,7 @@ impl Aspect {
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Background {
     #[default]
     Black,
@@ -55,11 +57,13 @@ impl Background {
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CanvasSettings {
     pub aspect: Aspect,
     pub background: Background,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Fit {
     #[default]
     Fit,

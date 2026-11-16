@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MediaInfo {
     pub duration_ms: i64,
     pub width: u32,

@@ -3,6 +3,7 @@
 use crate::track::Transform;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Effect {
     #[default]
     None,
@@ -44,6 +45,7 @@ impl Effect {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Animation {
     pub intro: Effect,
     pub outro: Effect,

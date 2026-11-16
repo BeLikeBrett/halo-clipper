@@ -1626,6 +1626,33 @@ impl ClipperApp {
                     (Some(EditorDrag::Clip { id, .. }), Some(_)) => Some(*id),
                     _ => None,
                 };
+                // Display labels, numbered per kind in row order (V1, V2…,
+                // T1, T2…, A1, A2…). Computed from the live row order so the
+                // numbers stay sequential no matter what was added or deleted,
+                // instead of the stored track name, which keeps climbing.
+                let row_labels: std::collections::HashMap<TrackId, String> = {
+                    let (mut v, mut a, mut txt) = (0u32, 0u32, 0u32);
+                    tracks
+                        .iter()
+                        .map(|t| {
+                            let (prefix, n) = match t.kind {
+                                TrackKind::Video => {
+                                    v += 1;
+                                    ('V', v)
+                                }
+                                TrackKind::Audio => {
+                                    a += 1;
+                                    ('A', a)
+                                }
+                                TrackKind::Text => {
+                                    txt += 1;
+                                    ('T', txt)
+                                }
+                            };
+                            (t.id, format!("{prefix}{n}"))
+                        })
+                        .collect()
+                };
                 for (index, t) in tracks.iter().enumerate() {
                     let target_shift = if gap.is_some_and(|slot| index >= slot) {
                         lane_h
@@ -1696,7 +1723,7 @@ impl ClipperApp {
                     title_response.dnd_set_drag_payload(EditorDrag::Track(t.id));
                     let has_monitor = monitored.get(&t.id).is_some_and(|ids| !ids.is_empty());
                     let sub = match (t.muted, t.kind, has_monitor) {
-                        (true, ..) => "Disabled",
+                        (true, ..) => "Hidden in preview",
                         (false, TrackKind::Audio, _) => "Audio",
                         (false, TrackKind::Video, true) => "Video + audio",
                         (false, TrackKind::Video, false) => "Video",
@@ -1705,7 +1732,7 @@ impl ClipperApp {
                     painter.text(
                         egui::pos2(title.left() + 14.0, title.center().y - 7.0),
                         Align2::LEFT_CENTER,
-                        &t.name,
+                        row_labels.get(&t.id).map(String::as_str).unwrap_or(&t.name),
                         theme::semibold(12.5),
                         if t.muted {
                             theme::TEXT_MUTED
@@ -1725,11 +1752,14 @@ impl ClipperApp {
                         if crate::widgets::menu_item(
                             ui,
                             if t.muted {
-                                "Enable track"
+                                "Show track in preview"
                             } else {
-                                "Disable track (preview + export)"
+                                "Hide track in preview"
                             },
                             None,
+                        )
+                        .on_hover_text(
+                            "Hides the track while you work. The export still includes it.",
                         )
                         .clicked()
                         {
@@ -2126,22 +2156,17 @@ impl ClipperApp {
             let painter = ui.painter_at(lanes_view);
             crate::widgets::paint_drop_zone(&painter, lanes_view.shrink(1.0), drop_fade, None);
             let x = zone.lanes.x_of(start);
-            let y = match lane {
-                FileLane::Onto(_, row) => {
-                    // The lane it lands on, softly lit.
-                    let top = rows_top + row as f32 * LANE_HEIGHT;
-                    let well = egui::Rect::from_min_max(
-                        egui::pos2(zone.lanes.left + 2.0, top + 3.0),
-                        egui::pos2(lanes_view.right() - 3.0, top + LANE_HEIGHT - 3.0),
-                    );
-                    painter.rect_filled(well, 6.0, theme::ACCENT.gamma_multiply(0.10 * drop_fade));
-                    painter.rect_stroke(
-                        well,
-                        6.0,
-                        Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.55 * drop_fade)),
-                    );
-                    top + LANE_HEIGHT * 0.5
-                }
+            // Row and clip color for the ghost. A new lane (Insert) also
+            // gets a seam line where it will open.
+            let (row, kind) = match lane {
+                FileLane::Onto(id, row) => (
+                    row,
+                    tracks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.kind)
+                        .unwrap_or(TrackKind::Video),
+                ),
                 FileLane::Insert(slot) => {
                     let y = rows_top + slot as f32 * LANE_HEIGHT;
                     painter.line_segment(
@@ -2151,9 +2176,10 @@ impl ClipperApp {
                         ],
                         Stroke::new(2.0_f32, theme::ACCENT.gamma_multiply(drop_fade)),
                     );
-                    y
+                    (slot, TrackKind::Video)
                 }
             };
+            // Thin start line, like the one under a clip dragged from the bin.
             painter.line_segment(
                 [
                     egui::pos2(x, lanes_view.top()),
@@ -2161,22 +2187,49 @@ impl ClipperApp {
                 ],
                 Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.8 * drop_fade)),
             );
-            let label = format!("Add at {}", media::format_timestamp(start));
-            let galley = painter.layout_no_wrap(label, theme::medium(12.0), theme::TEXT_PRIMARY);
-            let chip = egui::Rect::from_min_size(
-                egui::pos2(
-                    x + 8.0,
-                    (y - galley.size().y * 0.5 - 6.0).max(lanes_view.top() + 4.0),
-                ),
-                galley.size() + egui::vec2(16.0, 10.0),
+            // A ghost clip at the drop spot so the preview matches the real
+            // drop. The exact length and thumbnail aren't known until the
+            // file is probed, so it's a representative block carrying the
+            // file's name — drawn in the same selected style as paint_clip.
+            let top = rows_top + row as f32 * LANE_HEIGHT;
+            let width = 170.0_f32.min((lanes_view.right() - x - 4.0).max(48.0));
+            let ghost = egui::Rect::from_min_max(
+                egui::pos2(x, top + CLIP_INSET),
+                egui::pos2(x + width, top + LANE_HEIGHT - CLIP_INSET),
             );
-            painter.rect_filled(chip, 6.0, theme::BG_MODAL.gamma_multiply(drop_fade));
-            painter.rect_stroke(
-                chip,
-                6.0,
-                Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.6 * drop_fade)),
+            let (base, edge) = match kind {
+                TrackKind::Video => (theme::CLIP_VIDEO, theme::CLIP_VIDEO_EDGE),
+                TrackKind::Audio => (theme::CLIP_AUDIO, theme::CLIP_AUDIO_EDGE),
+                TrackKind::Text => (theme::CLIP_TEXT, theme::CLIP_TEXT_EDGE),
+            };
+            let rounding = egui::Rounding::same(5.0);
+            painter.rect_filled(
+                ghost,
+                rounding,
+                crate::widgets::lerp_color(base, edge, 0.28)
+                    .gamma_multiply(0.6 + 0.4 * drop_fade),
             );
-            painter.galley(chip.min + egui::vec2(8.0, 5.0), galley, theme::TEXT_PRIMARY);
+            painter.line_segment(
+                [
+                    egui::pos2(ghost.left() + 2.0, ghost.top() + 1.5),
+                    egui::pos2(ghost.right() - 2.0, ghost.top() + 1.5),
+                ],
+                Stroke::new(1.0_f32, Color32::from_white_alpha(22)),
+            );
+            let label = self
+                .file_hover_label
+                .clone()
+                .unwrap_or_else(|| "New clip".into());
+            painter
+                .with_clip_rect(ghost.shrink2(egui::vec2(9.0, 4.0)))
+                .text(
+                    egui::pos2(ghost.left() + 10.0, ghost.center().y),
+                    Align2::LEFT_CENTER,
+                    &label,
+                    theme::medium(12.0),
+                    theme::TEXT_PRIMARY,
+                );
+            crate::widgets::paint_selection(&painter, ghost, rounding);
         }
         self.timeline_drop = Some(zone);
         let (bar_rect, _) = ui.allocate_exact_size(

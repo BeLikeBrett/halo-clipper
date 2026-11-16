@@ -19,6 +19,8 @@ mod grouping;
 mod layers;
 #[path = "live.rs"]
 mod live;
+#[path = "projectfile.rs"]
+mod projectfile;
 #[path = "simple.rs"]
 mod simple;
 #[path = "support.rs"]
@@ -50,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum EditMode {
     /// Single In/Out range; instant export.
     SimpleClip,
@@ -185,12 +188,15 @@ impl Project {
     fn composition(&self, preview: bool) -> crate::composition::Composition {
         let mut segments = Vec::new();
         // Top lane is painted last. All audio streams remain independent.
+        // A disabled (muted) track is hidden from the preview only — the
+        // export still includes it. So we drop muted tracks when building
+        // the preview composition, but keep them for export (preview=false).
         for (depth, t) in self
             .tracks
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, t)| !t.muted)
+            .filter(|(_, t)| !(preview && t.muted))
         {
             for c in self.clips.iter().filter(|c| c.track_id == t.id) {
                 let (source, info) = self.clip_source(c);
@@ -227,12 +233,17 @@ impl Project {
             .enumerate()
             .map(|(i, t)| (t.id, i))
             .collect();
-        let muted: HashSet<TrackId> = self
-            .tracks
-            .iter()
-            .filter(|t| t.muted)
-            .map(|t| t.id)
-            .collect();
+        // Disabled tracks hide their text in the preview only; the export
+        // keeps them (see the segment filter above).
+        let muted: HashSet<TrackId> = if preview {
+            self.tracks
+                .iter()
+                .filter(|t| t.muted)
+                .map(|t| t.id)
+                .collect()
+        } else {
+            HashSet::new()
+        };
         crate::composition::Composition {
             width: self.canvas_media().width,
             height: self.canvas_media().height,
@@ -509,6 +520,24 @@ pub enum ExportMode {
     Custom,
 }
 
+/// Pre-computed summary of what Auto mode will do for the current
+/// project. Built once when the export modal opens (the keyframe check
+/// runs an ffprobe and the size estimate stats the source file); the
+/// project can't change while the modal is up, so caching is safe.
+struct AutoPreview {
+    /// One-line verdict, e.g. "Stream copy — no re-encode".
+    headline: String,
+    /// Why Auto chose that path.
+    reason: String,
+    /// (label, value) rows for the summary card: Video, Audio, Length, Size.
+    facts: Vec<(&'static str, String)>,
+    /// True when the size is a quality-based (CRF) estimate, so the panel
+    /// adds the "varies with content" caveat.
+    size_estimated: bool,
+    /// Shown in red, e.g. when In/Out aren't set yet.
+    warning: Option<String>,
+}
+
 /// How Custom mode drives the encoder's rate control.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RateControl {
@@ -677,6 +706,10 @@ pub struct ClipperApp {
     /// When true, the Export Options modal is shown. The actual export
     /// is kicked off by the modal's "Begin Export" button.
     export_options_open: bool,
+    /// What Auto mode will do for the current project, computed once when
+    /// the modal opens (the keyframe check runs an ffprobe) and shown in
+    /// the Auto panel. None until a project is open / the modal opens.
+    auto_preview: Option<AutoPreview>,
     /// Edge-trigger state so mpv's `lavfi-complex` and `mute` properties
     /// are only updated when the desired state actually changes.
     last_lavfi_complex: String,
@@ -686,6 +719,10 @@ pub struct ClipperApp {
     file_hover: bool,
     /// Pointer during that drag, when the OS can tell us.
     file_hover_pos: Option<egui::Pos2>,
+    /// Name of the first file being dragged, when the OS exposes it during
+    /// the hover (some platforms only give the path on drop). Shown in the
+    /// timeline's ghost clip so the drag preview matches a real drop.
+    file_hover_label: Option<String>,
     /// File drops on native Wayland (`None` on X11 or before the first frame).
     #[cfg(target_os = "linux")]
     wayland_drops: Option<crate::wayland_drop::WaylandDrops>,
@@ -782,10 +819,12 @@ impl ClipperApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             export_options_open: false,
+            auto_preview: None,
             last_lavfi_complex: String::new(),
             window_fit_checked: false,
             file_hover: false,
             file_hover_pos: None,
+            file_hover_label: None,
             #[cfg(target_os = "linux")]
             wayland_drops: None,
             #[cfg(target_os = "linux")]
@@ -1914,6 +1953,23 @@ impl eframe::App for ClipperApp {
             }
             ctx.request_repaint();
         }
+        if hovering {
+            // Keep the last known name through frames where the OS stops
+            // reporting the path mid-drag, so the ghost clip's label doesn't
+            // flicker. Cleared when the drag ends.
+            if let Some(name) = ctx.input(|i| {
+                i.raw
+                    .hovered_files
+                    .iter()
+                    .find_map(|f| f.path.as_ref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+            }) {
+                self.file_hover_label = Some(name);
+            }
+        } else {
+            self.file_hover_label = None;
+        }
         self.file_hover = hovering;
         if !dropped.is_empty() {
             let spot = self
@@ -2034,15 +2090,27 @@ impl eframe::App for ClipperApp {
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let mut want_open = false;
+                        let mut want_save_edit = false;
+                        let mut want_open_edit = false;
                         let mut want_settings = false;
                         let mut want_support = false;
                         let mut want_quit = false;
                         // One app menu behind the logo: everything File and Help held.
                         let update =
-                            matches!(self.updater.state, crate::updater::State::Available(_));
+                            matches!(self.updater.state, crate::updater::State::Available(..));
                         crate::widgets::app_menu_button(ui, update, 220.0, |ui| {
                             want_open =
                                 crate::widgets::menu_item(ui, "Open Video…", None).clicked();
+                            crate::widgets::menu_separator(ui);
+                            want_open_edit =
+                                crate::widgets::menu_item(ui, "Open Edit…", None).clicked();
+                            want_save_edit = crate::widgets::menu_item(ui, "Save Edit…", None)
+                                .on_hover_text(
+                                    "Saves your timeline to a file. It links to your source \
+                                     videos — keep them where they are.",
+                                )
+                                .clicked();
+                            crate::widgets::menu_separator(ui);
                             want_settings =
                                 crate::widgets::menu_item(ui, "Settings…", None).clicked();
                             want_support = crate::widgets::menu_item(
@@ -2057,10 +2125,21 @@ impl eframe::App for ClipperApp {
                             .clicked();
                             crate::widgets::menu_separator(ui);
                             want_quit = crate::widgets::menu_item(ui, "Quit", None).clicked();
-                            want_open || want_settings || want_support || want_quit
+                            want_open
+                                || want_open_edit
+                                || want_save_edit
+                                || want_settings
+                                || want_support
+                                || want_quit
                         });
                         if want_open {
                             self.open_file();
+                        }
+                        if want_open_edit {
+                            self.open_edit();
+                        }
+                        if want_save_edit {
+                            self.save_edit();
                         }
                         if want_settings {
                             self.settings_open = true;
@@ -2962,6 +3041,7 @@ impl ClipperApp {
         }
         if want_export {
             self.export_options_open = true;
+            self.auto_preview = self.compute_auto_preview();
         }
         if let Some(action) = clip_action {
             self.apply_clip_action(action);
@@ -3386,7 +3466,7 @@ impl ClipperApp {
                         match next_mode {
                             ExportMode::Discord => self.show_discord_nitro_panel(ui),
                             ExportMode::Custom => self.show_custom_encode_panel(ui),
-                            ExportMode::Auto => {}
+                            ExportMode::Auto => self.show_auto_panel(ui),
                         }
                     });
 
@@ -3420,10 +3500,203 @@ impl ClipperApp {
         self.export_mode = next_mode;
         if cancel {
             self.export_options_open = false;
+            self.auto_preview = None;
         }
         if begin {
             self.export_options_open = false;
+            self.auto_preview = None;
             self.start_export();
+        }
+    }
+
+    /// Works out what Auto mode will produce for the current project:
+    /// stream copy vs re-encode (mirroring the decision in
+    /// [`start_export`]), the concrete output settings, and an estimated
+    /// file size. Runs an ffprobe keyframe check and stats the source, so
+    /// it's called once when the modal opens, not every frame.
+    fn compute_auto_preview(&self) -> Option<AutoPreview> {
+        let project = self.project.as_ref()?;
+        let media = project.canvas_media();
+        let (src_w, src_h) = (media.width, media.height);
+        let cut_ms = self.cut_duration_ms_for_export(project);
+
+        // Source bytes-per-millisecond drives the size estimate. For a
+        // stream copy the output is that slice of the source, so the
+        // estimate is tight; for a re-encode it's a ballpark (CRF targets
+        // quality, not size), which the caller flags as such.
+        let total_ms = project.media.duration_ms.max(1);
+        let src_bytes = std::fs::metadata(&project.source).map(|m| m.len()).ok();
+        let human = |bytes: f64| {
+            let mb = bytes / 1_048_576.0;
+            if mb >= 1024.0 {
+                format!("{:.2} GB", mb / 1024.0)
+            } else {
+                format!("{mb:.0} MB")
+            }
+        };
+        let size_fact = |scale: f64| {
+            src_bytes.map(|b| format!("≈ {}", human(b as f64 * cut_ms as f64 / total_ms as f64 * scale)))
+        };
+
+        let fps_label = if media.fps > 0.0 {
+            format!("{:.0} fps", media.fps)
+        } else {
+            "source fps".into()
+        };
+        let length = format!("{}:{:02}", cut_ms / 60_000, (cut_ms % 60_000) / 1000);
+
+        // Mirror start_export()'s copy-vs-encode decision exactly.
+        let (copy, reason, warning) = match project.mode {
+            EditMode::SimpleClip => match (project.in_ms, project.out_ms) {
+                (Some(a), Some(b)) => {
+                    let aligned = !self.resolve_smart_cut(&project.source, a.min(b)).0;
+                    if aligned {
+                        (
+                            true,
+                            "Nothing was re-timed and the In point lands on a keyframe, so \
+                             the clip is copied straight out — no quality loss, near-instant."
+                                .to_string(),
+                            None,
+                        )
+                    } else {
+                        (
+                            false,
+                            "The In point isn't on a keyframe, so the clip is re-encoded to \
+                             cut exactly where you set it."
+                                .to_string(),
+                            None,
+                        )
+                    }
+                }
+                _ => (
+                    false,
+                    "Re-encodes at source quality.".to_string(),
+                    Some("Set an In and Out point to see the exact plan.".to_string()),
+                ),
+            },
+            EditMode::MultiTrack => (
+                false,
+                "The timeline has layers or edits, so frames are re-rendered through the \
+                 filter graph and re-encoded at source quality."
+                    .to_string(),
+                None,
+            ),
+        };
+
+        let mut facts: Vec<(&'static str, String)> = Vec::new();
+        let headline = if copy {
+            facts.push((
+                "Video",
+                format!(
+                    "Original {} · {}×{} · {}",
+                    media.video_codec.to_uppercase(),
+                    src_w,
+                    src_h,
+                    fps_label
+                ),
+            ));
+            facts.push(("Audio", "Copied as-is".into()));
+            facts.push(("Length", length));
+            if let Some(s) = size_fact(1.0) {
+                facts.push(("Size", s));
+            }
+            "Stream copy — no re-encode".to_string()
+        } else {
+            facts.push((
+                "Video",
+                format!("H.264 · {src_w}×{src_h} · {fps_label}"),
+            ));
+            facts.push(("Audio", "AAC 192 kbps".into()));
+            facts.push(("Length", length));
+            if let Some(s) = size_fact(1.0) {
+                facts.push(("Size", s));
+            }
+            "Re-encode — H.264, CRF 18 (visually lossless)".to_string()
+        };
+
+        Some(AutoPreview {
+            headline,
+            reason,
+            facts,
+            size_estimated: !copy,
+            warning,
+        })
+    }
+
+    /// Renders the Auto mode body: the verdict, why, and a summary card
+    /// of the concrete settings and projected size.
+    fn show_auto_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(preview) = self.auto_preview.as_ref() else {
+            ui.label(RichText::new("Open a video first.").color(theme::TEXT_MUTED));
+            return;
+        };
+
+        ui.label(
+            RichText::new(&preview.headline)
+                .font(theme::medium(14.0))
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(&preview.reason)
+                .size(12.5)
+                .color(theme::TEXT_MUTED),
+        );
+        ui.add_space(12.0);
+
+        Frame::none()
+            .fill(theme::BG_BUTTON)
+            .rounding(Rounding::same(8.0))
+            .stroke(Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+            .inner_margin(Margin::symmetric(14.0, 12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let fact = |ui: &mut egui::Ui, label: &str, value: &str| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new(label).size(11.0).color(theme::TEXT_MUTED));
+                        ui.label(
+                            RichText::new(value)
+                                .font(theme::mono(12.5))
+                                .color(theme::TEXT_PRIMARY),
+                        );
+                    });
+                };
+                egui::Grid::new("auto_plan_stats")
+                    .num_columns(2)
+                    .min_col_width((ui.available_width() - 16.0) / 2.0)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        for (i, (label, value)) in preview.facts.iter().enumerate() {
+                            fact(ui, label, value);
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
+                        if preview.facts.len() % 2 == 1 {
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if preview.size_estimated {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Size is an estimate — a quality-based (CRF) encode, so the real file \
+                     tracks how much motion the footage has.",
+                )
+                .size(11.5)
+                .color(theme::TEXT_MUTED),
+            );
+        }
+        if let Some(warning) = &preview.warning {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(warning)
+                    .size(12.0)
+                    .color(theme::ACCENT_ERR.linear_multiply(0.85)),
+            );
         }
     }
 

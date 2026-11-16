@@ -29,13 +29,18 @@ struct Release {
     tag_name: String,
     draft: bool,
     prerelease: bool,
+    /// The release notes shown on GitHub — our changelog for that version.
+    #[serde(default)]
+    body: Option<String>,
 }
 #[derive(Debug)]
 pub enum State {
     Idle,
     Working(String),
     Current,
-    Available(Manifest),
+    /// An update is available: the signed manifest plus the release notes
+    /// (GitHub's release body) to show the user what changed.
+    Available(Manifest, Option<String>),
     Staged(PathBuf),
     Error(String),
 }
@@ -126,7 +131,18 @@ fn check() -> Result<State> {
         m.version == version.to_string(),
         "Release and signed manifest versions disagree"
     );
-    Ok(State::Available(m))
+    // Trim the notes to a sane length; the metadata read is already capped,
+    // but release bodies can still be long, and the panel only needs a summary.
+    let notes = release.body.map(|b| {
+        let b = b.trim();
+        let clipped: String = b.chars().take(4000).collect();
+        if clipped.len() < b.len() {
+            format!("{clipped}…")
+        } else {
+            clipped
+        }
+    });
+    Ok(State::Available(m, notes))
 }
 pub fn target() -> &'static str {
     if cfg!(windows) {
@@ -225,6 +241,21 @@ impl Updater {
         }
     }
 }
+/// Whether this user can write into `dir` — probed by creating and removing
+/// a temp file, which is exactly what the in-place update needs to do. A
+/// root-owned system folder returns false without special-casing any path.
+#[cfg(not(windows))]
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".halo-clipper-write-test-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// The downloaded executable must load its native libraries and initialize
 /// mpv before the current executable or its known-good backup is touched.
 #[cfg(not(windows))]
@@ -284,9 +315,17 @@ pub fn install(path: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
+        // Self-update needs to replace the binary in place, which means its
+        // folder has to be writable by this user. A root-owned system install
+        // (e.g. /usr/bin from a package) isn't, so it's steered to the package
+        // manager; a copy in the user's home updates itself. This is tested by
+        // actually probing the folder rather than hard-coding /usr, so a
+        // user-writable install anywhere can self-update.
+        let parent = exe.parent().context("Application has no parent folder")?;
         anyhow::ensure!(
-            !exe.starts_with("/usr") && !exe.starts_with("/opt"),
-            "This is a system-managed install. Update through your package manager."
+            dir_writable(parent),
+            "This copy is managed by your system — its folder isn’t writable here. \
+             Update it the way it was installed (your package manager)."
         );
         let backup = prepare_linux_update(&exe, path)?;
         let launch = (|| -> Result<()> {
