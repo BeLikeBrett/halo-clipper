@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Registers the .haloedit project file so file managers give it the Halo
+     Clipper icon and open it with Halo Clipper on double-click. Installed to
+     /usr/share/mime/packages/ and registered with update-mime-database. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-haloedit">
+    <comment>Halo Clipper edit</comment>
+    <glob pattern="*.haloedit"/>
+    <icon name="application-x-haloedit"/>
+    <generic-icon name="application-x-haloedit"/>
+  </mime-type>
+</mime-info>

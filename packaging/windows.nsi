@@ -47,6 +47,14 @@ Section "Halo Clipper"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper" "NoRepair" 1
+  ; Associate .haloedit project files: double-click opens Halo Clipper, with
+  ; the app icon. Per-user (HKCU) to match the user-level install.
+  WriteRegStr HKCU "Software\Classes\.haloedit" "" "HaloClipper.Edit"
+  WriteRegStr HKCU "Software\Classes\.haloedit" "Content Type" "application/x-haloedit"
+  WriteRegStr HKCU "Software\Classes\HaloClipper.Edit" "" "Halo Clipper Edit"
+  WriteRegStr HKCU "Software\Classes\HaloClipper.Edit\DefaultIcon" "" "$INSTDIR\halo-clipper.exe,0"
+  WriteRegStr HKCU "Software\Classes\HaloClipper.Edit\shell\open\command" "" '$\"$INSTDIR\halo-clipper.exe$\" $\"%1$\"'
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
 SectionEnd
 Section "Uninstall"
   Delete "$DESKTOP\Halo Clipper.lnk"
@@ -65,4 +73,9 @@ Section "Uninstall"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\HaloClipper"
+  ; Remove the .haloedit association.
+  DeleteRegKey HKCU "Software\Classes\HaloClipper.Edit"
+  DeleteRegValue HKCU "Software\Classes\.haloedit" ""
+  DeleteRegKey /ifempty HKCU "Software\Classes\.haloedit"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
 SectionEnd

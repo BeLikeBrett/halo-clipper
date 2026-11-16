@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.14
+
+- `.haloedit` files now have their own icon and open Halo Clipper when you
+  double-click them, on both Windows and Linux — no more "it's just a text
+  file" problem.
+- "Save Edit" is hidden from the menu when there's nothing to save (no video
+  or empty timeline).
+
 ## 0.10.13
 
 - Save Edit / Open Edit: save your whole timeline to a file and reopen it

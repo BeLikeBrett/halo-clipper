@@ -94,7 +94,16 @@ fn main() -> eframe::Result<()> {
             match ClipperApp::new(cc) {
                 Ok(mut app) => {
                     if let Some(path) = initial_file {
-                        app.open_path(path);
+                        // Double-clicking a .haloedit (or "Open With") opens it
+                        // as a saved project, not as a source video to probe.
+                        if path
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("haloedit"))
+                        {
+                            app.open_edit_path(path);
+                        } else {
+                            app.open_path(path);
+                        }
                     }
                     if advanced {
                         app.set_mode(app::EditMode::MultiTrack);

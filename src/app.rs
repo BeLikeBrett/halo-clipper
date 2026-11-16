@@ -2097,18 +2097,25 @@ impl eframe::App for ClipperApp {
                         // One app menu behind the logo: everything File and Help held.
                         let update =
                             matches!(self.updater.state, crate::updater::State::Available(..));
+                        // Only offer "Save Edit" when there's actually something
+                        // to save — a loaded video, clips, or text.
+                        let can_save = self.project.as_ref().is_some_and(|p| {
+                            !p.clips.is_empty() || !p.texts.is_empty() || !p.assets.is_empty()
+                        });
                         crate::widgets::app_menu_button(ui, update, 220.0, |ui| {
                             want_open =
                                 crate::widgets::menu_item(ui, "Open Video…", None).clicked();
                             crate::widgets::menu_separator(ui);
                             want_open_edit =
                                 crate::widgets::menu_item(ui, "Open Edit…", None).clicked();
-                            want_save_edit = crate::widgets::menu_item(ui, "Save Edit…", None)
-                                .on_hover_text(
-                                    "Saves your timeline to a file. It links to your source \
-                                     videos — keep them where they are.",
-                                )
-                                .clicked();
+                            if can_save {
+                                want_save_edit = crate::widgets::menu_item(ui, "Save Edit…", None)
+                                    .on_hover_text(
+                                        "Saves your timeline to a file. It links to your source \
+                                         videos — keep them where they are.",
+                                    )
+                                    .clicked();
+                            }
                             crate::widgets::menu_separator(ui);
                             want_settings =
                                 crate::widgets::menu_item(ui, "Settings…", None).clicked();

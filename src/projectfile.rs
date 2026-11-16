@@ -257,6 +257,18 @@ impl ClipperApp {
         }
     }
 
+    /// Open a specific edit file — used when Halo Clipper is launched with a
+    /// `.haloedit` path (double-click or "Open With"), so there's no dialog.
+    pub fn open_edit_path(&mut self, path: std::path::PathBuf) {
+        match load(&path) {
+            Ok(project) => self.apply_loaded_edit(project, &path),
+            Err(e) => {
+                self.status = format!("{e:#}");
+                log::warn!("open edit failed: {e:#}");
+            }
+        }
+    }
+
     /// Swap in a freshly loaded project, resetting the same transient state
     /// (preview, scrub proxy, undo history) that opening a video does.
     fn apply_loaded_edit(&mut self, project: Project, path: &Path) {
