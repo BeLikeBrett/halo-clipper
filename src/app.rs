@@ -641,7 +641,7 @@ pub struct ClipperApp {
     /// Optional encoders this machine can actually run — every hardware
     /// encoder ffmpeg advertises, plus software AV1. Detected once at
     /// startup (hardware AV1 entries are additionally test-encoded, see
-    /// `encode::verify_av1_encoders`); surfaced in the Custom codec
+    /// `encode::verify_hw_encoders`); surfaced in the Custom codec
     /// dropdown and used by the Discord planner.
     available_codecs: Vec<VideoCodec>,
     /// Discord mode's codec row: Auto (the size-aware picker) or a
@@ -743,10 +743,10 @@ impl ClipperApp {
         player.ensure_render_context()?;
         // One probe each — the results feed both the stored fields and
         // the Custom-encode defaults.
-        // Hardware AV1 gets a real test encode: ffmpeg lists the encoder
-        // on machines whose silicon has no AV1 encode block, and the
-        // Discord planner picks from this list without asking.
-        let available_codecs = encode::verify_av1_encoders(encode::detect_available_codecs());
+        // Every hardware encoder gets a real test encode: ffmpeg lists
+        // encoders the GPU/driver can't run, and the Discord planner
+        // picks from this list without asking.
+        let available_codecs = encode::verify_hw_encoders(encode::detect_available_codecs());
         let detected_gpu = encode::detect_gpu();
         let recommended = encode::recommend_codec(detected_gpu, &available_codecs);
         let settings = Settings::load();
@@ -1684,7 +1684,17 @@ impl ClipperApp {
             }
         };
 
-        match export::spawn(plan) {
+        // Discord's target is a hard upload cap: the export re-checks the
+        // finished file and shrinks it if the encoder overshot.
+        // If a hardware encoder dies mid-export (driver, firmware, an
+        // input size it rejects), the export redoes itself on the CPU
+        // encoder for the same format instead of failing.
+        let guards = export::Guards {
+            size_cap_bytes: (self.export_mode == ExportMode::Discord)
+                .then(|| encode::DiscordNitro::target_bytes_from_mb(self.discord_target_mb)),
+            available_codecs: self.available_codecs.clone(),
+        };
+        match export::spawn_guarded(plan, guards) {
             Ok(handle) => {
                 self.export = Some(handle);
                 self.status = match note {
@@ -3565,7 +3575,9 @@ impl ClipperApp {
                         .color(theme::TEXT_MUTED),
                 )
                 .on_hover_text(format!(
-                    "Constant bitrate aiming near {est_mb_rounded} MB (±10% in practice)."
+                    "Constant bitrate aiming near {est_mb_rounded} MB. The finished file is \
+                     checked against the {} MB limit and re-encoded smaller if it overshoots.",
+                    self.discord_target_mb
                 ));
             });
 

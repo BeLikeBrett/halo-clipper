@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::encode::{is_vaapi_decodable, EncodeSettings, HwDecode};
+use crate::encode::{is_vaapi_decodable, EncodeQuality, EncodeSettings, HwDecode, VideoCodec};
 
 /// Encode mode for a Simple export. MultiTrack always re-encodes through
 /// a filter graph and uses `EncodeSettings` directly.
@@ -147,6 +147,22 @@ impl ExportPlan {
         }
     }
 
+    /// The re-encode settings, when this plan encodes at all. The size
+    /// cap check rewrites the bitrate through this between attempts.
+    fn encode_settings_mut(&mut self) -> Option<&mut EncodeSettings> {
+        match self {
+            Self::Layered { encode, .. } | Self::MultiTrack { encode, .. } => Some(encode),
+            Self::Simple {
+                encode: EncodeMode::Encode(encode),
+                ..
+            } => Some(encode),
+            Self::Simple {
+                encode: EncodeMode::Copy,
+                ..
+            } => None,
+        }
+    }
+
     pub fn mode_label(&self) -> &'static str {
         match self {
             Self::Layered { .. } => "layered composition",
@@ -233,7 +249,39 @@ impl ExportHandle {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn spawn(plan: ExportPlan) -> Result<ExportHandle> {
+    spawn_guarded(plan, Guards::default())
+}
+
+/// Safety nets around an export's ffmpeg run.
+#[derive(Clone, Default)]
+pub struct Guards {
+    /// The finished file must be at most this many bytes (Discord mode).
+    pub size_cap_bytes: Option<i64>,
+    /// Encoders this machine has. When non-empty and a hardware encode
+    /// fails, the export reruns once on [`VideoCodec::cpu_fallback`].
+    pub available_codecs: Vec<VideoCodec>,
+}
+
+/// How many smaller re-encodes a size-capped export may run after the
+/// first pass comes out over the cap. One almost always lands it (the
+/// refit scales by the measured overshoot); the second covers encoders
+/// whose overshoot grows as the bitrate drops.
+const SIZE_CAP_RETRIES: usize = 2;
+
+/// [`spawn`] with [`Guards`]:
+///
+/// - **Size cap.** Encoders miss bitrate targets by different amounts
+///   per GPU, driver and source, so the plan's budget alone can't
+///   guarantee a Discord cap: after each encode the real file size is
+///   checked, and an oversized file is re-encoded at a bitrate scaled
+///   down by the measured overshoot.
+/// - **CPU fallback.** Encoder probes at startup catch most broken
+///   hardware encoders, but some only fail on real input (resolution
+///   limits, driver bugs). A failed hardware encode is rerun once on the
+///   CPU encoder for the same format.
+pub fn spawn_guarded(plan: ExportPlan, guards: Guards) -> Result<ExportHandle> {
     let total_ms = plan.total_output_ms();
     log::info!("{} job started; timeline={}ms", plan.mode_label(), total_ms);
     if total_ms <= 0 {
@@ -258,7 +306,7 @@ pub fn spawn(plan: ExportPlan) -> Result<ExportHandle> {
     let c = cancel_flag.clone();
     let cs = child_slot.clone();
 
-    let thread = thread::spawn(move || run_plan(plan, p, c, cs));
+    let thread = thread::spawn(move || run_plan(plan, guards, p, c, cs));
 
     Ok(ExportHandle {
         progress,
@@ -269,12 +317,116 @@ pub fn spawn(plan: ExportPlan) -> Result<ExportHandle> {
 }
 
 fn run_plan(
-    plan: ExportPlan,
+    mut plan: ExportPlan,
+    guards: Guards,
     progress: Arc<Mutex<ExportProgress>>,
     cancel_flag: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
 ) {
-    let res = match &plan {
+    let mut attempt = 0;
+    let mut fell_back = false;
+    let res = loop {
+        let res = run_once(&plan, &progress, &cancel_flag, &child_slot);
+        if cancel_flag.load(Ordering::SeqCst) {
+            break res;
+        }
+        if let Err(e) = &res {
+            if !fell_back && fall_back_to_cpu(&mut plan, &guards.available_codecs) {
+                fell_back = true;
+                log::warn!("hardware encode failed ({e:#}); retrying on the CPU");
+                let mut p = progress.lock().unwrap();
+                p.current_ms = 0;
+                p.mode_label = "re-encode on CPU (GPU encoder failed)";
+                continue;
+            }
+            break res;
+        }
+        let Some(cap) = guards.size_cap_bytes else {
+            break res;
+        };
+        let actual = match std::fs::metadata(plan.destination()) {
+            Ok(m) => m.len() as i64,
+            Err(e) => break Err(anyhow::anyhow!("checking output size: {e}")),
+        };
+        if actual <= cap {
+            break Ok(());
+        }
+        let duration_ms = plan.total_output_ms();
+        let refit = plan
+            .encode_settings_mut()
+            .and_then(|enc| match enc.quality {
+                EncodeQuality::Bitrate(kbps) => crate::encode::DiscordNitro::refit_video_kbps(
+                    kbps,
+                    enc.audio_bitrate_kbps,
+                    duration_ms,
+                    actual,
+                    cap,
+                )
+                .map(|new| (enc, kbps, new)),
+                EncodeQuality::ConstantQuality(_) => None,
+            });
+        let over = |actual: i64| {
+            anyhow::anyhow!(
+                "the file came out at {:.1} MB, over the {:.1} MB limit — \
+                 shorten the clip or pick a bigger target",
+                actual as f64 / 1e6,
+                cap as f64 / 1e6
+            )
+        };
+        let Some((enc, old_kbps, new_kbps)) = refit else {
+            break Err(over(actual));
+        };
+        if attempt == SIZE_CAP_RETRIES {
+            break Err(over(actual));
+        }
+        attempt += 1;
+        log::warn!(
+            "output {actual} B is over the {cap} B cap; re-encoding video at \
+             {new_kbps} kbps (was {old_kbps}), attempt {attempt}/{SIZE_CAP_RETRIES}"
+        );
+        enc.quality = EncodeQuality::Bitrate(new_kbps);
+        // -maxrate/-bufsize are derived from the bitrate in video_args,
+        // so they follow automatically.
+        let mut p = progress.lock().unwrap();
+        p.current_ms = 0;
+        p.mode_label = "re-encode (shrinking to fit the size limit)";
+    };
+    finalize(&progress, &cancel_flag, res);
+}
+
+/// Swap a failed hardware encoder in `plan` for its CPU counterpart.
+/// Bitrate, resolution and audio stay as planned; the decode/upload path
+/// follows the codec, so the rerun is a plain CPU pipeline. `false` when
+/// the plan doesn't encode, is already on the CPU, or no fallback list
+/// was given.
+fn fall_back_to_cpu(plan: &mut ExportPlan, available: &[VideoCodec]) -> bool {
+    if available.is_empty() {
+        return false;
+    }
+    let duration_ms = plan.total_output_ms();
+    let Some(enc) = plan.encode_settings_mut() else {
+        return false;
+    };
+    let Some(cpu) = enc.video_codec.cpu_fallback(available) else {
+        return false;
+    };
+    enc.video_codec = cpu;
+    enc.video_preset = if cpu == VideoCodec::SvtAv1 {
+        crate::encode::DiscordNitro::svt_preset_for(duration_ms).to_string()
+    } else {
+        cpu.default_preset().to_string()
+    };
+    true
+}
+
+/// One ffmpeg pass of `plan`.
+fn run_once(
+    plan: &ExportPlan,
+    progress: &Arc<Mutex<ExportProgress>>,
+    cancel_flag: &Arc<AtomicBool>,
+    child_slot: &Arc<Mutex<Option<Child>>>,
+) -> Result<()> {
+    match plan {
         ExportPlan::Layered {
             composition,
             destination,
@@ -283,9 +435,9 @@ fn run_plan(
             composition,
             destination,
             encode,
-            &progress,
-            &cancel_flag,
-            &child_slot,
+            progress,
+            cancel_flag,
+            child_slot,
         ),
         ExportPlan::Simple {
             source,
@@ -303,9 +455,9 @@ fn run_plan(
             *src_end_ms,
             encode,
             *audio_muted,
-            &progress,
-            &cancel_flag,
-            &child_slot,
+            progress,
+            cancel_flag,
+            child_slot,
         ),
         ExportPlan::MultiTrack {
             source,
@@ -326,12 +478,11 @@ fn run_plan(
             video_clips,
             audio_tracks,
             encode,
-            &progress,
-            &cancel_flag,
-            &child_slot,
+            progress,
+            cancel_flag,
+            child_slot,
         ),
-    };
-    finalize(&progress, &cancel_flag, res);
+    }
 }
 
 fn finalize(progress: &Arc<Mutex<ExportProgress>>, cancel_flag: &Arc<AtomicBool>, res: Result<()>) {
@@ -1709,13 +1860,109 @@ mod tests {
     }
 
     #[test]
+    fn e2e_failed_hardware_encode_falls_back_to_cpu() {
+        // h264_nvenc can't run without an NVIDIA GPU + driver, so on
+        // machines like that it's a dependable "hardware encoder fails at
+        // export time". The export must finish on x264 instead of failing.
+        if crate::encode::encoder_works(VideoCodec::NvencH264) {
+            eprintln!("skipping: NVENC works here, can't force a hardware failure");
+            return;
+        }
+        let source = synth_source(true);
+        let dest = test_dir().join("out_fallback.mp4");
+        let mut encode = base_encode(VideoCodec::NvencH264);
+        encode.quality = EncodeQuality::Bitrate(1_000);
+        encode.video_preset = VideoCodec::NvencH264.default_preset().into();
+        let plan = ExportPlan::Simple {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_start_ms: 1_000,
+            src_end_ms: 3_000,
+            encode: EncodeMode::Encode(encode),
+            audio_muted: false,
+        };
+        let handle = spawn_guarded(
+            plan,
+            Guards {
+                available_codecs: vec![VideoCodec::NvencH264],
+                ..Guards::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let progress = loop {
+            let p = handle.progress();
+            if !matches!(p.phase, ExportPhase::Running) || Instant::now() > deadline {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "{:?}",
+            progress.phase
+        );
+        assert_eq!(progress.mode_label, "re-encode on CPU (GPU encoder failed)");
+        let (_, vcodec) = probe_stream(&dest, "v:0").unwrap();
+        assert_eq!(vcodec, "h264");
+    }
+
+    #[test]
+    fn e2e_size_cap_reencodes_an_oversized_export_under_the_cap() {
+        // Force the overshoot every encoder can produce: ask libx264 for
+        // ~2× more bitrate than the cap allows, then check the finished
+        // file was shrunk to fit instead of shipped over the limit.
+        let source = synth_source(true);
+        let dest = test_dir().join("out_capped.mp4");
+        let cap: i64 = 600_000;
+        let mut encode = base_encode(VideoCodec::X264);
+        encode.quality = EncodeQuality::Bitrate(3_000); // 3 s × 3 Mbps ≈ 1.1 MB
+        encode.audio_bitrate_kbps = 64;
+        let plan = ExportPlan::Simple {
+            source,
+            destination: dest.clone(),
+            source_codec: "h264".into(),
+            src_start_ms: 1_000,
+            src_end_ms: 4_000,
+            encode: EncodeMode::Encode(encode),
+            audio_muted: false,
+        };
+        let handle = spawn_guarded(
+            plan,
+            Guards {
+                size_cap_bytes: Some(cap),
+                ..Guards::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let progress = loop {
+            let p = handle.progress();
+            if !matches!(p.phase, ExportPhase::Running) || Instant::now() > deadline {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            matches!(progress.phase, ExportPhase::Done),
+            "{:?}",
+            progress.phase
+        );
+        let size = std::fs::metadata(&dest).unwrap().len() as i64;
+        assert!(
+            size <= cap,
+            "capped export is {size} B, over the {cap} B cap"
+        );
+    }
+
+    #[test]
     fn e2e_discord_av1_export_muxes_av1_in_mp4() {
         // The Discord planner can pick an AV1 encoder unattended, so the
         // whole path — plan → bitrate args → mp4 mux — gets exercised for
         // real. Uses whichever AV1 encoder this machine actually has;
         // skips (passes) when it has none.
-        let available =
-            crate::encode::verify_av1_encoders(crate::encode::detect_available_codecs());
+        let available = crate::encode::verify_hw_encoders(crate::encode::detect_available_codecs());
         let Some(codec) =
             crate::encode::DiscordNitro::best_av1(crate::encode::detect_gpu(), &available)
         else {

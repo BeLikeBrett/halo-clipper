@@ -617,3 +617,72 @@ All in `src/app.rs`. Three small changes:
   forward to the next clip and plays normally.
 - Preview shows black (not frozen) while the playhead sits in a gap.
 - Export pipeline is untouched (no behavioural change there).
+
+## 2026-11-15 — Discord export lands over the 20 MB limit on some machines
+
+### Symptom
+
+A friend's HaloOS PC (RX 9600 XT) produced Discord-mode exports of
+~20.8–22 MB on the 20 MB tier, so uploads failed.
+
+### Root cause
+
+1. **Zero headroom.** The planner spent 100% of the target on bitrate
+   (`target_bytes_from_mb` = MiB, 20 MB → 20,971,520 B budget). Encoders
+   never hit a bitrate target exactly; measured on a 1440p58 Overwatch
+   clip, 60 s @ the old 20 MB budget: av1_vaapi 99.5%, h264_vaapi
+   99.8%, **libx264 100.7% (over)** on the 7800 XT (VCN 4). Another GPU
+   generation / Mesa rate control only needs to run a few % hotter.
+2. **No verification.** Nothing checked the finished file, and the UI
+   even promised "±10% in practice" around a target equal to the cap.
+3. MiB vs MB: "20 MB" was read as the *larger* 20 MiB.
+
+### Fix
+
+- `DiscordNitro::target_bytes_from_mb` is now the hard cap in decimal
+  bytes (20 MB → 20,000,000 — the smaller reading fits either way).
+- `budget_bytes` = 95% of the cap; all bitrate math aims at that.
+  Tiers are the real caps now (Nitro 500, not 475).
+- `export::spawn_capped`: after each Discord encode the file size is
+  checked; if over the cap, the video bitrate is scaled down by the
+  measured overshoot (`refit_video_kbps`) and re-encoded, up to 2 more
+  passes. If it still can't fit, the export fails with a clear message
+  instead of reporting Done.
+
+### Verification
+
+- Same 60 s clip at the new budget: av1_vaapi 18.91 MB (94.5% of cap),
+  libx264 19.14 MB (95.7%).
+- `e2e_size_cap_reencodes_an_oversized_export_under_the_cap` forces a
+  ~2× overshoot (1.16 MB first pass vs a 600 KB cap) and asserts the
+  final file is under the cap. 175 tests pass.
+
+## 2026-11-15 — Hardware encoder failures had no CPU fallback
+
+### Symptom (latent)
+
+Discord/Custom exports on a listed-but-broken hardware encoder failed
+outright instead of finishing on the CPU.
+
+### Root cause
+
+- Only hardware **AV1** encoders were test-encoded at startup
+  (`verify_av1_encoders`). `h264_vaapi`/`h264_nvenc`/`h264_qsv` were
+  trusted because `ffmpeg -encoders` lists them — but it lists whatever
+  ffmpeg was built with (e.g. Mesa without H.264 encode, no NVIDIA driver).
+- Nothing retried when a hardware encode failed on real input.
+
+### Fix
+
+- `verify_hw_encoders` test-encodes **every** hardware encoder, in
+  parallel (~60 ms total here, not ~60 ms × N).
+- `VideoCodec::cpu_fallback` (AV1 → SVT-AV1 if present else x264,
+  HEVC → x265, H.264 → x264) and `export::Guards` /
+  `spawn_guarded`: a failed hardware encode reruns once on the CPU
+  encoder; the Done screen says "re-encode on CPU (GPU encoder failed)".
+
+### Verification
+
+- `e2e_failed_hardware_encode_falls_back_to_cpu`: h264_nvenc on a
+  machine with no NVIDIA GPU → export finishes as H.264 via x264.
+- 177 tests pass, clippy clean.

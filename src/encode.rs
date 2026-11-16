@@ -151,6 +151,37 @@ impl VideoCodec {
     }
 
     /// True for every AV1 encoder, hardware or software.
+    /// Software (CPU) encoders — always runnable when listed, and the
+    /// fallback when a hardware encode fails.
+    pub fn is_software(self) -> bool {
+        matches!(self, Self::X264 | Self::X265 | Self::SvtAv1)
+    }
+
+    /// The CPU encoder that makes the same format, for when this
+    /// hardware encoder fails mid-export. `None` for software encoders
+    /// (nothing slower to fall back to). AV1 falls back to SVT-AV1 when
+    /// this ffmpeg has it, otherwise to x264 — a working H.264 file
+    /// beats a failed AV1 one.
+    pub fn cpu_fallback(self, available: &[VideoCodec]) -> Option<VideoCodec> {
+        if self.is_software() {
+            return None;
+        }
+        Some(if self.is_av1() {
+            if available.contains(&Self::SvtAv1) {
+                Self::SvtAv1
+            } else {
+                Self::X264
+            }
+        } else if matches!(
+            self,
+            Self::NvencHevc | Self::VaapiHevc | Self::QsvHevc | Self::AmfHevc
+        ) {
+            Self::X265
+        } else {
+            Self::X264
+        })
+    }
+
     pub fn is_av1(self) -> bool {
         matches!(
             self,
@@ -460,22 +491,30 @@ pub struct DiscordNitro;
 impl DiscordNitro {
     /// 500 MB ceiling — Discord's hard upload cap for full Nitro.
     #[allow(dead_code)]
-    pub const NITRO_LIMIT_BYTES: i64 = 500 * 1024 * 1024;
+    pub const NITRO_LIMIT_BYTES: i64 = 500 * 1_000_000;
     /// Lowest the user can dial via the slider. Discord's free tier is
     /// 20 MB (raised from 10 in 2026), but the slider goes below it so
     /// short clips can be made deliberately small.
     pub const MIN_TARGET_MB: u32 = 10;
-    /// Highest the slider goes. Sits 5% under Discord's 500 MB hard
-    /// cap so container overhead can't push the final file over.
-    pub const MAX_TARGET_MB: u32 = 475;
-    /// One-click presets for Discord's subscription tiers. The Nitro
-    /// entry is 475 (not 500) for the same container-overhead headroom
-    /// reason as MAX_TARGET_MB.
+    /// Highest the slider goes: Discord's 500 MB Nitro cap. The slider
+    /// value is always a hard *cap*; the headroom for rate-control
+    /// overshoot and container overhead lives in
+    /// [`budget_bytes`](Self::budget_bytes), not in these numbers.
+    pub const MAX_TARGET_MB: u32 = 500;
+    /// One-click presets for Discord's subscription tiers (their caps).
     pub const TIERS: &'static [(&'static str, u32)] = &[
         ("Free · 20 MB", 20),
         ("Nitro Basic · 50 MB", 50),
         ("Nitro · 500 MB", Self::MAX_TARGET_MB),
     ];
+    /// Share of the cap the encoder is asked to fill. Encoders don't hit
+    /// a bitrate target exactly — measured on a high-motion 1440p60
+    /// game clip at a 0% margin, h264_vaapi/av1_vaapi on VCN 4 landed
+    /// 98–100% of the cap and libx264 landed 100.7% (over). Other GPU
+    /// generations and drivers drift further, so aim 5% low; anything
+    /// that still overshoots is caught by the post-encode size check
+    /// in `export` and re-encoded smaller.
+    pub const BUDGET_PERCENT: i64 = 95;
     pub const AUDIO_KBPS: u32 = 128;
 
     /// Hard ceiling we cap the computed bitrate at, regardless of how
@@ -486,9 +525,42 @@ impl DiscordNitro {
     /// extra bitrate produces no perceptible quality gain at 1080p.
     pub const MAX_BITRATE_KBPS: u32 = 35_000;
 
-    /// Convert MB → bytes for the target slider value.
+    /// Convert the slider's MB value → the hard cap in bytes. Decimal
+    /// megabytes on purpose: it is the smaller reading of "20 MB", so the
+    /// file fits whether the uploader counts in MB or MiB.
     pub fn target_bytes_from_mb(mb: u32) -> i64 {
-        (mb as i64) * 1024 * 1024
+        (mb as i64) * 1_000_000
+    }
+
+    /// Bytes the encode actually aims for under a hard `cap_bytes`.
+    pub fn budget_bytes(cap_bytes: i64) -> i64 {
+        cap_bytes * Self::BUDGET_PERCENT / 100
+    }
+
+    /// Video bitrate for a re-encode after an export came out at
+    /// `actual_bytes`, over `cap_bytes`. Scales the video share by how
+    /// far the encoder overshot, aiming at the same budget as the first
+    /// pass — so an encoder that runs 8% hot gets asked for 8% less.
+    /// Audio is left alone (AAC/Opus at a fixed rate land on target).
+    /// `None` when there's no room left to shrink into.
+    pub fn refit_video_kbps(
+        video_kbps: u32,
+        audio_kbps: u32,
+        duration_ms: i64,
+        actual_bytes: i64,
+        cap_bytes: i64,
+    ) -> Option<u32> {
+        let audio_bytes = audio_kbps as i64 * duration_ms / 8;
+        let actual_video = actual_bytes - audio_bytes;
+        let goal_video = Self::budget_bytes(cap_bytes) - audio_bytes;
+        if actual_video <= 0 || goal_video <= 0 {
+            return None;
+        }
+        let kbps = (video_kbps as f64 * goal_video as f64 / actual_video as f64) as u32;
+        // Never ask for *more* than last time, and stop at a rate no
+        // encoder can make a picture from.
+        let kbps = kbps.min(video_kbps.saturating_sub(1));
+        (kbps >= 50).then_some(kbps)
     }
 
     /// Total available kbps (video + audio) for a clip of the given
@@ -501,7 +573,7 @@ impl DiscordNitro {
             return Self::MAX_BITRATE_KBPS;
         }
         let duration_secs = (duration_ms as f64) / 1000.0;
-        let kbps = (target_bytes as f64) * 8.0 / 1000.0 / duration_secs;
+        let kbps = (Self::budget_bytes(target_bytes) as f64) * 8.0 / 1000.0 / duration_secs;
         kbps.clamp(200.0, Self::MAX_BITRATE_KBPS as f64) as u32
     }
 
@@ -717,15 +789,13 @@ impl DiscordNitro {
     }
 
     /// Estimated output file size in bytes for the chosen bitrate +
-    /// duration. Real CBR encodes (especially HW) tend to land 5–10%
-    /// under target because rate-control leaves headroom for peaks, so
-    /// we report 92% of the theoretical max + 3% for muxer overhead.
+    /// duration. Measured encodes land within ~±2% of the bitrate math
+    /// (muxer overhead included), and the budget already sits under the
+    /// cap, so the plain bitrate × duration is the honest estimate.
     pub fn estimated_size_bytes(duration_ms: i64, target_bytes: i64) -> i64 {
         let video_kbps = Self::video_kbps_for(duration_ms, target_bytes) as i64;
         let total_kbps = video_kbps + Self::audio_kbps_for(duration_ms, target_bytes) as i64;
-        let theoretical_bits = total_kbps * 1000 * duration_ms / 1000;
-        // 92% rate-control realism × 103% muxer overhead ≈ 0.948×.
-        theoretical_bits / 8 * 948 / 1000
+        total_kbps * duration_ms / 8
     }
 }
 
@@ -846,8 +916,9 @@ impl NitroPlan {
         }
     }
 
+    /// Estimate in decimal MB — the same unit as the target slider.
     pub fn est_mb(&self) -> f64 {
-        self.est_bytes as f64 / (1024.0 * 1024.0)
+        self.est_bytes as f64 / 1_000_000.0
     }
 
     /// One line explaining the codec, for the stats panel. On Auto it
@@ -1037,28 +1108,38 @@ pub fn encoder_works(codec: VideoCodec) -> bool {
     }
 }
 
-/// Drop hardware AV1 encoders that ffmpeg advertises but the machine
-/// can't actually run. AV1 is the one family where "listed" and "works"
-/// diverge often enough to matter — it's the newest encode block, absent
-/// from anything older than RDNA 3 / Ada / Arc — and the Discord planner
-/// picks from this list unattended, so a phantom entry would silently
-/// break exports. Software SVT-AV1 is left alone: if it's in the list,
-/// it's linked in and it runs.
-pub fn verify_av1_encoders(codecs: Vec<VideoCodec>) -> Vec<VideoCodec> {
+/// Drop hardware encoders that ffmpeg advertises but the machine can't
+/// actually run. `ffmpeg -encoders` lists everything the build was
+/// compiled with: an RDNA 2 card advertises `av1_vaapi` with no AV1
+/// encode block, a box with no NVIDIA driver advertises `*_nvenc`, and a
+/// Mesa built without H.264/HEVC encode (Fedora, some others) still
+/// advertises `h264_vaapi`. The Discord planner and the startup
+/// recommendation pick from this list unattended, so every hardware
+/// entry gets a real test encode. The probes run in parallel (each is
+/// ~100 ms, mostly process startup) so startup doesn't pay for them in
+/// series. Software encoders are linked in and always run.
+pub fn verify_hw_encoders(codecs: Vec<VideoCodec>) -> Vec<VideoCodec> {
+    let works: Vec<bool> = std::thread::scope(|scope| {
+        let probes: Vec<_> = codecs
+            .iter()
+            .map(|&c| scope.spawn(move || c.is_software() || encoder_works(c)))
+            .collect();
+        probes
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .collect()
+    });
     codecs
         .into_iter()
-        .filter(|c| {
-            if !c.is_av1() || matches!(c, VideoCodec::SvtAv1) {
-                return true;
-            }
-            let ok = encoder_works(*c);
+        .zip(works)
+        .filter_map(|(c, ok)| {
             if !ok {
                 log::info!(
                     "{} advertised but not usable here — dropping",
                     c.ffmpeg_name()
                 );
             }
-            ok
+            ok.then_some(c)
         })
         .collect()
 }
@@ -1275,6 +1356,85 @@ mod tests {
     }
 
     // ---- Discord Nitro -----------------------------------------------
+
+    #[test]
+    fn discord_budget_leaves_headroom_under_every_tier_cap() {
+        // The plan's own size must sit under the cap with room to spare,
+        // or every encoder that runs a little hot uploads-fails. (Long
+        // clips that hit the 200 kbps floor are excluded — the
+        // post-encode size check owns those.)
+        for &(_, mb) in DiscordNitro::TIERS {
+            let cap = DiscordNitro::target_bytes_from_mb(mb);
+            for &secs in &[5i64, 15, 30, 60, 120, 300] {
+                let dur = secs * 1000;
+                if DiscordNitro::total_kbps_for(dur, cap) <= 200 {
+                    continue;
+                }
+                let est = DiscordNitro::estimated_size_bytes(dur, cap);
+                assert!(
+                    est <= cap * 96 / 100,
+                    "{mb} MB tier, {secs}s: plan {est} B has <4% headroom under {cap} B"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hardware_encoders_fall_back_to_cpu_for_the_same_format() {
+        let with_svt = [VideoCodec::SvtAv1, VideoCodec::VaapiAv1];
+        assert_eq!(
+            VideoCodec::VaapiAv1.cpu_fallback(&with_svt),
+            Some(VideoCodec::SvtAv1)
+        );
+        // No SVT-AV1 in this ffmpeg → a working H.264 file instead.
+        assert_eq!(
+            VideoCodec::NvencAv1.cpu_fallback(&[]),
+            Some(VideoCodec::X264)
+        );
+        assert_eq!(
+            VideoCodec::VaapiH264.cpu_fallback(&[]),
+            Some(VideoCodec::X264)
+        );
+        assert_eq!(
+            VideoCodec::QsvHevc.cpu_fallback(&[]),
+            Some(VideoCodec::X265)
+        );
+        for sw in [VideoCodec::X264, VideoCodec::X265, VideoCodec::SvtAv1] {
+            assert_eq!(sw.cpu_fallback(&with_svt), None);
+        }
+    }
+
+    #[test]
+    fn discord_cap_is_decimal_megabytes() {
+        // 20 MB means 20,000,000 bytes — the smaller reading, so the file
+        // fits whichever unit the uploader counts in.
+        assert_eq!(DiscordNitro::target_bytes_from_mb(20), 20_000_000);
+    }
+
+    #[test]
+    fn refit_scales_video_down_by_the_overshoot() {
+        let cap = DiscordNitro::target_bytes_from_mb(20);
+        // 60 s, encoder ran 10% over the cap.
+        let new = DiscordNitro::refit_video_kbps(2_400, 128, 60_000, cap * 110 / 100, cap)
+            .expect("room to shrink");
+        assert!(
+            new < 2_400 * 100 / 110,
+            "refit {new} kbps doesn't undo a 10% overshoot"
+        );
+        // Re-run the math as if the encoder overshot by the same factor
+        // again: the result must land under the cap.
+        let audio_bytes = 128 * 60_000 / 8;
+        let video_bytes = new as i64 * 60_000 / 8 * 110 / 100;
+        assert!(audio_bytes + video_bytes <= cap, "refit still over the cap");
+        // Always strictly smaller, even for a 1-byte overshoot.
+        let tiny = DiscordNitro::refit_video_kbps(2_400, 128, 60_000, cap + 1, cap).unwrap();
+        assert!(tiny < 2_400);
+        // Audio alone over the budget → nothing left to shrink.
+        assert_eq!(
+            DiscordNitro::refit_video_kbps(100, 128, 10 * 60 * 60_000, cap * 2, cap),
+            None
+        );
+    }
 
     #[test]
     fn nitro_2min_clip_keeps_high_resolution() {
