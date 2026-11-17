@@ -5,7 +5,12 @@
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/x-haloedit">
     <comment>Halo Clipper edit</comment>
-    <glob pattern="*.haloedit"/>
+    <!-- The file is JSON inside. Declaring it a subclass of application/json,
+         plus a strong glob weight, makes every resolver (GIO, KDE's
+         QMimeDatabase, libmagic-based xdg-mime) return this specific type
+         instead of sniffing the contents as plain JSON. -->
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.haloedit" weight="80"/>
     <icon name="application-x-haloedit"/>
     <generic-icon name="application-x-haloedit"/>
   </mime-type>

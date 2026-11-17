@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.15
+
+- `.haloedit` files are recognized reliably on Linux: the file type is now
+  declared as a kind of JSON with a strong name match, so file managers
+  (including KDE's Dolphin) show the Halo Clipper icon and open the app on
+  double-click instead of treating the file as plain JSON.
+
 ## 0.10.14
 
 - `.haloedit` files now have their own icon and open Halo Clipper when you
